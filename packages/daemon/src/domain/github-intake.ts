@@ -273,17 +273,27 @@ export class GithubIntakeService {
           // A confirmed absent reservation can retry only under the same current scope/revision.
           if (row.stage === "ready" && row.approved_revision !== issue.updatedAt) continue;
           const target = config.targets.find(t => t.host === row.target_host && t.session === row.target_session);
-          if (!target || !observations.some(o => targetKey(o) === targetKey(target) && o.available)) continue;
-          if ((usage.get(targetKey(target)) ?? 0) > target.capacity || machineUsage(target.physicalHost) > config.hostCapacity) {
+          const observed = target && observations.find(o => targetKey(o) === targetKey(target));
+          if (!target || !observed?.available) continue;
+          const occupied = machineUsage(target.physicalHost);
+          const occupiedManagerTriage = row.stage === "triage" && target.host === config.manager?.host
+            && target.session === config.manager.session && observed.active > 0 && Number.isFinite(occupied);
+          if ((usage.get(targetKey(target)) ?? 0) > target.capacity || (!occupiedManagerTriage && occupied > config.hostCapacity)) {
             this.update(row, { error: "Reserved retry waiting for target and physical host capacity" }); continue;
           }
           await this.deliver(row, issue, revision); continue;
         }
         const stage = row.eligibility === "ready" && row.approved_revision === issue.updatedAt ? "ready" : row.eligibility === "triage" ? "triage" : null;
         if (!stage) continue;
-        const target = config.targets.find(t => (stage === "triage" ? t.host === config.manager?.host && t.session === config.manager.session : t.capabilities.includes(row.capability!))
-          && observations.some(o => targetKey(o) === targetKey(t) && o.available)
-          && (usage.get(targetKey(t)) ?? 0) < t.capacity && machineUsage(t.physicalHost) + ((usage.get(targetKey(t)) ?? 0) > 0 ? 0 : 1) <= config.hostCapacity);
+        const target = config.targets.find(t => {
+          if (stage === "triage" ? t.host !== config.manager?.host || t.session !== config.manager.session : !t.capabilities.includes(row.capability!)) return false;
+          const observed = observations.find(o => targetKey(o) === targetKey(t));
+          if (!observed?.available || (usage.get(targetKey(t)) ?? 0) >= t.capacity) return false;
+          const occupied = machineUsage(t.physicalHost);
+          // Triage on an observed occupied manager adds no seat and can reconcile legacy overload.
+          return Number.isFinite(occupied) && ((stage === "triage" && observed.active > 0)
+            || occupied + ((usage.get(targetKey(t)) ?? 0) > 0 ? 0 : 1) <= config.hostCapacity);
+        });
         if (!target) continue;
         const generation = row.generation + 1;
         const hash = createHash("sha256").update(`${row.repository_id}:${row.issue_number}:${generation}`).digest("hex").slice(0, 24);

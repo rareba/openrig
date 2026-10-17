@@ -102,6 +102,42 @@ describe("GitHub intake durable native queue dispatch", () => {
     expect(f.io.createTask).toHaveBeenCalledTimes(2);
     expect(f.service.status().issues[0]?.stage).toBe("ready");
   });
+  it.each([
+    { active: 1, hostActive: 5, capacity: 2, available: true, expected: 1 },
+    { active: 0, hostActive: 5, capacity: 2, available: true, expected: 0 },
+    { active: 1, hostActive: null, capacity: 2, available: true, expected: 0 },
+    { active: 1, hostActive: 5, capacity: 1, available: true, expected: 0 },
+    { active: 1, hostActive: 5, capacity: 2, available: false, expected: 0 },
+  ])("admits triage only on an already occupied known manager: %j", async ({ active, hostActive, capacity, available, expected }) => {
+    const f = setup();
+    f.service.configure({ ...config, manager: { host: "host-a", session: "worker@rig" }, targets: [{ ...config.targets[0]!, capacity }] });
+    f.io.observeTargets = vi.fn(async () => [{ host: "host-a", session: "worker@rig", active, hostActive, available }]);
+    await f.service.reconcile(); expect(f.io.createTask).toHaveBeenCalledTimes(expected);
+  });
+  it("keeps ready work on an occupied manager subject to the physical limit", async () => {
+    const f = setup(); await f.service.reconcile(); f.ready();
+    f.service.configure({ ...config, manager: { host: "host-a", session: "worker@rig" }, targets: [{ ...config.targets[0]!, capacity: 2 }] });
+    f.io.observeTargets = vi.fn(async () => [{ host: "host-a", session: "worker@rig", active: 1, hostActive: 5, available: true }]);
+    await f.service.reconcile(); expect(f.io.createTask).not.toHaveBeenCalled();
+  });
+  it("retries absent triage on the still occupied current manager using the reserved ID", async () => {
+    const f = setup();
+    f.service.configure({ ...config, manager: { host: "host-a", session: "worker@rig" }, targets: [{ ...config.targets[0]!, capacity: 2 }] });
+    f.io.observeTargets = vi.fn(async () => [{ host: "host-a", session: "worker@rig", active: 1, hostActive: 5, available: true }]);
+    f.io.createTask = vi.fn(async () => { throw new Error("timeout before write"); });
+    await f.service.reconcile(); const id = f.service.status().issues[0]!.qitemId;
+    await f.service.reconcile();
+    expect((f.io.createTask as ReturnType<typeof vi.fn>).mock.calls.map(call => call[1].qitemId)).toEqual([id, id]);
+  });
+  it("does not treat a triage reservation as observed occupancy for retry", async () => {
+    const f = setup();
+    f.service.configure({ ...config, manager: { host: "host-a", session: "worker@rig" }, targets: [{ ...config.targets[0]!, capacity: 2 }] });
+    f.io.observeTargets = vi.fn(async () => [{ host: "host-a", session: "worker@rig", active: 1, hostActive: 5, available: true }]);
+    f.io.createTask = vi.fn(async () => { throw new Error("timeout before write"); });
+    await f.service.reconcile(); expect(f.io.createTask).toHaveBeenCalledTimes(1);
+    f.io.observeTargets = vi.fn(async () => [{ host: "host-a", session: "worker@rig", active: 0, hostActive: 5, available: true }]);
+    await f.service.reconcile(); expect(f.io.createTask).toHaveBeenCalledTimes(1);
+  });
   it("counts independent external work and unknown reservations conservatively", async () => {
     const f = setup([issue(), issue(2)]); f.service.configure({ ...config, targets: [{ ...config.targets[0]!, capacity: 2 }] });
     await f.service.reconcile(); f.ready(); f.ready(2);
