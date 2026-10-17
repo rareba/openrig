@@ -179,11 +179,15 @@ function piCredentialHint(message: string): string {
     : " For managed Pi, configure this provider in the seat's PI_CODING_AGENT_DIR (auth.json or models.json). Its key is not in OpenRig's Pi environment passthrough map; default Pi logins are not automatically shared.";
 }
 
-function errorNotice(details: unknown[], runtime: RunnerRuntime): string {
+function sanitizedErrorText(details: unknown[]): string {
   // Empty or control-only fields must not hide a later usable diagnostic.
-  const text = details.map(detail => typeof detail === "string"
+  return details.map(detail => typeof detail === "string"
     ? stripVTControlCharacters(detail).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").replace(/\s+/g, " ").trim()
     : "").find(Boolean) ?? "";
+}
+
+function errorNotice(details: unknown[], runtime: RunnerRuntime): string {
+  const text = sanitizedErrorText(details);
   const marker = runtime === "omp" ? "[omp-runner] ERROR" : PI_RUNNER_ERROR_MARKER;
   return `${marker} ${text.slice(0, 400) || "request failed"}${runtime === "pi" ? piCredentialHint(text) : ""}`;
 }
@@ -202,6 +206,14 @@ function modelErrorNotice(event: Record<string, unknown>, runtime: RunnerRuntime
     return { errorNotice: errorNotice([message.errorMessage, message.error, event.error], runtime) };
   }
   return {};
+}
+
+function compactionFailure(event: Record<string, unknown>, runtime: RunnerRuntime): string | undefined {
+  if (event.aborted === true) return `[${runtime}] compaction cancelled`;
+  if (typeof event.errorMessage === "string" && event.errorMessage.trim()) {
+    return `[${runtime}] compaction failed: ${sanitizedErrorText([event.errorMessage]).slice(0, 400) || "request failed"}`;
+  }
+  return undefined;
 }
 
 export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntime = "pi"): MirrorAndActivity {
@@ -251,15 +263,18 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
     case "compaction_start":
       return { mirrorLines: [`[${runtime}] compacting context…`], activity: { hookEvent: "active", subtype: "compaction" } };
     case "compaction_end":
-      return { mirrorLines: [`[${runtime}] compaction done`] };
+      return { mirrorLines: [compactionFailure(event, runtime) ?? `[${runtime}] compaction done`] };
     // OMP names its automatic compaction separately. Pi keeps main's mapping
     // (unmapped), so an idle Pi seat never reads as running after one.
     case "auto_compaction_start":
       return runtime === "omp"
         ? { mirrorLines: ["[omp] compacting context…"], activity: { hookEvent: "active", subtype: "compaction" } }
         : { mirrorLines: [] };
-    case "auto_compaction_end":
-      return runtime === "omp" ? { mirrorLines: ["[omp] compaction done"] } : { mirrorLines: [] };
+    case "auto_compaction_end": {
+      const failure = compactionFailure(event, runtime);
+      return failure ? { mirrorLines: [failure] }
+        : runtime === "omp" ? { mirrorLines: ["[omp] compaction done"] } : { mirrorLines: [] };
+    }
     case "auto_retry_start":
       return { mirrorLines: ["[pi] transient error — retrying"], activity: { hookEvent: "active", subtype: "auto_retry" } };
     case "auto_retry_end": {

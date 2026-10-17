@@ -337,6 +337,41 @@ describe("mapPiEvent", () => {
     expect(mapPiEvent({ type: "auto_retry_start" }).activity).toEqual({ hookEvent: "active", subtype: "auto_retry" });
   });
 
+  it.each(["pi", "omp"] as const)("reports cancelled compaction without a success label for %s", (runtime) => {
+    for (const type of ["compaction_end", "auto_compaction_end"]) {
+      // Native Pi emits this when session_before_compact returns { cancel: true }.
+      const cancelled = mapPiEvent({ type, reason: "threshold", result: undefined,
+        aborted: true, willRetry: false }, runtime);
+      expect(cancelled.mirrorLines).toEqual([`[${runtime}] compaction cancelled`]);
+      expect(cancelled.activity).toBeUndefined();
+    }
+  });
+
+  it.each(["pi", "omp"] as const)("reports failed compaction without a success label for %s", (runtime) => {
+    for (const type of ["compaction_end", "auto_compaction_end"]) {
+      const failed = mapPiEvent({ type, reason: "overflow", result: undefined,
+        aborted: false, willRetry: false, errorMessage: "Context overflow recovery failed: provider refused summary" }, runtime);
+      expect(failed.mirrorLines).toEqual([`[${runtime}] compaction failed: Context overflow recovery failed: provider refused summary`]);
+      expect(failed.activity).toBeUndefined();
+    }
+  });
+
+  it("keeps completed compaction distinct from cancellation", () => {
+    const event = { type: "compaction_end", reason: "threshold", aborted: false, willRetry: false,
+      result: { summary: "Preserved work and constraints", firstKeptEntryId: "entry-2", tokensBefore: 8000 } };
+    expect(mapPiEvent(event).mirrorLines).toEqual(["[pi] compaction done"]);
+    expect(mapPiEvent({ ...event, type: "auto_compaction_end" }, "omp").mirrorLines).toEqual(["[omp] compaction done"]);
+  });
+
+  it.each(["pi", "omp"] as const)("bounds and sanitizes compaction diagnostics for %s", (runtime) => {
+    const prefix = `[${runtime}] compaction failed: `;
+    const failed = mapPiEvent({ type: "compaction_end", aborted: false,
+      errorMessage: `\u001b[31mCompaction\u0000 failed\u001b[0m\n${"x".repeat(800)}` }, runtime);
+    expect(failed.mirrorLines[0]).toBe(prefix + (`Compaction failed ${"x".repeat(800)}`).slice(0, 400));
+    expect(mapPiEvent({ type: "auto_compaction_end", aborted: false,
+      errorMessage: "\u001b[31m\u0000\u001b[0m" }, runtime).mirrorLines).toEqual([prefix + "request failed"]);
+  });
+
   it("leaves auto_compaction_* unmapped for Pi so an idle seat never reads as running", () => {
     for (const type of ["auto_compaction_start", "auto_compaction_end"]) {
       expect(mapPiEvent({ type })).toEqual({ mirrorLines: [] });
