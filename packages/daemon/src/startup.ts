@@ -17,6 +17,11 @@ import { migrate } from "./db/migrate.js";
 // P8: apply the CANONICAL migration list — the single source of truth (db/all-migrations.ts),
 // never an inline copy that can drift out of sync with the daemon's schema.
 import { ALL_MIGRATIONS } from "./db/all-migrations.js";
+import { GithubIntakeService } from "./domain/github-intake.js";
+import { recoverHumanResponseReturns } from "./domain/human-response-recovery.js";
+import { PollScheduler } from "./domain/github-poll-scheduler.js";
+import { createGithubIntakeIO } from "./adapters/github-intake.js";
+import { attachAgentActivity, attachTerminalActivityAndWork, getNodeInventoryForAllRigs } from "./domain/node-inventory.js";
 import { RigRepository } from "./domain/rig-repository.js";
 import { SessionRegistry } from "./domain/session-registry.js";
 import { deriveCanonicalSessionName, isHumanSeatSessionRef, parseSessionName } from "./domain/session-name.js";
@@ -2567,6 +2572,25 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   deps.webUiEnabled = opts?.webUiEnabled ?? new ContextPackSettingsStore().resolveOne("ui.enabled").value === true;
   // /api browser boundary: this machine's exact Tailscale MagicDNS name, looked up on demand.
   deps.selfNameDiscovery = () => discoverTailscaleSelfNames({ timeoutMs: 1500 });
+  deps.githubIntakeService = new GithubIntakeService(db, queueRepoInstance, createGithubIntakeIO({
+    queue: queueRepoInstance,
+    localNodes: async () => {
+      const active = new Set((db.prepare("SELECT id FROM rigs WHERE archived_at IS NULL").all() as { id: string }[]).map(r => r.id));
+      const nodes = [...getNodeInventoryForAllRigs(db)].flatMap(([id, nodes]) => nodes.map(node => ({ ...node, archived: !active.has(id) })));
+      const activity = await attachAgentActivity(nodes, { tmuxAdapter, activityStore: agentActivityStore, seatActivity: seatActivityService, captureFallback: false });
+      const archived = new Map(nodes.map(node => [node.nodeId, node.archived]));
+      return attachTerminalActivityAndWork(activity, { db, seatActivity: seatActivityService }).map(node => ({ ...node, archived: archived.get(node.nodeId) }));
+    },
+    onError: message => console.error(`[github-intake] ${message}`),
+  }));
+  deps.githubIntakeScheduler = new PollScheduler(deps.githubIntakeService, message => console.error(`[github-intake] ${message}`));
+  deps.humanResponseScheduler = new PollScheduler({
+    status: () => ({ config: { pollIntervalSeconds: 60 } }),
+    reconcile: async () => {
+      const result = await recoverHumanResponseReturns(queueRepoInstance);
+      return { error: result.errors.length ? result.errors.join("; ") : null };
+    },
+  }, message => console.error(`[human-response] ${message}`));
   const { app, injectWebSocket } = createAppWithWebSocket(deps);
 
   return { app, db, deps, contextMonitor, eventLoopMonitor, injectWebSocket };

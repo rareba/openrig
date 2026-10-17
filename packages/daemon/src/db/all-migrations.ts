@@ -117,6 +117,8 @@ import { appliedLaunchDaemonOptOutSchema } from "./migrations/113_applied_launch
 
 /** Ordered migrations; numbers may be reserved by independent changes. */
 
+import { githubIntakeSchema } from "./migrations/115_github_intake.js";
+
 export const ALL_MIGRATIONS: Migration[] = [
   coreSchema,
   bindingsSessionsSchema,
@@ -227,4 +229,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   seatEnvSchema,
   queueTransitionsTsQitemSchema,
   appliedLaunchDaemonOptOutSchema,
+  githubIntakeSchema,
 ];

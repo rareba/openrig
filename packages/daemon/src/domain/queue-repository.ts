@@ -6,12 +6,12 @@ import { loadHumanRegistry, resolveRegisteredHumanAddress, type LoadResult } fro
 import { resolveExternal } from "./gateway/external-admission.js";
 import type { PersistedEvent } from "./types.js";
 import { QueueTransitionLog, type OwnerNotificationLevel, type QueueTransition, type RecentQueueTransitionScope } from "./queue-transition-log.js";
-import { WAKE_INTENT_PREFIX, type OutboxHandler } from "./outbox-handler.js";
+import { WAKE_INTENT_PREFIX, type OutboxEntry, type OutboxHandler } from "./outbox-handler.js";
 import { derivePickup, type PickupReceipt } from "./queue-pickup.js";
 import { lastMeaningfulTransition, readWaitingView, type WaitingView, type WaitingActivityReader } from "./queue-waiting.js";
 import { wrapPaneEnvelope } from "../lib/pane-envelope.js";
 import { renderQueueHandoffNudge } from "./queue-nudge-text.js";
-import { getSelfHostId } from "./hosts/fanout-contract.js";
+import { getSelfHostId, resolvesToLocalHost } from "./hosts/fanout-contract.js";
 import { parseSessionName, isHumanSeatSessionRef } from "./session-name.js";
 import { parseReplyToChoice, formatReplyToChoice, describeReplyToFallback, REPLY_TO_CHOICE_ACTOR, type ReplyToChoice } from "./reply-to-choice.js";
 import { classifyDestination, type DestinationClass } from "./gateway/destination-resolver.js";
@@ -28,7 +28,7 @@ import {
 } from "./queue-wake-repository.js";
 import { WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
 import { armQueueWait, backOffQueueWait, refreshQueueWaits, evaluateQueueWait, retargetQueueWait, isQueueWait } from "./queue-wait-backoff.js";
-import { parseHumanQuestions, unansweredQuestions, describeTypedReplyPlacement, type HumanQuestion, type HumanAnswers, type TypedHumanReply, type RecordHumanAnswerResult } from "./human-questions.js";
+import { parseHumanResponse, type HumanResponse, formatHumanAnswers, parseHumanQuestions, unansweredQuestions, describeTypedReplyPlacement, type HumanQuestion, type HumanAnswers, type TypedHumanReply, type RecordHumanAnswerResult } from "./human-questions.js";
 
 export const QUEUE_STATES = [
   "pending",
@@ -148,6 +148,7 @@ export interface QueueItem {
   qitemId: string;
   tsCreated: string;
   tsUpdated: string;
+  humanRequestRevision?: string;
   sourceSession: string;
   destinationSession: string;
   state: QueueState;
@@ -279,6 +280,19 @@ export interface QueueNudgeTransport {
     opts?: { verify?: boolean; stampISO?: string; actorSession?: string; committedOutboxIds?: string[]; deliveryId?: string; auditPointer?: string }
   ): Promise<{ ok: boolean; verified?: boolean; error?: string; reason?: string; outcome?: string }>;
 }
+
+export const HUMAN_RESPONSE_ACTIVATION_PREFIX = "human-response-activation-";
+const HUMAN_RESPONSE_COMMIT_GATE = "external:human-response-commit:";
+const PROVISIONAL_HUMAN_RESPONSE = "PROVISIONAL HUMAN RESPONSE. The source decision has not committed. Do not treat this row as an answer, approval, or authority to resume work while it is blocked.\n\n";
+const HUMAN_RESPONSE_RECEIPT_PREFIX = "human response receipt: ";
+export interface HumanResponseInput {
+  qitemId: string; actorSession: string; replyId: string; requestRevision: string; response: HumanResponse;
+  identityProvenance?: import("../routes/require-sender-identity.js").IdentityProvenance;
+}
+export interface HumanResponseReceipt { replyQitemId: string; complete: boolean; replyHostId?: string }
+export type HumanResponsePlan =
+  | { status: "recorded"; receipt: HumanResponseReceipt }
+  | { status: "prepared"; item: QueueItem; reply: QueueCreateInput; answers: HumanAnswers; fingerprint: string; receipt: HumanResponseReceipt };
 
 export interface QueueCreateInput {
   qitemId?: string;
@@ -437,6 +451,7 @@ export interface QueueClaimInput {
 }
 
 export interface QueueListOptions {
+  handedOffFrom?: string;
   /** Exact tag selection before the result bound (used by diagnostic occurrences). */
   tag?: string;
   destinationSession?: string;
@@ -2278,6 +2293,9 @@ export class QueueRepository {
         `qitem ${input.qitemId} destination is ${qitem.destinationSession}, not ${input.destinationSession}`
       );
     }
+    if (qitem.blockedOn?.startsWith(HUMAN_RESPONSE_COMMIT_GATE)) {
+      throw new QueueRepositoryError("human_response_uncommitted", "This human response is provisional. Its source daemon must commit and activate it before it can be claimed.");
+    }
     if (qitem.state !== "pending" && qitem.state !== "blocked") {
       throw new QueueRepositoryError(
         "qitem_not_claimable",
@@ -3238,6 +3256,186 @@ export class QueueRepository {
     for (const event of events) this.eventBus.notifySubscribers(event);
   }
 
+  pendingHumanResponseActivations(limit = 4): OutboxEntry[] {
+    if (!this.outbox) return [];
+    const rows = this.db.prepare(`SELECT outbox_id FROM outbox_entries
+      WHERE delivery_state='pending' AND substr(outbox_id,1,?)=?
+        AND COALESCE((SELECT value FROM json_each(COALESCE(tags,'[]')) WHERE value LIKE 'human-response-next:%' LIMIT 1),'') <= ?
+      ORDER BY COALESCE((SELECT value FROM json_each(COALESCE(tags,'[]')) WHERE value LIKE 'human-response-next:%' LIMIT 1),''),ts_dispatched,rowid LIMIT ?`)
+      .all(HUMAN_RESPONSE_ACTIVATION_PREFIX.length, HUMAN_RESPONSE_ACTIVATION_PREFIX, `human-response-next:${new Date().toISOString()}`, limit) as Array<{ outbox_id: string }>;
+    return rows.flatMap(row => { const entry = this.outbox!.getById(row.outbox_id); return entry ? [entry] : []; });
+  }
+
+  deferHumanResponseActivation(outboxId: string): void {
+    const entry = this.outbox?.getById(outboxId);
+    if (!entry || !outboxId.startsWith(HUMAN_RESPONSE_ACTIVATION_PREFIX) || entry.deliveryState !== "pending") return;
+    const tags = [...(entry.tags ?? []).filter(tag => !tag.startsWith("human-response-next:")), `human-response-next:${new Date(Date.now() + 60_000).toISOString()}`];
+    this.db.prepare("UPDATE outbox_entries SET tags=? WHERE outbox_id=? AND delivery_state='pending'").run(JSON.stringify(tags), outboxId);
+  }
+
+  acknowledgeHumanResponseActivation(replyQitemId: string): void {
+    this.outbox?.markDelivered(`${HUMAN_RESPONSE_ACTIVATION_PREFIX}${replyQitemId}`);
+  }
+
+  /** A remote human answer is inert until its source daemon commits the decision receipt. */
+  stageHumanResponseReturn(input: QueueCreateInput): QueueItem {
+    const events: PersistedEvent[] = [];
+    const result = this.db.transaction(() => {
+      const existing = input.qitemId ? this.getById(input.qitemId) : null;
+      if (existing) {
+        if (existing.sourceSession !== input.sourceSession || existing.destinationSession !== input.destinationSession
+          || (existing.body !== `${PROVISIONAL_HUMAN_RESPONSE}${input.body}` && existing.body !== input.body)
+          || JSON.stringify(existing.chainOfRecord) !== JSON.stringify(input.chainOfRecord)
+          || !input.tags?.every(tag => existing.tags?.includes(tag))) {
+          throw new QueueRepositoryError("reply_id_conflict", "The remote response ID already records different content.");
+        }
+        return existing;
+      }
+      const created = this.createWithinTransaction({ ...input, body: `${PROVISIONAL_HUMAN_RESPONSE}${input.body}`, nudge: false });
+      events.push(created.persistedEvent);
+      events.push(...this.updateInTransactionalContext({ qitemId: created.qitemId, actorSession: input.sourceSession,
+        state: "blocked", blockedOn: `${HUMAN_RESPONSE_COMMIT_GATE}${created.qitemId}`, transitionNote: "Waiting for the source daemon's committed human response receipt; no work or wake authorized." }).persistedEvents);
+      return this.getByIdOrThrow(created.qitemId);
+    })();
+    for (const event of events) this.eventBus.notifySubscribers(event);
+    return result;
+  }
+
+  activateHumanResponseReturn(input: { qitemId: string; actorSession: string; fingerprint: string; identityProvenance?: import("../routes/require-sender-identity.js").IdentityProvenance }): QueueItem {
+    const events: PersistedEvent[] = [];
+    let wake = false;
+    const result = this.db.transaction(() => {
+      const item = this.getByIdOrThrow(input.qitemId);
+      if (item.sourceSession !== input.actorSession || !item.tags?.includes(`response:${input.fingerprint}`)) {
+        throw new QueueRepositoryError("reply_id_conflict", "The committed response does not match this staged return.");
+      }
+      if (item.tags.includes("human-response-activated")) return item;
+      if (item.state !== "blocked" || item.blockedOn !== `${HUMAN_RESPONSE_COMMIT_GATE}${item.qitemId}` || !item.body.startsWith(PROVISIONAL_HUMAN_RESPONSE)) {
+        throw new QueueRepositoryError("stale_human_request", "This remote response is no longer awaiting its source receipt.");
+      }
+      this.db.prepare("UPDATE queue_items SET body = ?, tags = ? WHERE qitem_id = ?")
+        .run(item.body.slice(PROVISIONAL_HUMAN_RESPONSE.length), JSON.stringify([...item.tags, "human-response-activated"]), item.qitemId);
+      events.push(...this.updateInTransactionalContext({ qitemId: item.qitemId, actorSession: input.actorSession,
+        state: "pending", transitionNote: "Source daemon committed the human response; manager continuation is ready.", identityProvenance: input.identityProvenance }).persistedEvents);
+      this.stageWakeIntent(item.qitemId, input.actorSession, item.destinationSession, input.identityProvenance ?? null, true);
+      this.assertTerminalClosureHasIntent(item.qitemId, item.qitemId, true);
+      wake = true;
+      return this.getByIdOrThrow(item.qitemId);
+    })();
+    for (const event of events) this.eventBus.notifySubscribers(event);
+    if (wake) this.deliverWakeIntentAfterCommit(`${WAKE_INTENT_PREFIX}${input.qitemId}`);
+    return result;
+  }
+
+  /** Pure preflight shared by local recording and the native target-first remote return. */
+  prepareHumanResponse(input: HumanResponseInput): HumanResponsePlan {
+    const response = parseHumanResponse(input.response);
+    if (!response || !/^[A-Za-z0-9_-]{1,100}$/.test(input.replyId)) {
+      throw new QueueRepositoryError("invalid_human_response", "Provide a replyId and a choice, custom answer, or clarification with nonempty text (up to 10000 characters).");
+    }
+    const fingerprint = createHash("sha256").update(JSON.stringify([input.requestRevision, response])).digest("hex");
+    const replyQitemId = `human-reply-${createHash("sha256").update(JSON.stringify([input.qitemId, input.replyId])).digest("hex")}`;
+    const item = this.getById(input.qitemId);
+    if (!item || item.destinationSession !== input.actorSession || !isHumanSeatSessionRef(item.destinationSession)) {
+      throw new QueueRepositoryError("not_the_asked_human", "Only the asked human may respond to this request.");
+    }
+    // A receipt lives with the request even when the native reply row lives on another daemon.
+    for (const transition of this.transitionLog.listForQitem(item.qitemId).reverse()) {
+      if (!transition.transitionNote?.startsWith(HUMAN_RESPONSE_RECEIPT_PREFIX)) continue;
+      const receipt = JSON.parse(transition.transitionNote.slice(HUMAN_RESPONSE_RECEIPT_PREFIX.length)) as HumanResponseReceipt & { fingerprint: string };
+      if (receipt.replyQitemId !== replyQitemId) continue;
+      if (receipt.fingerprint !== fingerprint || transition.actorSession !== input.actorSession) {
+        throw new QueueRepositoryError("reply_id_conflict", "This replyId already records a different response.");
+      }
+      return { status: "recorded", receipt: { replyQitemId, complete: receipt.complete, ...(receipt.replyHostId ? { replyHostId: receipt.replyHostId } : {}) } };
+    }
+    if (item.state !== "pending" || item.humanIntent === "update") {
+      throw new QueueRepositoryError("stale_human_request", "This decision is no longer pending. Refresh the request before responding.");
+    }
+    if (input.requestRevision !== item.humanRequestRevision) {
+      throw new QueueRepositoryError("stale_human_request", "The pending request changed. Refresh its questions before responding.");
+    }
+    const questions = item.humanQuestions ?? [];
+    let answers: HumanAnswers = item.humanAnswers ?? {};
+    let complete = false;
+    if (response.kind === "choice") {
+      const question = questions.find(q => q.id === response.questionId);
+      if (!question?.options.some(o => o.id === response.optionId)) throw new QueueRepositoryError("invalid_human_response", "unknown-option");
+      if (unansweredQuestions(questions, answers).length) answers = { ...answers, [question.id]: response.optionId };
+      complete = unansweredQuestions(questions, answers).length === 0;
+    } else if (response.kind === "custom") {
+      const remaining = unansweredQuestions(questions, answers);
+      const question = remaining[0];
+      if (questions.length && !question) throw new QueueRepositoryError("invalid_human_response", "All questions already have an answer.");
+      if (question) answers = { ...answers, [question.id]: { kind: "typed-reply", text: response.text, placement: "first-unanswered", unansweredCount: remaining.length - 1 } };
+      complete = remaining.length <= 1;
+    }
+    const text = response.kind === "clarification"
+      ? `Clarification requested. The decision remains pending.\n\n${response.text}`
+      : `${complete ? "Human answer complete." : "Partial human answer. Other questions remain unanswered."}\n\n${questions.length ? formatHumanAnswers(questions, answers).join("\n") : response.kind === "custom" ? response.text : ""}`;
+    // The stored source carries the forwarding origin. Destinations remain bare member@rig.
+    const parsed = parseSessionName(item.sourceSession);
+    const origin = parsed.kind === "canonical" && parsed.rig.includes("@") ? destinationRigTeaching(item.sourceSession)?.destinationSplit as { member: string; rig: string; host: string } | undefined : undefined;
+    const destinationSession = origin ? `${origin.member}@${origin.rig}` : item.sourceSession;
+    const replyHostId = origin && !resolvesToLocalHost(origin.host, getSelfHostId()) ? origin.host : undefined;
+    const reply: QueueCreateInput = {
+      qitemId: replyQitemId, sourceSession: input.actorSession, destinationSession,
+      body: `${text}\n\nIn reply to: ${item.qitemId}`, inboundReplyTo: item.qitemId,
+      chainOfRecord: [...(item.chainOfRecord ?? []), item.qitemId],
+      tags: ["human-response", `human-${response.kind}`, `response:${fingerprint}`, ...(complete ? ["human-response-complete"] : [])],
+      identityProvenance: input.identityProvenance,
+    };
+    return { status: "prepared", item, reply, answers, fingerprint, receipt: { replyQitemId, complete, ...(replyHostId ? { replyHostId } : {}) } };
+  }
+
+  /** Local answer+reply+wake are one transaction. Remote return uses the existing target-first
+   * handoff protocol: require the target's exact durable native queue receipt before closing here.
+   */
+  recordHumanResponse(input: HumanResponseInput, remoteReply?: QueueItem): HumanResponseReceipt {
+    const events: PersistedEvent[] = [];
+    let localWakeId: string | undefined;
+    const result = this.db.transaction(() => {
+      const plan = this.prepareHumanResponse(input);
+      if (plan.status === "recorded") return plan.receipt;
+      const { item, reply, answers, fingerprint, receipt } = plan;
+      if (receipt.replyHostId) {
+        const expectedSource = stampSelfHostSuffix(input.actorSession);
+        if (!remoteReply || remoteReply.qitemId !== receipt.replyQitemId || remoteReply.destinationSession !== reply.destinationSession
+          || remoteReply.sourceSession !== expectedSource || remoteReply.body !== `${PROVISIONAL_HUMAN_RESPONSE}${reply.body}`
+          || remoteReply.state !== "blocked" || remoteReply.blockedOn !== `${HUMAN_RESPONSE_COMMIT_GATE}${receipt.replyQitemId}`
+          || !remoteReply.tags?.includes(`response:${fingerprint}`) || !remoteReply.chainOfRecord?.includes(item.qitemId)) {
+          throw new QueueRepositoryError("remote_human_response_required", "The original manager is on another host. Its exact durable native queue receipt is required before recording this answer.");
+        }
+      } else {
+        const created = this.createWithinTransaction(reply);
+        this.stageWakeIntent(created.qitemId, input.actorSession, reply.destinationSession, input.identityProvenance ?? null, true);
+        events.push(created.persistedEvent);
+        localWakeId = created.qitemId;
+      }
+      if (receipt.replyHostId) {
+        if (!this.outbox) throw new QueueRepositoryError("wake_intent_store_unavailable", "A remote human response requires the native durable activation outbox.");
+        this.outbox.record({ outboxId: `${HUMAN_RESPONSE_ACTIVATION_PREFIX}${receipt.replyQitemId}`,
+          senderSession: input.actorSession, destinationSession: item.sourceSession, auditPointer: item.qitemId,
+          body: JSON.stringify({ replyQitemId: receipt.replyQitemId, replyHostId: receipt.replyHostId, fingerprint, actorSession: stampSelfHostSuffix(input.actorSession), identityProvenance: input.identityProvenance ?? "claimed:v1" }),
+          tags: ["human-response-activation"], identityProvenance: input.identityProvenance });
+      }
+      if (this.hasHumanQuestionsColumn && input.response.kind !== "clarification") {
+        this.db.prepare("UPDATE queue_items SET human_answers = ? WHERE qitem_id = ?").run(JSON.stringify(answers), item.qitemId);
+      }
+      events.push(...this.updateInTransactionalContext({
+        qitemId: item.qitemId, actorSession: input.actorSession,
+        ...(receipt.complete ? { state: "done" as const, closureReason: "no-follow-on" as const, ownerNotificationKind: "human-decision-resolved" as const } : {}),
+        transitionNote: `${HUMAN_RESPONSE_RECEIPT_PREFIX}${JSON.stringify({ ...receipt, fingerprint })}`,
+        identityProvenance: input.identityProvenance,
+      }).persistedEvents);
+      if (!receipt.replyHostId) this.assertTerminalClosureHasIntent(item.qitemId, receipt.replyQitemId, true);
+      return receipt;
+    })();
+    for (const event of events) this.eventBus.notifySubscribers(event);
+    if (localWakeId) this.deliverWakeIntentAfterCommit(`${WAKE_INTENT_PREFIX}${localWakeId}`);
+    return result;
+  }
+
   /** Close a direct human request and retain its typed answer in the same transaction.
    * A thread reply has no question id: store it under the first unanswered question only,
    * preserving earlier clicks and leaving the other questions unanswered. A completed
@@ -3322,6 +3520,9 @@ export class QueueRepository {
     const ledger = this.deliveryOutcomeFor(item.qitemId);
     return {
       ...item,
+      ...(isHumanSeatSessionRef(item.destinationSession) ? { humanRequestRevision: createHash("sha256").update(JSON.stringify([
+        item.sourceSession, item.destinationSession, item.body, item.summary, item.evidenceRef, item.humanIntent, item.humanQuestions, item.humanAnswers,
+      ])).digest("hex") } : {}),
       deliveryOutcome: ledger?.outcome ?? null,
       ...(ledger && ledger.outcome !== "posted" ? { deliveryFailureDetail: ledger.detail } : {}),
       ...(item.replyTo ? { replyToFallback: this.replyToFallbackFor(item.qitemId) } : {}),
@@ -3381,6 +3582,10 @@ export class QueueRepository {
     const limit = opts?.limit ?? 100;
     const conditions: string[] = [];
     const params: unknown[] = [];
+    if (opts?.handedOffFrom) {
+      conditions.push("handed_off_from = ?");
+      params.push(opts.handedOffFrom);
+    }
     if (opts?.tag) {
       conditions.push("EXISTS (SELECT 1 FROM json_each(queue_items.tags) WHERE value = ?)");
       params.push(opts.tag);

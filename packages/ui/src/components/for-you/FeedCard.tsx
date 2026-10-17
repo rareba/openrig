@@ -10,6 +10,8 @@ import type { QueueItemViewerData } from "../drawer-viewers/QueueItemViewer.js";
 import type { QueueItemDetail } from "../../hooks/useSlices.js";
 import type { FeedCard as FeedCardModel, FeedCardKind } from "../../lib/feed-classifier.js";
 import { isSyntheticFeedCard } from "../../lib/attention-feed.js";
+import { isHumanSeatSessionRef } from "../../lib/session-name.js";
+import { HumanResponse } from "./HumanResponse.js";
 import { VerbActions } from "../mission-control/components/VerbActions.js";
 import { ProgressiveTerminal } from "../terminal/ProgressiveTerminal.js";
 import { buildChatPreamble } from "../review/chat.js";
@@ -423,9 +425,12 @@ export function FeedCard({
   const source = qitemViewerData?.source ?? card.authorSession;
   const destination = qitemViewerData?.destination;
   const actorSession = destination?.startsWith("human") ? destination : "human@host";
-  const renderedOutcome = actionOutcome ?? fallbackOutcomeFromQueueItem(card.kind, queueItem);
-  const primaryToken = renderedOutcome ? outcomeToken(renderedOutcome) : KIND_TOKEN[card.kind];
-  const primaryDotClass = renderedOutcome
+  const humanResponseRecorded = !actionOutcome && queueItem?.state === "done" && isHumanSeatSessionRef(queueItem.destinationSession)
+    && queueItem.humanIntent !== "update";
+  const renderedOutcome = actionOutcome ?? (humanResponseRecorded ? null : fallbackOutcomeFromQueueItem(card.kind, queueItem));
+  const primaryToken: ProjectToken = humanResponseRecorded ? { label: "Response recorded", tone: "success", icon: History }
+    : renderedOutcome ? outcomeToken(renderedOutcome) : KIND_TOKEN[card.kind];
+  const primaryDotClass = renderedOutcome || humanResponseRecorded
     ? TONE_DOT[primaryToken.tone]
     : KIND_DOT[card.kind];
   // OPR.0.4.1.27 Unit 5 — the kind glyph (mockup fidelity): render the kind's
@@ -544,6 +549,14 @@ export function FeedCard({
           </div>
         ) : null}
         {renderedOutcome ? <ActionOutcomePanel outcome={renderedOutcome} /> : null}
+        {humanResponseRecorded ? <div role="status" className="mt-3 space-y-1 text-sm">
+          <p>Human response recorded.</p>
+          {(queueItem?.humanQuestions ?? []).map(question => {
+            const answer = Object.prototype.hasOwnProperty.call(queueItem?.humanAnswers ?? {}, question.id) ? queueItem?.humanAnswers?.[question.id] : undefined;
+            if (answer == null) return null;
+            return <p key={question.id}>{question.question} {typeof answer === "string" ? question.options.find(option => option.id === answer)?.label ?? answer : answer.text}</p>;
+          })}
+        </div> : null}
         {qitemViewerData && isActionableCard(card.kind, queueItem, renderedOutcome) ? (
           <div
             data-testid={`feed-card-actions-${card.id}`}
@@ -555,7 +568,10 @@ export function FeedCard({
                 prose, no "Choose response" chrome (VerbActions `bare`) —
                 buttons are self-evident. Deny/route stay retired. */}
             <div className="flex flex-wrap items-center gap-2">
-              <VerbActions
+              {destination && isHumanSeatSessionRef(destination) && queueItem?.humanIntent !== "update" ? (queueItem?.humanRequestRevision ? (
+                <HumanResponse actorSession={actorSession} requestRevision={queueItem.humanRequestRevision} qitemId={queueItem.qitemId} destinationSession={queueItem.destinationSession}
+                  questions={queueItem.humanQuestions ?? []} answers={queueItem.humanAnswers ?? {}} hostId={card.hostId} />
+              ) : <p>Refresh this request to load its current questions before responding.</p>) : <VerbActions
                 qitemId={qitemViewerData.qitemId}
                 actorSession={actorSession}
                 bare
@@ -567,7 +583,7 @@ export function FeedCard({
                     ? (outcome) => onOptimisticOutcome(qitemViewerData.qitemId, outcome)
                     : undefined
                 }
-              />
+              />}
               <button
                 type="button"
                 data-testid={`feed-card-chat-${card.id}`}

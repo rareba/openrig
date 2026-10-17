@@ -237,9 +237,9 @@ describe("FeedCard P5-1 wiring: show-context QueueItemTrigger", () => {
     expect(img.getAttribute("src")).toContain("/api/slices/idea-ledger-triage-ideas-cycle-4/proof-asset/");
   });
 
-  it("renders bare APPROVE + CHAT for actionable human queue cards (corrective \u00a77.1)", async () => {
+  it("renders structured responses and CHAT for a current human decision", async () => {
     const card = makeCard();
-    const { findAllByText, findByTestId, queryByText, queryByTestId } = renderWithRouterAndQuery(
+    const { findAllByText, findByText, findByTestId, queryByText, queryByTestId } = renderWithRouterAndQuery(
       <FeedCard
         card={card}
         queueItem={{
@@ -248,7 +248,12 @@ describe("FeedCard P5-1 wiring: show-context QueueItemTrigger", () => {
           tsUpdated: "2026-05-06T18:00:00Z",
           sourceSession: "orch-lead@openrig-velocity",
           destinationSession: "human@host",
-          state: "human-gate",
+          state: "pending",
+          summary: "Release authority",
+          humanRequestRevision: "current-request-revision",
+          humanQuestions: [{ id: "release", question: "Release now?", options: [
+            { id: "yes", label: "Release", recommended: true }, { id: "no", label: "Wait" },
+          ] }],
           priority: "urgent",
           tier: "fast",
           tags: ["human-review"],
@@ -257,15 +262,15 @@ describe("FeedCard P5-1 wiring: show-context QueueItemTrigger", () => {
       />,
     );
 
-    // CORRECTIVE §7.1 (founder N-1, 2026-07-05 + guard fixback 2026-07-06):
-    // the actionable card renders bare APPROVE + CHAT only. "Your turn" and
-    // "Choose response" chrome are GONE; deny/route are retired from the
-    // surface; the kind tag is the status label "Action required".
+    // Human decisions use their native question schema; ordinary agent cards keep verb actions.
     expect(await findByTestId(`feed-card-actions-${card.id}`)).toBeTruthy();
     expect((await findAllByText("Action required")).length).toBeGreaterThanOrEqual(1);
     expect(queryByText("Your turn")).toBeNull();
     expect(queryByText("Choose response")).toBeNull();
-    expect(await findByTestId("mc-verb-approve")).toBeTruthy();
+    expect(await findByText("Release (Recommended)")).toBeTruthy();
+    expect(await findByText("Ask a question")).toBeTruthy();
+    expect(await findByText("Write a custom response")).toBeTruthy();
+    expect(queryByTestId("mc-verb-approve")).toBeNull();
     expect(await findByTestId(`feed-card-chat-${card.id}`)).toBeTruthy();
     expect(queryByTestId("mc-verb-deny")).toBeNull();
     expect(queryByTestId("mc-verb-route")).toBeNull();

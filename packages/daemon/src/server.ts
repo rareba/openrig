@@ -95,6 +95,8 @@ import { PermissionDriftObserver, type PermissionDriftReader } from "./domain/pe
 import { chatRoutes } from "./routes/chat.js";
 import { streamRoutes } from "./routes/stream.js";
 import { queueRoutes } from "./routes/queue.js";
+import { githubIntakeRoutes } from "./routes/github-intake.js";
+import { humanResponsesRoutes } from "./routes/human-responses.js";
 import { workspaceRoutes } from "./routes/workspace.js";
 import { projectsRoutes } from "./routes/projects.js";
 import { viewsRoutes } from "./routes/views.js";
@@ -209,6 +211,9 @@ export interface AppDeps {
   slowOpRecorder?: SlowOperationInstrumentation;
   requestPhaseObserver?: import("./domain/request-phase-observer.js").RequestPhaseObserver;
   queueRepo?: QueueRepository;
+  githubIntakeService?: import("./domain/github-intake.js").GithubIntakeService;
+  githubIntakeScheduler?: import("./domain/github-poll-scheduler.js").PollScheduler;
+  humanResponseScheduler?: import("./domain/github-poll-scheduler.js").PollScheduler;
   /** S02 — the standing stuck sweep's observable heartbeat (ADDITIVE on healthz;
    *  absent = legacy body). Set by the index.ts scheduler when the loop starts. */
   stuckSweepStatus?: import("./domain/queue-stuck-sweep.js").StuckSweepStatus;
@@ -782,6 +787,8 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/rigs/:rigId/chat", chatRoutes());
   app.route("/api/stream", streamRoutes());
   app.route("/api/queue", queueRoutes());
+  app.route("/api/github-intake", githubIntakeRoutes({ service: deps.githubIntakeService, bearerToken: deps.missionControlBearerToken ?? null }));
+  app.route("/api/mission-control", humanResponsesRoutes({ queueRepo: deps.queueRepo, bearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/workspace", workspaceRoutes());
   app.route("/api/projects", projectsRoutes());
   app.route("/api/views", viewsRoutes());

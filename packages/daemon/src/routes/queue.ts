@@ -955,6 +955,7 @@ export function queueRoutes(): Hono {
   app.get("/list", (c) => {
     const destinationSession = c.req.query("destinationSession") || undefined;
     const sourceSession = c.req.query("sourceSession") || undefined;
+    const handedOffFrom = c.req.query("handedOffFrom") || undefined;
     const stateRaw = c.req.query("state") || undefined;
     const targetRepo = c.req.query("targetRepo") || undefined;
     const parsedLimit = queryLimit(c);
@@ -974,6 +975,7 @@ export function queueRoutes(): Hono {
 
     if (!attention) {
       const items = getRepo(c).list({
+        handedOffFrom,
         destinationSession,
         sourceSession,
         state,

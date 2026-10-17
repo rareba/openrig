@@ -7,6 +7,7 @@ export interface HumanQuestionOption {
   id: string;
   label: string;
   recommended?: boolean;
+  consequences?: string;
 }
 
 export interface HumanQuestion {
@@ -74,7 +75,11 @@ export function parseHumanQuestions(value: unknown): HumanQuestionsParse {
       if (o.label.length > MAX_OPTION_LABEL) return fail(`${optionWhere}: label is over Slack's ${MAX_OPTION_LABEL}-character button limit.`);
       if (o.recommended != null && typeof o.recommended !== "boolean") return fail(`${optionWhere}: recommended must be true or false.`);
       if (o.recommended) recommended++;
-      options.push(o.recommended ? { id: o.id, label: o.label, recommended: true } : { id: o.id, label: o.label });
+      if (o.consequences != null && (typeof o.consequences !== "string" || !o.consequences.trim() || o.consequences.length > MAX_QUESTION_TEXT)) {
+        return fail(`${optionWhere}: consequences must be nonempty text up to ${MAX_QUESTION_TEXT} characters.`);
+      }
+      options.push({ id: o.id, label: o.label, ...(o.recommended ? { recommended: true } : {}),
+        ...(typeof o.consequences === "string" ? { consequences: o.consequences } : {}) });
     }
     if (recommended > 1) return fail(`${where}: mark at most one option as recommended.`);
     questions.push({ id: q.id, question: q.question, options });
@@ -105,4 +110,21 @@ export function formatHumanAnswers(questions: readonly HumanQuestion[], answers:
 /** The questions still waiting for an answer. */
 export function unansweredQuestions(questions: readonly HumanQuestion[], answers: HumanAnswers): HumanQuestion[] {
   return questions.filter((q) => ownAnswer(answers, q.id) == null);
+}
+
+/** Clarification never answers a decision. Custom text answers only one question slot. */
+export type HumanResponse =
+  | { kind: "choice"; questionId: string; optionId: string }
+  | { kind: "custom" | "clarification"; text: string };
+
+export function parseHumanResponse(value: unknown): HumanResponse | null {
+  if (!value || typeof value !== "object") return null;
+  const r = value as Record<string, unknown>;
+  if (r.kind === "choice" && typeof r.questionId === "string" && ID_PATTERN.test(r.questionId)
+    && typeof r.optionId === "string" && ID_PATTERN.test(r.optionId)) {
+    return { kind: "choice", questionId: r.questionId, optionId: r.optionId };
+  }
+  if ((r.kind === "custom" || r.kind === "clarification") && typeof r.text === "string"
+    && r.text.trim() && r.text.length <= 10_000) return { kind: r.kind, text: r.text.trim() };
+  return null;
 }

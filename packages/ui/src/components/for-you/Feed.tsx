@@ -35,6 +35,7 @@ import {
 import { useNeedsInputSeats } from "../../hooks/useNeedsInputSeats.js";
 import {
   useQueueItemMap,
+  queueItemOriginKey,
   useSliceDetails,
   useSlices,
   type QueueItemDetail,
@@ -322,7 +323,10 @@ export function Feed() {
     setPendingUndo(null);
   }, []);
   const qitemIds = useMemo(
-    () => rawCards.map(qitemIdForCard).filter((id): id is string => Boolean(id)),
+    () => rawCards.flatMap(card => {
+      const qitemId = qitemIdForCard(card);
+      return qitemId ? [{ qitemId, hostId: card.hostId ?? "local" }] : [];
+    }),
     [rawCards],
   );
   const queueItems = useQueueItemMap(qitemIds);
@@ -334,8 +338,8 @@ export function Feed() {
   const cards = useMemo(() => {
     const hydrated = rawCards.map((card) => {
       const qitemId = qitemIdForCard(card);
-      const item = qitemId ? queueItems.itemsById.get(qitemId) : undefined;
-      const outcome = qitemId ? actionOutcomes.get(qitemId) : undefined;
+      const item = qitemId ? queueItems.itemsById.get(queueItemOriginKey(qitemId, card.hostId)) : undefined;
+      const outcome = qitemId && (!card.hostId || card.hostId === "local") ? actionOutcomes.get(qitemId) : undefined;
       const kind = hydratedCardKind(card, item, outcome);
       return kind === card.kind ? card : { ...card, kind };
     });
@@ -364,7 +368,7 @@ export function Feed() {
     for (const card of cards) {
       if (card.kind !== "shipped") continue;
       const qitemId = qitemIdForCard(card);
-      const item = qitemId ? queueItems.itemsById.get(qitemId) : undefined;
+      const item = qitemId ? queueItems.itemsById.get(queueItemOriginKey(qitemId, card.hostId)) : undefined;
       const sliceName = sliceForCard(card, item, sliceRows);
       if (sliceName) names.add(sliceName);
     }
@@ -495,11 +499,11 @@ export function Feed() {
         <div data-testid="for-you-feed-cards">
           {cards.map((c) => {
             const qitemId = qitemIdForCard(c);
-            const queueItem = qitemId ? queueItems.itemsById.get(qitemId) : undefined;
+            const queueItem = qitemId ? queueItems.itemsById.get(queueItemOriginKey(qitemId, c.hostId)) : undefined;
             const sliceName = c.kind === "shipped" ? sliceForCard(c, queueItem, sliceRows) : null;
             const proofPreview = sliceName ? proofPreviewForSlice(proofSlices.itemsByName.get(sliceName)) : null;
             const actionOutcome = qitemId
-              ? optimisticOutcomes.get(qitemId) ?? actionOutcomes.get(qitemId) ?? null
+              ? optimisticOutcomes.get(queueItemOriginKey(qitemId, c.hostId)) ?? ((!c.hostId || c.hostId === "local") ? actionOutcomes.get(qitemId) : null) ?? null
               : null;
             return (
               <FeedCard
@@ -509,7 +513,7 @@ export function Feed() {
                 proofPreview={proofPreview}
                 actionOutcome={actionOutcome}
                 onDismiss={handleDismiss}
-                onOptimisticOutcome={setOptimisticOutcome}
+                onOptimisticOutcome={(id, outcome) => setOptimisticOutcome(queueItemOriginKey(id, c.hostId), outcome)}
               />
             );
           })}

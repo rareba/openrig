@@ -385,6 +385,10 @@ export function proofAssetUrl(sliceName: string, relPath: string): string {
 }
 
 export interface QueueItemDetail {
+  humanRequestRevision?: string;
+  humanIntent?: "decision" | "update" | null;
+  humanQuestions?: import("../components/for-you/HumanResponse.js").HumanQuestion[] | null;
+  humanAnswers?: import("../components/for-you/HumanResponse.js").HumanAnswers | null;
   qitemId: string;
   tsCreated: string;
   tsUpdated: string;
@@ -427,22 +431,29 @@ export interface QueueItemMapResult {
   missingIds: string[];
 }
 
-async function fetchQueueItem(qitemId: string): Promise<QueueItemDetail | null> {
-  const res = await fetch(`/api/queue/${encodeURIComponent(qitemId)}`);
+async function fetchQueueItem(qitemId: string, hostId = "local"): Promise<QueueItemDetail | null> {
+  const res = await fetch(withHostParam(`/api/queue/${encodeURIComponent(qitemId)}`, hostId));
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return (await res.json()) as QueueItemDetail;
 }
 
-export function useQueueItemMap(qitemIds: string[]): QueueItemMapResult {
+export function queueItemOriginKey(qitemId: string, hostId = "local"): string {
+  return hostId === "local" ? qitemId : JSON.stringify([hostId, qitemId]);
+}
+
+export function useQueueItemMap(qitemIds: Array<string | { qitemId: string; hostId?: string }>): QueueItemMapResult {
   const uniqueIds = useMemo(
-    () => Array.from(new Set(qitemIds.filter((id) => id.length > 0))).sort(),
+    () => Array.from(new Map(qitemIds.map(value => {
+      const ref = typeof value === "string" ? { qitemId: value, hostId: "local" } : { ...value, hostId: value.hostId ?? "local" };
+      return [queueItemOriginKey(ref.qitemId, ref.hostId), ref] as const;
+    }).filter(([, ref]) => ref.qitemId.length > 0)).values()),
     [qitemIds],
   );
   const queries = useQueries({
-    queries: uniqueIds.map((qitemId) => ({
-      queryKey: ["queue", "item", qitemId],
-      queryFn: () => fetchQueueItem(qitemId),
+    queries: uniqueIds.map(({ qitemId, hostId }) => ({
+      queryKey: ["queue", "item", qitemId, hostId],
+      queryFn: () => fetchQueueItem(qitemId, hostId),
       staleTime: 30_000,
     })),
   });
@@ -450,12 +461,13 @@ export function useQueueItemMap(qitemIds: string[]): QueueItemMapResult {
   return useMemo(() => {
     const itemsById = new Map<string, QueueItemDetail>();
     const missingIds: string[] = [];
-    uniqueIds.forEach((qitemId, idx) => {
+    uniqueIds.forEach(({ qitemId, hostId }, idx) => {
+      const key = queueItemOriginKey(qitemId, hostId);
       const item = queries[idx]?.data;
       if (item) {
-        itemsById.set(qitemId, item);
+        itemsById.set(key, item);
       } else if (queries[idx]?.status === "success") {
-        missingIds.push(qitemId);
+        missingIds.push(key);
       }
     });
     return {

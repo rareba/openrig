@@ -275,6 +275,41 @@ OpenRig is a multi-agent harness — it manages the system that coding agents fo
 
 Every agent runs in a tmux session you can attach to, inspect, and work with directly.
 
+## Automatic GitHub issue intake
+
+`rig github` runs on the coordinator daemon. Its GitHub CLI login must have access to the explicitly configured repositories; run `gh auth status` as the daemon account first. Intake is disabled until configured. Existing HTTP host registrations supply transport and bearer credentials; configuration contains no credentials.
+
+```json
+{
+  "enabled": true,
+  "assignee": "your-github-login",
+  "repositories": [{ "id": "123456", "name": "owner/project" }],
+  "targets": [
+    { "host": "local", "session": "manager@team", "physicalHost": "vm1", "capacity": 1, "capabilities": ["triage"] },
+    { "host": "worker2", "session": "coder@team", "physicalHost": "vm2", "capacity": 1, "capabilities": ["code", "review"] }
+  ],
+  "manager": { "host": "local", "session": "manager@team" },
+  "hostCapacity": 3,
+  "pollIntervalSeconds": 60
+}
+```
+
+```sh
+rig github configure --file intake.json
+rig github sync
+rig github status --json
+```
+
+Use the repository's REST numeric `id` or verified `node_id`. Both resolve to one durable issue identity. Only open issues assigned to the configured login enter intake. New issues require manager triage: inspect existing ownership, branches/PRs, dependencies and acceptance work, then record the next action against the exact source revision:
+
+```json
+{ "repositoryId": "123456", "number": 42, "revision": "2026-01-01T00:00:00Z", "eligibility": "ready", "capability": "review", "priority": "urgent", "reason": "Existing implementation is ready for independent review; review its PR before starting another implementation." }
+```
+
+Save that decision and run `rig github eligibility --file decision.json`. The manager's native triage packet includes the commands to finish triage and refresh the source revision. Eligible work is dispatched automatically, ordered by priority and intake age, within session and physical-host capacity. Host observations include existing work outside the configured targets. Unavailable or incomplete observations hold dispatch; a lost create response is read back using the same task ID. Native queue handoffs retain issue custody. Task completion does not close a GitHub issue or certify acceptance; existing review and delivery rules still apply. An already delivered issue is never silently restarted after an issue edit or reopen.
+
+For operator instructions, managers create native human queue requests with structured questions and options. In the web operator's **For You** feed, the addressed human can select a choice, ask a clarification question, or send a custom answer. Recommendations and consequences are shown when supplied. Local `human@kernel` requests work without Slack registration. Answers return to the requesting session, including across registered HTTP hosts. Other eligible work continues while a human decision is pending; an answer queues a continuation through the existing guarded wake path. The interface records a receipt and rejects stale or conflicting replies. External notifications still require the existing gateway configuration.
+
 ## Teams
 
 Three teams grow with you, and the kernel operator helps you pick one:
