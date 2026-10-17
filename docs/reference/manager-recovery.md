@@ -8,7 +8,7 @@ The manager owns diagnosis, bounded repair, and verification. OpenRig's existing
 
 Read the current native task, its owner and handoffs, the seat's current occupant generation, and recent tool/provider results. Use the installed `rig ps`, `rig capture`, `rig queue`, `rig seat`, and `rig watchdog` help to discover supported operations. Private installations may have additional input receipts; capability-check them before use. Never substitute terminal keystrokes when a native operation refuses a control command.
 
-Use the same native recovery row for the same unresolved incident. Record the seat generation, affected task IDs, exact failure and evidence reference, last successful work, attempted action, outcome, and next verification. A pending or claimed recovery row has one recovery owner. A stale generation or a completed incident cannot authorize repair of its replacement.
+Use the same native recovery row for the same unresolved incident. Claim a new incident through the native queue claim operation before repair; an in-progress state or a note saying “claimed” is not a pickup receipt. Record the seat generation, affected task IDs, exact failure and evidence reference, last successful work, attempted action, outcome, and next verification. A pending or claimed recovery row has one recovery owner. A stale generation or a completed incident cannot authorize repair of its replacement.
 
 | Observed blocker | Manager action | Required proof |
 | --- | --- | --- |
@@ -21,6 +21,8 @@ Use the same native recovery row for the same unresolved incident. Record the se
 ## Bound the recovery
 
 Make at most one lifecycle attempt for an unchanged incident. Read the plan before execution. On timeout, inspect that original attempt and the actual occupant before retrying; an uncertain outcome remains uncertain. A later action requires new evidence and a recorded manager disposition, not another timer tick.
+
+Copy exact revisions and hashes from current tool results; never expand an abbreviated commit from memory. Verify that the successor can actually read the cited binding instructions, refreshing the remote or using an authorized immutable source while preserving the checkout.
 
 Before replacing a conversation, prepare an explicit carrier containing current authorized task IDs, working directory/branch, exact next action, already observed side effects, and all held tasks and prohibitions. Validate the configured rebuild artifact paths, their readability and exact bytes before execution; writing a recap file alone does not prove it will be delivered. Some installed handover plans do not list selected artifacts: record that limitation instead of treating a successful dry-run as carrier proof. Check the execution result's delivered artifacts and verify that the successor reads the intended scope before taking task actions. Missing recap, missing provenance, or a fresh prompt must not be called transferred continuity. Do not let old checkpoints or unrelated blocked rows become new work by accident.
 
