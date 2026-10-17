@@ -97,6 +97,12 @@ missing tools or logins, kernel startup, a closed viewing terminal and recovery 
 before choosing an action. A healthy daemon doesn't by itself mean the project's seats are ready: check
 `rig ps --nodes --rig <rig-name>`.
 
+### Workers are running but work is stalled
+
+Use [Manager recovery](manager-recovery.md)
+(`rig context get reference/manager-recovery.md`). Inspect current faults and queue custody, use the existing
+manager watchdog for bounded recovery, and require renewed task progress before closing an incident.
+
 ### The agent is waiting for permission or can't reach the daemon
 
 Read [Have your agent configure permissions](getting-started.md#have-your-agent-configure-permissions)

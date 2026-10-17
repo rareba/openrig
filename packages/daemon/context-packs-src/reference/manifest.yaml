@@ -17,3 +17,6 @@ files:
   - path: whats-new.md
     role: reference
     summary: "What changed in the installed version, for an agent on an upgraded install."
+  - path: manager-recovery.md
+    role: reference
+    summary: "Manager recovery of stalled workers while preserving task custody and human holds."

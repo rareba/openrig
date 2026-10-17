@@ -603,8 +603,8 @@ test("HELP ADDRESSES: every guide address taught in help.md resolves through the
     runProduction(out);
     const helpSource = readFileSync(join(REPO, "docs/reference/help.md"), "utf8");
     const refDir = join(out, "reference");
-    assert.deepEqual(readdirSync(refDir).sort(), ["getting-started.md", "instance-layout.md", "manifest.yaml", "rig-spec.md", "whats-new.md"]);
-    for (const f of ["getting-started.md", "instance-layout.md", "rig-spec.md", "whats-new.md"]) {
+    assert.deepEqual(readdirSync(refDir).sort(), ["getting-started.md", "instance-layout.md", "manager-recovery.md", "manifest.yaml", "rig-spec.md", "whats-new.md"]);
+    for (const f of ["getting-started.md", "instance-layout.md", "manager-recovery.md", "rig-spec.md", "whats-new.md"]) {
       assert.ok(!lstatSync(join(refDir, f)).isSymbolicLink(), `${f} ships as a real file`);
       assert.equal(readFileSync(join(refDir, f), "utf8"), readFileSync(join(REPO, "docs/reference", f), "utf8"));
     }
@@ -615,6 +615,7 @@ test("HELP ADDRESSES: every guide address taught in help.md resolves through the
       "reference/getting-started.md#incomplete-setup-and-restart",
       "reference/getting-started.md#open-the-kernel-conversations",
       "reference/instance-layout.md",
+      "reference/manager-recovery.md",
       "reference/rig-spec.md",
       "reference/whats-new.md",
     ]);
