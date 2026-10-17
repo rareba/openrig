@@ -2,18 +2,20 @@
 
 This optional Hermes plugin lets the bound person discuss a native OpenRig question on WhatsApp, then send an explicit choice, custom answer, or clarification back to its original request. OpenRig's existing queue and human-response writer remain authoritative. A conversation or an LLM statement never records an approval.
 
-The plugin uses Hermes' existing WhatsApp adapter and existing API-server lifecycle. It creates no process, port, account, or credentials. Keep the plugin disabled until the actual WhatsApp profile, chat and sender have been verified. Telegram and OpenClaw are outside this first slice.
+The plugin uses Hermes' existing WhatsApp adapter and supervised plugin task lifecycle. It creates no process, port, account, or credentials. Keep the plugin disabled until the actual WhatsApp profile, chat and sender have been verified. Telegram and OpenClaw are outside this first slice.
 
 ## Supported Hermes extension points
 
-Verified against Hermes source `d923a5eb487a17c0a68801bba9ef0f56c81040a8` and its [official plugin documentation](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins):
+Verified against the deployed Hermes source `71d34bad1045610252eda02ee79549436896e784` (also compatible with `d923a5eb487a17c0a68801bba9ef0f56c81040a8`) and its [official plugin documentation](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins):
 
-- `register_platform_handler("api_server", factory)` supplies the existing aiohttp application before `AppRunner.setup()`. Its `cleanup_ctx` starts and cancels polling with that gateway.
+- `ctx.spawn_task` supervises polling and status notices. `ctx.on_unload` cancels them on unload; normal gateway shutdown also cancels them through its existing asyncio lifecycle.
 - `register_platform_handler("whatsapp", factory)` supplies the adapter. `is_connected` and `send()` are public APIs; `SendResult.message_id` and `continuation_message_ids` provide platform receipt identities.
 - `pre_gateway_dispatch` receives the native message and quoted-message identity. It runs before Hermes authorization, so this plugin independently checks the exact configured profile, chat and sender before handling an OpenRig reply.
 - `ctx.get_config`, `ctx.profile_name` and durable `ctx.state` provide the existing plugin settings, authoritative profile and atomic profile-scoped state.
 
-Use a compatible Hermes installation with both existing platforms enabled. Install this directory as a trusted user plugin using Hermes' supported plugin installation procedure, then restart that gateway so the API-server startup/shutdown hook is installed. This plugin does not enable either platform or change Hermes access lists. A gateway without the existing API server has no polling lifecycle and cannot provide offline delivery.
+Use a compatible Hermes installation with its existing WhatsApp platform enabled. Install this directory as a trusted user plugin using Hermes' supported plugin installation procedure, then run `hermes plugins enable openrig-human-relay` in that gateway's existing profile and restart the gateway. This preserves other enabled plugins; the settings entry alone does not add this plugin to Hermes' `plugins.enabled` allow-list. No API server is required, enabled or exposed, and this plugin does not change Hermes access lists.
+
+The WhatsApp connection factory starts one supervised poll task; the existing webhook platform, when enabled, also starts the same task so previously saved inbound replies can retry before WhatsApp connects. Neither factory creates a listener or changes routes. Reconnecting updates the adapter without starting another poller. While WhatsApp is disconnected, native questions and saved replies remain retained. If neither an existing webhook nor WhatsApp has connected since gateway startup, no factory has fired yet, so saved inbound retries wait for platform startup. On successful connection, the existing durable retry lanes resume.
 
 ## Explicit binding
 
@@ -40,7 +42,6 @@ In the existing Hermes plugin settings, set:
 plugins:
   entries:
     openrig-human-relay:
-      enabled: true
       settings:
         connector_id: hermes
         openrig_url: http://127.0.0.1:17433

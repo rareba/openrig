@@ -15,8 +15,10 @@ class State:
  def set(self,key,value):self.data[key]=copy.deepcopy(value)
 class Context:
  profile_name='default'
- def __init__(self):self.state=State();self.hooks={};self.platforms={}
+ def __init__(self):self.state=State();self.hooks={};self.platforms={};self.unload=[]
  def get_config(self,key,default=None):return {'connector_id':'hermes','origin_hosts':['local'],'openrig_url':'http://127.0.0.1:17433'}.get(key,default)
+ def on_unload(self,callback):self.unload.append(callback)
+ def spawn_task(self,coro,*,name=None):return asyncio.create_task(coro,name=name)
  def register_hook(self,name,callback):self.hooks[name]=callback
  def register_platform_handler(self,name,callback):self.platforms[name]=callback
 class Transport:
@@ -41,7 +43,7 @@ def event(text='/choose 1',sender='person',quote='platform-1'):
  return types.SimpleNamespace(text=text,message_id='inbound-1',reply_to_message_id=quote,source=types.SimpleNamespace(platform=types.SimpleNamespace(value='whatsapp'),profile='default',chat_id='chat',user_id=sender))
 class PluginTests(unittest.IsolatedAsyncioTestCase):
  async def asyncSetUp(self):
-  self.ctx=Context();self.transport=Transport();self.clock=10000;self.now=lambda:self.clock;self.plugin=module.RelayPlugin(self.ctx,self.transport,now=self.now);self.adapter=Adapter();self.plugin.attach_whatsapp(None,self.adapter)
+  self.ctx=Context();self.transport=Transport();self.clock=10000;self.now=lambda:self.clock;self.plugin=module.RelayPlugin(self.ctx,self.transport,now=self.now);self.adapter=Adapter();self.plugin.adapter=self.adapter
  async def test_disconnected_adapter_never_claims_and_recovers_when_online(self):
   self.adapter.is_connected=False;await self.plugin.poll_once();self.assertEqual(self.transport.calls,[])
   self.adapter.is_connected=True;await self.plugin.poll_once();self.assertEqual(len(self.adapter.sent),1);self.assertIn('Test data only.',self.adapter.sent[0][1]);self.assertIn('/answer',self.adapter.sent[0][1])
@@ -165,8 +167,39 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
    return await original(operation,payload)
   self.transport.post=refused;await self.plugin.handle_event(event('/answer Old answer'));await self.plugin.poll_once();await asyncio.sleep(0)
   self.assertIn('not accept',self.adapter.sent[-1][1]);self.assertNotIn('recorded your answer',self.adapter.sent[-1][1])
- async def test_aiohttp_native_lifecycle_cancels_poll_on_shutdown(self):
-  app=types.SimpleNamespace(cleanup_ctx=[]);self.plugin.attach_api(app,None);self.assertEqual(len(app.cleanup_ctx),1)
-  context=app.cleanup_ctx[0](app);await context.__anext__();await asyncio.sleep(0)
-  with self.assertRaises(StopAsyncIteration):await context.__anext__()
+ async def test_whatsapp_factory_starts_once_reconnects_and_unloads_without_api_server(self):
+  module.register(self.ctx);plugin=self.ctx.hooks['pre_gateway_dispatch'].__self__;plugin.transport=self.transport
+  self.assertNotIn('api_server',self.ctx.platforms)
+  self.ctx.platforms['whatsapp'](None,self.adapter);first=plugin.poll_task
+  replacement=Adapter();self.ctx.platforms['whatsapp'](None,replacement)
+  self.assertIs(plugin.poll_task,first);self.assertIs(plugin.adapter,replacement)
+  self.adapter=replacement
+  await asyncio.sleep(0);self.assertEqual(len(self.adapter.sent),1)
+  self.adapter.is_connected=False;await plugin.poll_once();self.assertEqual(len(self.adapter.sent),1)
+  self.adapter.is_connected=True;await plugin.poll_once();self.assertEqual(len(self.adapter.sent),1)
+  for callback in self.ctx.unload:callback()
+  await asyncio.gather(first,return_exceptions=True);self.assertTrue(first.cancelled())
+  self.assertFalse(plugin.notice_tasks)
+ async def test_existing_webhook_boot_retries_saved_answer_before_whatsapp_connects(self):
+  await self.plugin.poll_once();await self.plugin.handle_event(event('/answer Saved before restart'))
+  module.register(self.ctx);plugin=self.ctx.hooks['pre_gateway_dispatch'].__self__;plugin.transport=self.transport
+  self.transport.calls=[]
+  self.ctx.platforms['webhook'](None,None);first=plugin.poll_task;await asyncio.sleep(0)
+  self.assertIsNone(plugin.adapter)
+  self.assertEqual(list(self.ctx.state.get('inbound').values())[0]['state'],'recorded')
+  self.assertFalse(any(op=='pull' for op,p in self.transport.calls))
+  self.ctx.platforms['whatsapp'](None,self.adapter);self.assertIs(plugin.poll_task,first)
+  for callback in self.ctx.unload:callback()
+  await asyncio.gather(first,return_exceptions=True)
+ async def test_unload_cancels_inflight_notice_and_does_not_restart(self):
+  module.register(self.ctx);plugin=self.ctx.hooks['pre_gateway_dispatch'].__self__;plugin.transport=self.transport
+  self.ctx.platforms['whatsapp'](None,self.adapter);await asyncio.sleep(0)
+  waiting=asyncio.Event()
+  async def slow_send(*args,**kwargs):await waiting.wait()
+  self.adapter.send=slow_send;await plugin.handle_event(event('/answer Original reply'));await asyncio.sleep(0)
+  tasks=[plugin.poll_task,*plugin.notice_tasks.values()]
+  for callback in self.ctx.unload:callback()
+  await asyncio.gather(*tasks,return_exceptions=True)
+  self.assertTrue(all(t.cancelled() for t in tasks))
+  self.ctx.platforms['whatsapp'](None,self.adapter);self.assertIs(plugin.poll_task,tasks[0])
 if __name__=='__main__':unittest.main()

@@ -2,7 +2,6 @@
 No LLM turn can manufacture a native answer. Quoted explicit commands own submission.
 """
 import asyncio
-import contextlib
 import hashlib
 import json
 import logging
@@ -82,27 +81,28 @@ class RelayPlugin:
         self.host_cursor = 0
         self.notice_tasks = {}
         self.notice_limit = asyncio.Semaphore(2)
+        self.poll_task = None
+        self.stopped = False
+        ctx.on_unload(self.stop)
 
     def attach_whatsapp(self, native, adapter):
         self.adapter = adapter
+        self.start()
 
-    def attach_api(self, app, adapter):
-        # Verified Hermes API-server platform hook supplies aiohttp.Application before
-        # AppRunner.setup(). Its cleanup context is the existing gateway lifecycle.
-        app.cleanup_ctx.append(self.lifecycle)
+    def attach_webhook(self, native, adapter):
+        # Existing webhook calls its factory with None after binding; only start
+        # supervised retries, without inspecting its app or changing routes.
+        self.start()
 
-    async def lifecycle(self, app):
-        task = asyncio.create_task(self.run())
-        try:
-            yield
-        finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-            notices = list(self.notice_tasks.values())
-            for notice in notices:
-                notice.cancel()
-            await asyncio.gather(*notices, return_exceptions=True)
+    def start(self):
+        if not self.stopped and (self.poll_task is None or self.poll_task.done()):
+            self.poll_task = self.ctx.spawn_task(self.run(), name='openrig-human-relay:poll')
+
+    def stop(self):
+        self.stopped = True
+        for task in [self.poll_task, *self.notice_tasks.values()]:
+            if task and not task.done() and not task.get_loop().is_closed():
+                task.get_loop().call_soon_threadsafe(task.cancel)
 
     async def run(self):
         while True:
@@ -145,7 +145,7 @@ class RelayPlugin:
         return 'Your reply is saved in Hermes and queued for confirmation by OpenRig. A native receipt has not been confirmed yet.'
 
     def schedule_notice(self, identity, failure=None):
-        if identity in self.notice_tasks and not self.notice_tasks[identity].done():
+        if self.stopped or (identity in self.notice_tasks and not self.notice_tasks[identity].done()):
             return
         async def deliver():
             async with self.notice_limit:
@@ -173,7 +173,7 @@ class RelayPlugin:
                     raise
                 except Exception:
                     logging.getLogger(__name__).warning('OpenRig reply status notification could not be confirmed; durable response state is unchanged.')
-        task = asyncio.create_task(deliver())
+        task = self.ctx.spawn_task(deliver(), name='openrig-human-relay:notice')
         self.notice_tasks[identity] = task
         def finished(done):
             if self.notice_tasks.get(identity) is done:
@@ -415,6 +415,6 @@ class RelayPlugin:
 
 def register(ctx):
     plugin = RelayPlugin(ctx)
-    ctx.register_platform_handler('api_server', plugin.attach_api)
     ctx.register_platform_handler('whatsapp', plugin.attach_whatsapp)
+    ctx.register_platform_handler('webhook', plugin.attach_webhook)
     ctx.register_hook('pre_gateway_dispatch', plugin.handle_event)
