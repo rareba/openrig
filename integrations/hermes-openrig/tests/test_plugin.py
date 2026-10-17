@@ -76,6 +76,23 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
  async def test_conversation_uses_readonly_current_context_without_submitting_an_answer(self):
   await self.plugin.poll_once();result=await self.plugin.handle_event(event('What are the alternatives?'));self.assertEqual(result['action'],'rewrite');self.assertIn('Current native context',result['text']);self.assertFalse(any(op=='respond' for op,p in self.transport.calls))
   self.assertIsNone(await self.plugin.handle_event(event('Ordinary chat',quote=None)))
+ async def test_native_stanza_only_quote_remains_linked_and_unquoted_input_is_not_inferred(self):
+  await self.plugin.poll_once()
+  e=event(quote=None)
+  self.assertIsNone(await self.plugin.handle_event(e));self.assertEqual(self.ctx.state.get('inbound',{}),{})
+  # SDK71 drops the structured reply id when quoted text is absent, but retains
+  # the native bridge stanza id and its event identity in raw_message.
+  e.raw_message={'hasQuotedMessage':False,'quotedMessageId':'platform-1','messageId':e.message_id,'chatId':'chat','senderId':'person'}
+  result=await self.plugin.handle_event(e);self.assertIsNotNone(result);self.assertEqual(result['action'],'skip')
+  saved=list(self.ctx.state.get('inbound').values())[0]['payload']
+  self.assertEqual(saved['replyToMessageId'],'platform-1');self.assertEqual(saved['qitemId'],'question-1')
+  self.assertEqual(saved['response'],{'kind':'choice','questionId':'sample','optionId':'blue'})
+ async def test_raw_quote_requires_matching_native_message_chat_and_sender(self):
+  await self.plugin.poll_once()
+  for field in ('messageId','chatId','senderId'):
+   e=event(quote=None);e.raw_message={'quotedMessageId':'platform-1','messageId':e.message_id,'chatId':'chat','senderId':'person',field:'different'}
+   self.assertIsNone(await self.plugin.handle_event(e))
+  self.assertEqual(self.ctx.state.get('inbound',{}),{})
  async def test_terminal_stale_native_response_is_retained_and_never_retargeted(self):
   await self.plugin.poll_once();original=self.transport.post
   async def refused(operation,payload):

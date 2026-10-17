@@ -338,6 +338,19 @@ class RelayPlugin:
         return next((item for item in self.ctx.state.get('outbound', {}).values()
                      if quoted_id and quoted_id in item.get('messageIds', [])), None)
 
+    def quoted_id(self, event):
+        quoted = getattr(event, 'reply_to_message_id', None)
+        if quoted:
+            return quoted
+        # SDK71 omits the structured id for native stanza-only WhatsApp quotes.
+        raw = getattr(event, 'raw_message', None)
+        if (isinstance(raw, dict) and isinstance(raw.get('quotedMessageId'), str)
+                and raw.get('messageId') == event.message_id
+                and raw.get('chatId') == event.source.chat_id
+                and raw.get('senderId') == event.source.user_id):
+            return raw['quotedMessageId'] or None
+        return None
+
     async def handle_event(self, event, **kwargs):
         try:
             return await self._handle_event(event, **kwargs)
@@ -347,7 +360,7 @@ class RelayPlugin:
             source = getattr(event, 'source', None)
             platform = getattr(getattr(source, 'platform', None), 'value', None)
             command = str(getattr(event, 'text', '')).strip().split(maxsplit=1)
-            if (platform == 'whatsapp' and getattr(event, 'reply_to_message_id', None)
+            if (platform == 'whatsapp' and self.quoted_id(event)
                     and command and command[0] in ('/choose', '/answer', '/ask')):
                 return {'action': 'skip', 'reason': 'OpenRig storage or transport failed; no success is claimed. The original reply remains retained if it was persisted.'}
             return None
@@ -356,7 +369,8 @@ class RelayPlugin:
         source = event.source
         if getattr(getattr(source, 'platform', None), 'value', None) != 'whatsapp':
             return None
-        item = self.known_question(getattr(event, 'reply_to_message_id', None))
+        quoted_id = self.quoted_id(event)
+        item = self.known_question(quoted_id)
         if not item:
             return None
         d = item['delivery']
@@ -366,7 +380,7 @@ class RelayPlugin:
         text = event.text.strip()
         base = {'hostId': item['hostId'], 'deliveryId': d['deliveryId'], 'connectorId': d['connectorId'],
                 'profile': profile, 'chatId': source.chat_id, 'senderId': source.user_id,
-                'replyToMessageId': event.reply_to_message_id}
+                'replyToMessageId': quoted_id}
         command = text.split(maxsplit=1)[0] if text else ''
         if command not in ('/choose', '/answer', '/ask'):
             try:
