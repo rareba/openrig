@@ -314,6 +314,8 @@ For operator instructions, managers create native human queue requests with stru
 
 For WhatsApp conversations through an existing Hermes gateway, the optional [Hermes human relay](integrations/hermes-openrig/README.md) preserves native question identity and queues explicit replies while either side is offline. It requires a verified sender/chat binding. Conversational context is read-only; quoted choice, answer and clarification commands submit the native response. Uncertain platform sends remain held for reconciliation.
 
+For workers that are running but no longer producing results, use [manager recovery](docs/reference/manager-recovery.md) with the existing manager watchdog and native recovery queue. Managers inspect the actual fault, choose one bounded repair, retain ownership and human holds, and verify renewed task progress before closing the incident.
+
 ## Teams
 
 Three teams grow with you, and the kernel operator helps you pick one:
