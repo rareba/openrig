@@ -12,7 +12,9 @@ export function githubCommand(override?: StatusDeps): Command {
     const status = await getDaemonStatus(deps.lifecycleDeps);
     if (!daemonStatusGuard(status, { json })) return;
     const client = deps.clientFactory(getDaemonUrl(status));
-    const result = method === "GET" ? await client.get(path) : await client.post(path, body);
+    const bearer = process.env.OPENRIG_AUTH_BEARER_TOKEN;
+    const auth = bearer ? { headers: { Authorization: `Bearer ${bearer}` } } : undefined;
+    const result = method === "GET" ? await client.get(path, auth) : await client.post(path, body, auth);
     console.log(JSON.stringify(result.data, null, json ? undefined : 2));
     if (result.status >= 400) process.exitCode = result.status >= 500 ? 2 : 1;
   }

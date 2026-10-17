@@ -279,6 +279,8 @@ Every agent runs in a tmux session you can attach to, inspect, and work with dir
 
 `rig github` runs on the coordinator daemon. Its GitHub CLI login must have access to the explicitly configured repositories; run `gh auth status` as the daemon account first. Intake is disabled until configured. Existing HTTP host registrations supply transport and bearer credentials; configuration contains no credentials.
 
+When the coordinator requires a bearer token, provide its existing token through `OPENRIG_AUTH_BEARER_TOKEN` in the CLI environment, as for Mission Control writes. Do not put it in the intake configuration.
+
 ```json
 {
   "enabled": true,
