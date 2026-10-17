@@ -11,7 +11,8 @@ const { TmuxAdapter } = await load("adapters/tmux");
 const { migrate } = await load("db/migrate"), { ALL_MIGRATIONS } = await load("db/all-migrations");
 const { RigRepository } = await load("domain/rig-repository"), { SessionRegistry } = await load("domain/session-registry");
 const { EventBus } = await load("domain/event-bus"), { Reconciler } = await load("domain/reconciler");
-const execute = promisify(execFile), socket = join(home, "tmux.sock");
+const execute = promisify(execFile);
+let socket = join(home, "tmux.sock");
 const native = async args => (await execute("tmux", ["-S", socket, ...args], { timeout: 5000 })).stdout;
 const quote = s => "'" + s.replace(/'/g, "'\"'\"'") + "'";
 const shell = async command => (await execute("sh", ["-c", command.replace(/^tmux /, `tmux -S ${quote(socket)} `)], { timeout: 5000 })).stdout;
@@ -51,8 +52,10 @@ try {
   // Literal-leading-equals case also reported by lab1207 in PR #460.
   // Each arrangement uses real tmux targets through both adapter APIs.
   const literal = "=worker@demo", plain = "worker@demo";
-  for (const names of [[literal], [plain], [literal, plain]]) {
+  for (const [index, names] of [[literal], [plain], [literal, plain]].entries()) {
     await native(["kill-server"]);
+    // A fresh socket avoids racing the previous server's shutdown.
+    socket = join(home, `tmux-${index}.sock`);
     // Keep the private server live when the literal case removes its only pane.
     await native(["new-session", "-d", "-s", "fixture-anchor", "sleep 120"]);
     for (const name of names) await native(["new-session", "-d", "-s", name, "sleep 120"]);
