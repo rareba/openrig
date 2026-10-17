@@ -93,6 +93,29 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
    e=event(quote=None);e.raw_message={'quotedMessageId':'platform-1','messageId':e.message_id,'chatId':'chat','senderId':'person',field:'different'}
    self.assertIsNone(await self.plugin.handle_event(e))
   self.assertEqual(self.ctx.state.get('inbound',{}),{})
+ async def test_native_owner_prefix_preserves_quoted_choice(self):
+  await self.plugin.poll_once();e=event('[owner reply] /choose 1')
+  e.metadata={'whatsapp_from_owner':True};e.raw_message={'fromOwner':True,'messageId':e.message_id,'chatId':'chat','senderId':'person'}
+  result=await self.plugin.handle_event(e);self.assertEqual(result['action'],'skip')
+  payload=list(self.ctx.state.get('inbound').values())[0]['payload']
+  self.assertEqual(payload['response'],{'kind':'choice','questionId':'sample','optionId':'blue'})
+  self.assertEqual(payload['replyToMessageId'],'platform-1')
+ async def test_owner_prefix_requires_native_markers_and_matching_event_identity(self):
+  await self.plugin.poll_once()
+  for field in ('metadata','fromOwner','messageId','chatId','senderId'):
+   e=event('[owner reply] /choose 1');e.metadata={'whatsapp_from_owner':True};e.raw_message={'fromOwner':True,'messageId':e.message_id,'chatId':'chat','senderId':'person'}
+   if field=='metadata':e.metadata={}
+   else:e.raw_message[field]=False if field=='fromOwner' else 'different'
+   result=await self.plugin.handle_event(e);self.assertEqual(result['action'],'rewrite')
+  self.assertEqual(self.ctx.state.get('inbound',{}),{})
+ async def test_owner_discussion_keeps_sdk_marker_without_recording_an_answer(self):
+  await self.plugin.poll_once();e=event('[owner reply] What are the alternatives?')
+  e.metadata={'whatsapp_from_owner':True};e.raw_message={'fromOwner':True,'messageId':e.message_id,'chatId':'chat','senderId':'person'}
+  result=await self.plugin.handle_event(e);self.assertEqual(result['action'],'rewrite');self.assertTrue(result['text'].startswith('[owner reply] '));self.assertEqual(self.ctx.state.get('inbound',{}),{})
+ async def test_native_owner_command_still_requires_a_quote(self):
+  await self.plugin.poll_once();e=event('[owner reply] /choose 1',quote=None)
+  e.metadata={'whatsapp_from_owner':True};e.raw_message={'fromOwner':True,'messageId':e.message_id,'chatId':'chat','senderId':'person'}
+  self.assertIsNone(await self.plugin.handle_event(e));self.assertEqual(self.ctx.state.get('inbound',{}),{})
  async def test_terminal_stale_native_response_is_retained_and_never_retargeted(self):
   await self.plugin.poll_once();original=self.transport.post
   async def refused(operation,payload):

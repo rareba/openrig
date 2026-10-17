@@ -351,6 +351,20 @@ class RelayPlugin:
             return raw['quotedMessageId'] or None
         return None
 
+    def command_text(self, event):
+        text = str(getattr(event, 'text', '')).strip()
+        raw = getattr(event, 'raw_message', None)
+        metadata = getattr(event, 'metadata', None)
+        # SDK71 prefixes owner messages; strip only its identity-matched native marker.
+        if (isinstance(metadata, dict) and metadata.get('whatsapp_from_owner') is True
+                and isinstance(raw, dict) and raw.get('fromOwner') is True
+                and raw.get('messageId') == event.message_id
+                and raw.get('chatId') == event.source.chat_id
+                and raw.get('senderId') == event.source.user_id
+                and text.startswith('[owner reply] ')):
+            return text[len('[owner reply] '):].strip()
+        return text
+
     async def handle_event(self, event, **kwargs):
         try:
             return await self._handle_event(event, **kwargs)
@@ -359,7 +373,7 @@ class RelayPlugin:
         except Exception:
             source = getattr(event, 'source', None)
             platform = getattr(getattr(source, 'platform', None), 'value', None)
-            command = str(getattr(event, 'text', '')).strip().split(maxsplit=1)
+            command = self.command_text(event).split(maxsplit=1)
             if (platform == 'whatsapp' and self.quoted_id(event)
                     and command and command[0] in ('/choose', '/answer', '/ask')):
                 return {'action': 'skip', 'reason': 'OpenRig storage or transport failed; no success is claimed. The original reply remains retained if it was persisted.'}
@@ -377,7 +391,7 @@ class RelayPlugin:
         profile = getattr(source, 'profile', None) or self.profile
         if (profile != d['profile'] or source.chat_id != d['chatId'] or source.user_id != d['senderId']):
             return {'action': 'skip', 'reason': 'OpenRig question belongs to a different bound sender/profile/chat.'}
-        text = event.text.strip()
+        text = self.command_text(event)
         base = {'hostId': item['hostId'], 'deliveryId': d['deliveryId'], 'connectorId': d['connectorId'],
                 'profile': profile, 'chatId': source.chat_id, 'senderId': source.user_id,
                 'replyToMessageId': quoted_id}
@@ -389,7 +403,7 @@ class RelayPlugin:
             except (OSError, TimeoutError, RelayFailure):
                 context = d
                 label = 'Historical snapshot; native OpenRig is unavailable'
-            return {'action': 'rewrite', 'text': text + '\n\n[Read-only OpenRig context: ' + label + '. '
+            return {'action': 'rewrite', 'text': event.text.strip() + '\n\n[Read-only OpenRig context: ' + label + '. '
                     'No answer is authorized or recorded by this conversation. Use an explicit quoted /choose, /answer, or /ask command to submit.]\n' + json.dumps(context, ensure_ascii=False)}
         try:
             argument = text[len(command):].strip()
