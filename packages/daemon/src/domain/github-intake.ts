@@ -50,7 +50,7 @@ export interface GithubTargetObservation {
   available: boolean;
   /** All active native queue work on this target, including intake assignments. */
   active: number;
-  /** All execution occupancy on this transport, including unconfigured seats. null is unknown. */
+  /** Occupied execution seats on this transport, including unconfigured seats. null is unknown. */
   hostActive?: number | null;
 }
 export interface GithubIntakeIO {
@@ -242,7 +242,7 @@ export class GithubIntakeService {
         const assigned = rows.filter(r => r.qitem_id && (r.current_host ?? r.target_host) === target.host && (r.current_session ?? r.target_session) === target.session);
         const knownActive = assigned.filter(r => tasks.has(r.qitem_id!) && !terminal(tasks.get(r.qitem_id!)!) && !waiting(tasks.get(r.qitem_id!)!)).length;
         const uncertain = assigned.filter(r => !tasks.has(r.qitem_id!)).length;
-        // Confirmed native tasks are already observed; unconfirmed reservations occupy extra slots.
+        // Confirmed native tasks are already observed; unconfirmed reservations consume session capacity.
         usage.set(targetKey(target), Math.max(observed?.active ?? 0, knownActive) + uncertain);
       }
       const machineUsage = (machine: string) => {
@@ -251,11 +251,12 @@ export class GithubIntakeService {
         for (const host of new Set(targets.map(t => t.host))) {
           const hostTargets = targets.filter(t => t.host === host);
           const hostObservations = observations.filter(o => o.host === host);
-          if (hostObservations.some(o => o.hostActive === null)) return Infinity;
+          if (!hostObservations.length || hostObservations.some(o => o.hostActive === null)) return Infinity;
           const observedTotal = hostObservations.some(o => o.hostActive !== undefined)
             ? Math.max(...hostObservations.map(o => o.hostActive ?? 0))
-            : hostTargets.reduce((n, t) => n + (observations.find(o => targetKey(o) === targetKey(t))?.active ?? 0), 0);
-          const delta = hostTargets.reduce((n, t) => n + Math.max(0, (usage.get(targetKey(t)) ?? 0) - (observations.find(o => targetKey(o) === targetKey(t))?.active ?? 0)), 0);
+            : hostTargets.reduce((n, t) => n + Math.min(1, observations.find(o => targetKey(o) === targetKey(t))?.active ?? 0), 0);
+          // Pending packets share a seat; only its first reservation adds physical occupancy.
+          const delta = hostTargets.reduce((n, t) => n + Math.max(0, Math.min(1, usage.get(targetKey(t)) ?? 0) - Math.min(1, observations.find(o => targetKey(o) === targetKey(t))?.active ?? 0)), 0);
           total += observedTotal + delta;
         }
         return total;
@@ -282,7 +283,7 @@ export class GithubIntakeService {
         if (!stage) continue;
         const target = config.targets.find(t => (stage === "triage" ? t.host === config.manager?.host && t.session === config.manager.session : t.capabilities.includes(row.capability!))
           && observations.some(o => targetKey(o) === targetKey(t) && o.available)
-          && (usage.get(targetKey(t)) ?? 0) < t.capacity && machineUsage(t.physicalHost) < config.hostCapacity);
+          && (usage.get(targetKey(t)) ?? 0) < t.capacity && machineUsage(t.physicalHost) + ((usage.get(targetKey(t)) ?? 0) > 0 ? 0 : 1) <= config.hostCapacity);
         if (!target) continue;
         const generation = row.generation + 1;
         const hash = createHash("sha256").update(`${row.repository_id}:${row.issue_number}:${generation}`).digest("hex").slice(0, 24);

@@ -281,4 +281,49 @@ describe("GitHub intake durable native queue dispatch", () => {
     const f = setup(); expect(() => f.service.configure({ ...config, targets: [...config.targets, { ...config.targets[0]!, session: "other@rig", physicalHost: "false-machine" }] })).toThrow();
   });
 
+  it("batches onto an already occupied seat at full physical capacity without opening another seat", async () => {
+    const f = setup([issue(), issue(2), issue(3)]);
+    f.service.configure({ ...config, hostCapacity: 1, targets: [{ ...config.targets[0]!, capacity: 3 }, { ...config.targets[0]!, session: "empty@rig" }] });
+    f.io.observeTargets = vi.fn(async () => [{ host: "host-a", session: "worker@rig", available: true, active: 1, hostActive: 1 }, { host: "host-a", session: "empty@rig", available: true, active: 0, hostActive: 1 }]);
+    await f.service.reconcile(); f.ready(); f.ready(2); f.ready(3); await f.service.reconcile();
+    expect(f.io.createTask).toHaveBeenCalledTimes(2);
+    expect([...f.tasks.values()].map(t => t.destinationSession)).toEqual(["worker@rig", "worker@rig"]);
+  });
+  it("denies a new empty seat when all three physical seats are occupied", async () => {
+    const f = setup(); f.io.observeTargets = vi.fn(async () => [{ host: "host-a", session: "worker@rig", available: true, active: 0, hostActive: 3 }]);
+    await f.service.reconcile(); f.ready(); await f.service.reconcile(); expect(f.io.createTask).not.toHaveBeenCalled();
+  });
+  it("counts multiple uncertain reservations on one seat once physically and individually per session", async () => {
+    const f = setup([issue(), issue(2), issue(3)]); f.service.configure({ ...config, hostCapacity: 1, targets: [{ ...config.targets[0]!, capacity: 2 }] });
+    await f.service.reconcile(); f.ready(); f.ready(2); f.ready(3);
+    f.io.createTask = vi.fn(async () => { throw new Error("uncertain"); }); await f.service.reconcile();
+    expect(f.io.createTask).toHaveBeenCalledTimes(2);
+    expect(f.service.status().issues.filter(row => row.qitemId)).toHaveLength(2);
+    await f.service.reconcile(); expect(f.service.status().issues.filter(row => row.qitemId)).toHaveLength(2);
+  });
+  it("uses occupied-seat fallback when hostActive is omitted even with ten packets", async () => {
+    const f = setup(); f.service.configure({ ...config, hostCapacity: 2, targets: [{ ...config.targets[0]!, capacity: 10, capabilities: [] }, { ...config.targets[0]!, session: "second@rig" }] });
+    f.io.observeTargets = vi.fn(async () => [{ host: "host-a", session: "worker@rig", available: true, active: 10 }, { host: "host-a", session: "second@rig", available: true, active: 0 }]);
+    await f.service.reconcile(); f.ready(); await f.service.reconcile();
+    expect(f.service.status().issues[0]?.session).toBe("second@rig");
+  });
+  it("retries held reservations at a full host without charging their seat twice", async () => {
+    const f = setup([issue(), issue(2)]); f.service.configure({ ...config, hostCapacity: 1, targets: [{ ...config.targets[0]!, capacity: 2 }] });
+    await f.service.reconcile(); f.ready(); f.ready(2); f.io.createTask = vi.fn(async () => { throw new Error("timeout before write"); });
+    await f.service.reconcile(); const ids = f.service.status().issues.map(row => row.qitemId); expect(ids.every(Boolean)).toBe(true);
+    await f.service.reconcile(); expect(f.io.createTask).toHaveBeenCalledTimes(4); expect(f.service.status().issues.map(row => row.qitemId)).toEqual(ids);
+  });
+
+  it("aggregates distinct transport host totals conservatively on the same physical machine", async () => {
+    const f = setup(); f.service.configure({ ...config, hostCapacity: 2, targets: [...config.targets, { ...config.targets[0]!, host: "host-alias", capabilities: [] }] });
+    f.io.observeTargets = vi.fn(async () => [{ host: "host-a", session: "worker@rig", available: true, active: 0, hostActive: 1 }, { host: "host-alias", session: "worker@rig", available: true, active: 0, hostActive: 1 }]);
+    await f.service.reconcile(); f.ready(); await f.service.reconcile(); expect(f.io.createTask).not.toHaveBeenCalled();
+  });
+
+  it("denies dispatch when a configured transport on the physical machine has no observation", async () => {
+    const f = setup(); f.service.configure({ ...config, targets: [...config.targets, { ...config.targets[0]!, host: "missing-host", capabilities: [] }] });
+    f.io.observeTargets = vi.fn(async () => [{ host: "host-a", session: "worker@rig", available: true, active: 0, hostActive: 0 }]);
+    await f.service.reconcile(); f.ready(); await f.service.reconcile(); expect(f.io.createTask).not.toHaveBeenCalled();
+  });
+
 });

@@ -172,7 +172,7 @@ export function createGithubIntakeIO(options: RuntimeOptions): GithubIntakeIO {
           };
           const sessions = new Set([...nodes.map(n => n.canonicalSessionName).filter((s): s is string => !!s),
             ...work.map(row => row.destinationSession).filter((s): s is string => typeof s === "string")]);
-          const hostActive = [...sessions].reduce((sum, session) => sum + active(session), 0);
+          const hostActive = [...sessions].reduce((sum, session) => sum + Math.min(1, active(session)), 0);
           const node = nodes.find(n => n.canonicalSessionName === target.session && !n.archived);
           const available = !!node && node.sessionStatus === "running" && node.startupStatus === "ready"
             && node.lifecycleState !== "attention_required" && !node.heldReason && node.agentActivity?.state !== "needs_input";

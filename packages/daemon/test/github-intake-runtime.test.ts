@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGithubIntakeIO, readGithubIssues } from "../src/adapters/github-intake.js";
-import type { GithubIntakeConfig } from "../src/domain/github-intake.js";
+import { GithubIntakeService, type GithubIntakeConfig } from "../src/domain/github-intake.js";
 
 const config: GithubIntakeConfig = { enabled: true, assignee: "operator", repositories: [{ id: "42", name: "owner/project" }], targets: [], hostCapacity: 3 };
 const issue = (number: number) => ({ number, html_url: `https://github.com/owner/project/issues/${number}`, title: "Fix the issue", body: "Details", updated_at: "2026-10-17T00:00:00Z", state: "open", assignees: [{ login: "operator" }] });
@@ -54,6 +54,32 @@ const targetConfig: GithubIntakeConfig = { ...config, targets: [{ host: "worker"
 const success = (payload: unknown): RemoteJsonResult => ({ ok: true, status: 200, payload });
 const node = (session: string, busy: boolean) => ({ canonicalSessionName: session, sessionStatus: "running", startupStatus: "ready", terminalActive: busy, agentActivity: { state: busy ? "running" : "idle" } });
 describe("GitHub native fleet transport", () => {
+  it("counts ten pending packets on one busy manager as one occupied physical seat", async () => {
+    const manager = "manager@project";
+    const { io } = runtime(path => path.startsWith("/api/ps") ? success([{ rigId: "live" }])
+      : path.includes("/nodes") ? success([node(manager, true), node("coder@project", false)])
+        : success(Array.from({ length: 10 }, (_, i) => ({ qitemId: `qitem-manager-${i}`, destinationSession: manager }))));
+    const targets = [targetConfig.targets[0]!, { ...targetConfig.targets[0]!, session: manager, capacity: 20 }];
+    expect(await io.observeTargets({ ...targetConfig, targets })).toEqual([
+      { host: "worker", session: "coder@project", available: true, active: 0, hostActive: 1 },
+      { host: "worker", session: manager, available: true, active: 10, hostActive: 1 },
+    ]);
+  });
+  it("dispatches a second native worker beside ten real manager packets under a physical cap of three", async () => {
+    const db = createFullTestDb(); cleanup.push(() => db.close());
+    const queue = new QueueRepository(db, new EventBus(db), { validateRig: () => true });
+    for (let i = 0; i < 10; i++) await queue.create({ sourceSession: "intake@system", destinationSession: "manager@project", body: `Triage ${i}`, nudge: false });
+    const io = createGithubIntakeIO({ queue, localNodes: () => [node("manager@project", true), node("coder@project", false)],
+      runGithub: async (_command, args) => JSON.stringify(args.includes("--paginate") ? [[issue(1)]] : { id: 42 }) });
+    const service = new GithubIntakeService(db, queue, io);
+    service.configure({ ...config, targets: [{ host: "local", physicalHost: "vm", session: "manager@project", capacity: 20, capabilities: ["triage"] }, { host: "local", physicalHost: "vm", session: "coder@project", capacity: 1, capabilities: ["code"] }] });
+    await service.reconcile(); service.markEligibility({ repositoryId: "42", number: 1, revision: issue(1).updated_at, eligibility: "ready", capability: "code", reason: "Existing ownership and downstream capacity checked" });
+    await service.reconcile();
+    expect(service.status().issues[0]?.session).toBe("coder@project");
+    expect(queue.list({ destinationSession: "manager@project", limit: 20 })).toHaveLength(10);
+    expect(queue.list({ destinationSession: "coder@project", limit: 20 })).toHaveLength(1);
+  });
+
   it("counts unconfigured writers and archived running seats before dispatch", async () => {
     const { io } = runtime(path => {
       if (path.startsWith("/api/ps")) return success([{ rigId: "live", archivedAt: null }, { rigId: "old", archivedAt: "yesterday" }]);
