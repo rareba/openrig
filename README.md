@@ -312,6 +312,8 @@ Save that decision and run `rig github eligibility --file decision.json`. The ma
 
 For operator instructions, managers create native human queue requests with structured questions and options. In the web operator's **For You** feed, the addressed human can select a choice, ask a clarification question, or send a custom answer. Recommendations and consequences are shown when supplied. Local `human@kernel` requests work without Slack registration. Answers return to the requesting session, including across registered HTTP hosts. Other eligible work continues while a human decision is pending; an answer queues a continuation through the existing guarded wake path. The interface records a receipt and rejects stale or conflicting replies. External notifications still require the existing gateway configuration.
 
+For WhatsApp conversations through an existing Hermes gateway, the optional [Hermes human relay](integrations/hermes-openrig/README.md) preserves native question identity and queues explicit replies while either side is offline. It requires a verified sender/chat binding. Conversational context is read-only; quoted choice, answer and clarification commands submit the native response. Uncertain platform sends remain held for reconciliation.
+
 ## Teams
 
 Three teams grow with you, and the kernel operator helps you pick one:

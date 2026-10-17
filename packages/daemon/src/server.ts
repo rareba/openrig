@@ -96,6 +96,7 @@ import { chatRoutes } from "./routes/chat.js";
 import { streamRoutes } from "./routes/stream.js";
 import { queueRoutes } from "./routes/queue.js";
 import { githubIntakeRoutes } from "./routes/github-intake.js";
+import { humanRelayRoutes } from "./routes/human-relay.js";
 import { humanResponsesRoutes } from "./routes/human-responses.js";
 import { workspaceRoutes } from "./routes/workspace.js";
 import { projectsRoutes } from "./routes/projects.js";
@@ -213,6 +214,7 @@ export interface AppDeps {
   queueRepo?: QueueRepository;
   githubIntakeService?: import("./domain/github-intake.js").GithubIntakeService;
   githubIntakeScheduler?: import("./domain/github-poll-scheduler.js").PollScheduler;
+  humanRelayService?: import("./domain/human-relay.js").HumanRelayService;
   humanResponseScheduler?: import("./domain/github-poll-scheduler.js").PollScheduler;
   /** S02 — the standing stuck sweep's observable heartbeat (ADDITIVE on healthz;
    *  absent = legacy body). Set by the index.ts scheduler when the loop starts. */
@@ -789,6 +791,7 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/queue", queueRoutes());
   app.route("/api/github-intake", githubIntakeRoutes({ service: deps.githubIntakeService, bearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/mission-control", humanResponsesRoutes({ queueRepo: deps.queueRepo, bearerToken: deps.missionControlBearerToken ?? null }));
+  app.route("/api/mission-control", humanRelayRoutes({ service: deps.humanRelayService, queueRepo: deps.queueRepo, bearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/workspace", workspaceRoutes());
   app.route("/api/projects", projectsRoutes());
   app.route("/api/views", viewsRoutes());

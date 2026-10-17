@@ -1,0 +1,155 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type Database from "better-sqlite3";
+import { Hono } from "hono";
+import { createDb } from "../src/db/connection.js";
+import { migrate } from "../src/db/migrate.js";
+import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
+import { EventBus } from "../src/domain/event-bus.js";
+import { QueueRepository } from "../src/domain/queue-repository.js";
+import { OutboxHandler, WAKE_INTENT_PREFIX } from "../src/domain/outbox-handler.js";
+import { HumanRelayService, type HumanRelayBinding } from "../src/domain/human-relay.js";
+import { humanRelayRoutes } from "../src/routes/human-relay.js";
+const binding: HumanRelayBinding = { connectorId: "hermes", humanSession: "human@kernel", profile: "default", chatId: "bound-chat", senderId: "bound-person" };
+const questions = [{ id: "sample", question: "Which synthetic sample?", options: [{ id: "blue", label: "Blue", recommended: true, consequences: "Record test data." }, { id: "green", label: "Green" }] }];
+describe("native Hermes human relay", () => {
+    let db: Database.Database;
+    let queue: QueueRepository;
+    let service: HumanRelayService;
+    let now: number;
+    beforeEach(() => { db = createDb(); migrate(db, ALL_MIGRATIONS); queue = new QueueRepository(db, new EventBus(db), { validateRig: () => true }); queue.attachOutbox(new OutboxHandler(db)); now = 100000; service = new HumanRelayService(db, queue, { bindings: () => [binding], hostId: () => "origin", now: () => now }); });
+    afterEach(() => { db.close(); vi.unstubAllEnvs(); });
+    const ask = () => queue.create({ sourceSession: "manager@team", destinationSession: "human@kernel", body: "Synthetic missing fact", summary: "Synthetic sample", evidenceRef: "/proof", humanIntent: "decision", humanQuestions: questions, nudge: false });
+    const pull = () => service.pull({ connectorId: "hermes", profile: "default" });
+    it("keeps the native request pending offline, claims durably before exposure and never resends an uncertain send", async () => {
+        const q = await ask();
+        expect(queue.getById(q.qitemId)?.state).toBe("pending");
+        const first = pull().deliveries[0]!;
+        expect(first.qitemId).toBe(q.qitemId);
+        expect(first.requestRevision).toBe(q.humanRequestRevision);
+        expect(new OutboxHandler(db).getById(first.deliveryId)?.deliveryState).toBe("sending");
+        expect(pull().deliveries).toEqual([]);
+        now += 120001;
+        expect(pull().deliveries).toEqual([]);
+        expect(new OutboxHandler(db).getById(first.deliveryId)?.deliveryState).toBe("indeterminate");
+        const restarted = new HumanRelayService(db, queue, { bindings: () => [binding], hostId: () => "origin", now: () => now });
+        expect(restarted.pull({ connectorId: "hermes", profile: "default" }).deliveries).toEqual([]);
+        expect(new OutboxHandler(db).listPending(WAKE_INTENT_PREFIX)).toEqual([]);
+    });
+    it("holds a crash after claim even before the send boundary and accepts only a recovered receipt", async () => {
+        await ask();
+        const d = pull().deliveries[0]!;
+        const restarted = new HumanRelayService(db, queue, { bindings: () => [binding], hostId: () => "origin", now: () => now });
+        expect(new OutboxHandler(db).getById(d.deliveryId)?.deliveryState).toBe("indeterminate");
+        expect(restarted.pull({ connectorId: "hermes", profile: "default" }).deliveries).toEqual([]);
+        restarted.receipt({ ...d, outcome: "platform-sent", messageIds: ["recovered-platform-id"] });
+        expect(new OutboxHandler(db).getById(d.deliveryId)?.deliveryState).toBe("delivered");
+    });
+    it("recovers a durable definite-unsent outcome across an origin restart without overriding a newer attempt", async () => {
+        await ask();
+        const d = pull().deliveries[0]!;
+        const restarted = new HumanRelayService(db, queue, { bindings: () => [binding], hostId: () => "origin", now: () => now });
+        expect(new OutboxHandler(db).getById(d.deliveryId)?.deliveryState).toBe("indeterminate");
+        expect(restarted.receipt({ ...d, outcome: "not-attempted" })).toEqual({ state: "pending" });
+        now += 61000;
+        const next = restarted.pull({ connectorId: "hermes", profile: "default" }).deliveries[0]!;
+        expect(next.deliveryId).toBe(d.deliveryId);
+        expect(next.attemptId).not.toBe(d.attemptId);
+        expect(() => restarted.receipt({ ...d, outcome: "not-attempted" })).toThrow(/different attempt/);
+        expect(new OutboxHandler(db).getById(next.deliveryId)?.deliveryState).toBe("sending");
+    });
+    it("retries only a confirmed not-attempted send with backoff and unchanged identity", async () => {
+        await ask();
+        const d = pull().deliveries[0]!;
+        service.receipt({ ...d, outcome: "not-attempted" });
+        expect(pull().deliveries).toEqual([]);
+        now += 61000;
+        const retry = pull().deliveries[0]!;
+        expect(retry.deliveryId).toBe(d.deliveryId);
+        expect(retry.attemptId).not.toBe(d.attemptId);
+    });
+    it("requires a real platform receipt and binds quoted responses to sender, profile, chat and the immutable revision", async () => {
+        const q = await ask();
+        const d = pull().deliveries[0]!;
+        expect(() => service.receipt({ ...d, outcome: "platform-sent", messageIds: [] })).toThrow();
+        service.receipt({ ...d, outcome: "platform-sent", messageIds: ["platform-1"] });
+        const inbound = { deliveryId: d.deliveryId, connectorId: "hermes", profile: "default", chatId: "bound-chat", senderId: "bound-person", messageId: "inbound-1", replyToMessageId: "platform-1", qitemId: q.qitemId, requestRevision: d.requestRevision, response: { kind: "choice" as const, questionId: "sample", optionId: "blue" } };
+        expect(() => service.responseInput({ ...inbound, senderId: "other" })).toThrow();
+        expect(() => service.responseInput({ ...inbound, profile: "other" })).toThrow();
+        expect(() => service.responseInput({ ...inbound, chatId: "other" })).toThrow();
+        expect(() => service.responseInput({ ...inbound, replyToMessageId: "other" })).toThrow();
+        expect(() => service.responseInput({ ...inbound, requestRevision: "changed" })).toThrow();
+        const input = service.responseInput(inbound);
+        expect(input.actorSession).toBe("human@kernel");
+        expect(input.requestRevision).toBe(d.requestRevision);
+        const receipt = queue.recordHumanResponse(input);
+        expect(queue.recordHumanResponse(service.responseInput(inbound))).toEqual(receipt);
+        expect(queue.getById(q.qitemId)?.humanAnswers).toEqual({ sample: "blue" });
+    });
+    it("revalidates changed, canceled and update requests; a late outbound receipt cannot authorize stale work", async () => {
+        const q = await ask();
+        const d = pull().deliveries[0]!;
+        queue.update({ qitemId: q.qitemId, actorSession: "manager@team", summary: "Changed question" });
+        service.receipt({ ...d, outcome: "platform-sent", messageIds: ["platform-1"] });
+        const input = service.responseInput({ deliveryId: d.deliveryId, connectorId: "hermes", profile: "default", chatId: "bound-chat", senderId: "bound-person", messageId: "late", replyToMessageId: "platform-1", qitemId: q.qitemId, requestRevision: d.requestRevision, response: { kind: "custom", text: "Old answer" } });
+        expect(() => queue.recordHumanResponse(input)).toThrow(/changed/);
+        expect(service.context({ deliveryId: d.deliveryId, ...binding, replyToMessageId: "platform-1" }).current).toBe(false);
+        queue.update({ qitemId: q.qitemId, actorSession: "manager@team", state: "canceled" });
+        await queue.create({ sourceSession: "manager@team", destinationSession: "human@kernel", body: "FYI", summary: "Update", evidenceRef: "/proof", humanIntent: "update", nudge: false });
+        expect(pull().deliveries).toEqual([]);
+    });
+    it("surfaces native outbox storage refusal without claiming the question was queued or losing it", async () => {
+        const q = await ask();
+        db.exec("CREATE TRIGGER refuse_relay BEFORE INSERT ON outbox_entries BEGIN SELECT RAISE(ABORT, 'synthetic storage refusal'); END");
+        expect(() => pull()).toThrow(/storage refusal/);
+        expect(queue.getById(q.qitemId)?.state).toBe("pending");
+        expect(db.prepare("SELECT count(*) AS n FROM outbox_entries").get()).toEqual({ n: 0 });
+    });
+    it("does not starve a fresh question behind an earlier held delivery", async () => {
+        await ask();
+        const first = pull().deliveries[0]!;
+        service.receipt({ ...first, outcome: "unknown" });
+        const next = await ask();
+        expect(pull().deliveries[0]?.qitemId).toBe(next.qitemId);
+    });
+    it("forwards only the explicit origin with registered server credentials and preserves stale refusals", async () => {
+        vi.stubEnv("OPENRIG_TEST_RELAY_REMOTE_BEARER", "server-native-token");
+        const calls: Array<{
+            url: string;
+            headers: Record<string, string>;
+            body: Record<string, unknown>;
+        }> = [];
+        const app = new Hono();
+        app.use("*", async (c, next) => {
+            c.set("hostRegistryLoader" as never, (() => ({ ok: true, registry: { hosts: [{ id: "origin-b", transport: "http", url: "http://origin-b:7433", bearer_env: "OPENRIG_TEST_RELAY_REMOTE_BEARER" }] } })) as never);
+            c.set("remoteFetchImpl" as never, (async (url: string, init: RequestInit) => { calls.push({ url, headers: init.headers as Record<string, string>, body: JSON.parse(String(init.body)) }); return new Response(JSON.stringify({ error: "stale_human_request" }), { status: 409 }); }) as never);
+            await next();
+        });
+        app.route("/api/mission-control", humanRelayRoutes({ bearerToken: "operator" }));
+        const r = await app.request("/api/mission-control/human-relay/respond", { method: "POST", headers: { Authorization: "Bearer operator", "Content-Type": "application/json" }, body: JSON.stringify({ hostId: "origin-b", deliveryId: "original-delivery", requestRevision: "immutable-revision" }) });
+        expect(r.status).toBe(409);
+        expect(await r.json()).toEqual({ error: "stale_human_request" });
+        expect(calls).toHaveLength(1);
+        expect(calls[0]?.url).toBe("http://origin-b:7433/api/mission-control/human-relay/respond");
+        expect(calls[0]?.headers.Authorization).toBe("Bearer server-native-token");
+        expect(calls[0]?.body).toEqual({ deliveryId: "original-delivery", requestRevision: "immutable-revision" });
+    });
+    it("relays only remaining questions after a native partial answer", async () => {
+        const item = await queue.create({ sourceSession: "manager@team", destinationSession: "human@kernel", body: "Two missing facts", summary: "Synthetic partial question", evidenceRef: "/proof", humanIntent: "decision", humanQuestions: [questions[0]!, { ...questions[0]!, id: "timing", question: "Which timing sample?" }], nudge: false });
+        queue.recordHumanResponse({ qitemId: item.qitemId, requestRevision: item.humanRequestRevision!, actorSession: "human@kernel", replyId: "partial", response: { kind: "choice", questionId: "sample", optionId: "blue" } });
+        const remaining = pull().deliveries[0]!;
+        expect(remaining.questions.map(q => q.id)).toEqual(["timing"]);
+        expect(queue.getById(item.qitemId)?.state).toBe("pending");
+    });
+    it("protects route writes with the existing bearer and sends clarification through the native response writer", async () => {
+        const q = await ask();
+        const app = new Hono().route("/api/mission-control", humanRelayRoutes({ service, queueRepo: queue, bearerToken: "operator" }));
+        const post = (suffix: string, body: unknown, auth = true) => app.request("/api/mission-control/human-relay/" + suffix, { method: "POST", headers: { "Content-Type": "application/json", ...(auth ? { Authorization: "Bearer operator" } : {}) }, body: JSON.stringify(body) });
+        expect((await post("pull", { connectorId: "hermes", profile: "default" }, false)).status).toBe(401);
+        const d = (await (await post("pull", { connectorId: "hermes", profile: "default" })).json()).deliveries[0];
+        expect((await post("receipt", { ...d, outcome: "platform-sent", messageIds: ["platform-1"] })).status).toBe(200);
+        const r = await post("respond", { deliveryId: d.deliveryId, ...binding, messageId: "reply-1", replyToMessageId: "platform-1", qitemId: q.qitemId, requestRevision: d.requestRevision, response: { kind: "clarification", text: "Which sample?" } });
+        expect(r.status).toBe(200);
+        expect((await r.json()).complete).toBe(false);
+        expect(queue.getById(q.qitemId)).toMatchObject({ state: "pending", humanAnswers: null });
+    });
+});

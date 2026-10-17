@@ -1,0 +1,4 @@
+name: openrig-human-relay
+version: 0.1.0
+description: Relay native OpenRig questions and explicit quoted replies through the existing Hermes WhatsApp gateway.
+author: OpenRig operators

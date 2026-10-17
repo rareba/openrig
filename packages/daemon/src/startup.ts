@@ -18,6 +18,7 @@ import { migrate } from "./db/migrate.js";
 // never an inline copy that can drift out of sync with the daemon's schema.
 import { ALL_MIGRATIONS } from "./db/all-migrations.js";
 import { GithubIntakeService } from "./domain/github-intake.js";
+import { HumanRelayService, loadHumanRelayBindings } from "./domain/human-relay.js";
 import { recoverHumanResponseReturns } from "./domain/human-response-recovery.js";
 import { PollScheduler } from "./domain/github-poll-scheduler.js";
 import { createGithubIntakeIO } from "./adapters/github-intake.js";
@@ -92,7 +93,7 @@ import { deriveSelfHostIdSource, SeatIdentityReconciler, reconcileSelfHostIdenti
 import { SeatIdentityStore, SelfHostIdentityStore } from "./domain/seat-identity-store.js";
 import { DaemonLifecycleStore } from "./domain/daemon-lifecycle-store.js";
 import { randomUUID } from "node:crypto";
-import { setSelfHostId, setSelfHostIdSource } from "./domain/hosts/fanout-contract.js";
+import { getSelfHostId, setSelfHostId, setSelfHostIdSource } from "./domain/hosts/fanout-contract.js";
 import { UpCommandRouter } from "./domain/up-command-router.js";
 import { RigTeardownOrchestrator } from "./domain/rig-teardown.js";
 import { ResumeMetadataRefresher } from "./domain/resume-metadata-refresher.js";
@@ -2572,6 +2573,9 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   deps.webUiEnabled = opts?.webUiEnabled ?? new ContextPackSettingsStore().resolveOne("ui.enabled").value === true;
   // /api browser boundary: this machine's exact Tailscale MagicDNS name, looked up on demand.
   deps.selfNameDiscovery = () => discoverTailscaleSelfNames({ timeoutMs: 1500 });
+  deps.humanRelayService = new HumanRelayService(db, queueRepoInstance, {
+    bindings: () => loadHumanRelayBindings(OPENRIG_HOME), hostId: getSelfHostId,
+  });
   deps.githubIntakeService = new GithubIntakeService(db, queueRepoInstance, createGithubIntakeIO({
     queue: queueRepoInstance,
     localNodes: async () => {
