@@ -38,6 +38,7 @@ export interface GithubTask {
   blockedOn?: string | null;
   claimedAt?: string | null;
   waitingForHuman?: boolean;
+  humanIntent?: "decision" | "update" | null;
   handedOffTo?: string | null;
   handedOffFrom?: string | null;
   closureReason?: string | null;

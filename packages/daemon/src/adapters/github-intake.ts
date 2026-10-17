@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { GithubIntakeConfig, GithubIntakeIO, GithubIssue, GithubTask } from "../domain/github-intake.js";
 import { isHumanSeatSessionRef } from "../domain/session-name.js";
-import { hasLiveHumanGate, type QueueItem, type QueueRepository } from "../domain/queue-repository.js";
+import { hasLiveHumanGate, type QueueRepository } from "../domain/queue-repository.js";
 import { loadHostRegistry, resolveHost, type HttpHostEntry } from "../domain/hosts/hosts-registry-reader.js";
 import { remoteJsonRequest, type RemoteJsonOptions, type RemoteJsonResult } from "../domain/hosts/remote-daemon-http.js";
 
@@ -69,34 +69,58 @@ export function createGithubIntakeIO(options: RuntimeOptions): GithubIntakeIO {
       headers: { "X-OpenRig-Session": "github-intake@system" },
     });
   }
-  function task(value: unknown): GithubTask {
+  function rawTask(value: unknown): GithubTask {
     const row = record(value);
-    if (typeof row.qitemId !== "string" || typeof row.state !== "string" || typeof row.destinationSession !== "string") throw new Error("Invalid native queue task response");
+    if (typeof row.qitemId !== "string" || typeof row.state !== "string" || typeof row.destinationSession !== "string"
+      || (row.blockedOn != null && typeof row.blockedOn !== "string")
+      || (row.humanIntent != null && row.humanIntent !== "decision" && row.humanIntent !== "update")) throw new Error("Invalid native queue task response");
     return { qitemId: row.qitemId, state: row.state, destinationSession: row.destinationSession,
       blockedOn: typeof row.blockedOn === "string" ? row.blockedOn : null,
+      humanIntent: row.humanIntent === "update" ? "update" : row.humanIntent === "decision" ? "decision" : null,
       claimedAt: typeof row.claimedAt === "string" ? row.claimedAt : null,
       handedOffTo: typeof row.handedOffTo === "string" ? row.handedOffTo : null,
       handedOffFrom: typeof row.handedOffFrom === "string" ? row.handedOffFrom : null,
       closureTarget: typeof row.closureTarget === "string" ? row.closureTarget : null,
       closureReason: typeof row.closureReason === "string" ? row.closureReason : null,
-      waitingForHuman: hasLiveHumanGate({ state: row.state as QueueItem["state"], destinationSession: row.destinationSession, blockedOn: typeof row.blockedOn === "string" ? row.blockedOn : null }) };
+      waitingForHuman: hasLiveHumanGate({ humanIntent: typeof row.humanIntent === "string" ? row.humanIntent : null, state: row.state, destinationSession: row.destinationSession, blockedOn: typeof row.blockedOn === "string" ? row.blockedOn : null }) };
   }
-  return {
-    listIssues: config => readGithubIssues(config, options.runGithub),
-    async getTask(host, id) {
-      if (host === "local") { const row = options.queue.getById(id); return row ? task(row) : null; }
+  async function readRawTask(host: string, id: string): Promise<GithubTask | null> {
+    let value: unknown;
+    if (host === "local") {
+      value = options.queue.getById(id);
+      if (!value) return null;
+    } else {
       const result = await remote(host, `/api/queue/${encodeURIComponent(id)}`, "GET");
       if (!result.ok) {
         if (result.kind === "http" && result.status === 404) return null;
         throw new Error(`Queue read unavailable for ${host}: ${result.kind}`);
       }
-      return task(result.payload);
+      value = result.payload;
+    }
+    const row = rawTask(value);
+    if (row.qitemId !== id) throw new Error("Queue readback returned the wrong task");
+    return row;
+  }
+  async function task(host: string, value: unknown): Promise<GithubTask> {
+    const row = rawTask(value);
+    // Native block --on <qitem> retains the worker row; inspect its direct gate on this host once.
+    if (!row.waitingForHuman && row.humanIntent !== "update" && row.state === "blocked" && row.blockedOn?.startsWith("qitem-")) {
+      const blocker = await readRawTask(host, row.blockedOn);
+      row.waitingForHuman = blocker !== null && hasLiveHumanGate({ ...blocker, blockedOn: blocker.blockedOn ?? null });
+    }
+    return row;
+  }
+  return {
+    listIssues: config => readGithubIssues(config, options.runGithub),
+    async getTask(host, id) {
+      const row = await readRawTask(host, id);
+      return row ? task(host, row) : null;
     },
     async createTask(host, input) {
-      if (host === "local") return task(await options.queue.create(input));
+      if (host === "local") return task(host, await options.queue.create(input));
       const result = await remote(host, "/api/queue/create", "POST", input);
       if (!result.ok) throw new Error(`Queue delivery uncertain for ${host}: ${result.kind}`);
-      return task(result.payload);
+      return task(host, result.payload);
     },
     async findSuccessor(host, source) {
       let values: unknown;
@@ -107,7 +131,7 @@ export function createGithubIntakeIO(options: RuntimeOptions): GithubIntakeIO {
         values = result.payload;
       }
       if (!Array.isArray(values) || values.length !== 1) throw new Error("Handoff must have exactly one native successor");
-      const successor = task(values[0]);
+      const successor = await task(host, values[0]);
       if (successor.handedOffFrom !== source.qitemId || successor.destinationSession !== source.handedOffTo) throw new Error("Handoff lineage mismatch");
       return { host, task: successor };
     },
