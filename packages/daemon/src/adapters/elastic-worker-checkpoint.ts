@@ -23,6 +23,7 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
+import { inspectCheckpointSqlite } from "./elastic-checkpoint-sqlite.js";
 import { workerDigest } from "../domain/elastic-worker-control.js";
 import type { WorkerRefProof } from "./elastic-worker-probe.js";
 export const CHECKPOINT_LIMIT = 512 * 1024 * 1024;
@@ -155,19 +156,6 @@ function walkRoots(
   }
   return files;
 }
-/** Preserve SQLite storage classes and every INTEGER/REAL bit used by custody equality. */
-function sqliteValue(value: unknown): unknown {
-  if (value === null) return ["null"];
-  if (typeof value === "bigint") return ["integer", value.toString()];
-  if (typeof value === "number") {
-    const bits = Buffer.alloc(8);
-    bits.writeDoubleBE(value);
-    return ["real", bits.toString("hex")];
-  }
-  if (typeof value === "string") return ["text", value];
-  if (Buffer.isBuffer(value)) return ["blob", value.toString("base64")];
-  fail();
-}
 export function stoppedSourceDigest(
   roots: string[],
   databases: string[] = [],
@@ -183,44 +171,7 @@ export function stoppedSourceDigest(
       bytes: f.bytes.length,
       sha256: sha256(f.bytes),
     }));
-  const logical = databases.map((path) => {
-    const db = new Database(path, { readonly: true, fileMustExist: true });
-    try {
-      db.pragma("trusted_schema=OFF");
-      if (db.pragma("integrity_check", { simple: true }) !== "ok") fail();
-      const schema = db
-        .prepare(
-          "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name",
-        )
-        .all();
-      const tables = db
-        .prepare(
-          "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name",
-        )
-        .all() as Array<{ name: string }>;
-      const tableKinds = db.pragma("table_list") as Array<{name: string; wr: number}>;
-      const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
-      const content = tables.map((t) => {
-        const columns = db.pragma(`table_xinfo(${quote(t.name)})`) as Array<{name: string}>;
-        const kind = tableKinds.find(table => table.name === t.name);
-        if (!kind) fail();
-        const rowid = ["rowid", "_rowid_", "oid"].find(name => !columns.some(c => c.name.toLowerCase() === name));
-        if (!kind.wr && !rowid) fail();
-        const select = [...(!kind.wr ? [quote(rowid!)] : []), ...columns.map(c => quote(c.name))].join(",");
-        return {
-          name: t.name,
-          rows: db.prepare(`SELECT ${select} FROM ${quote(t.name)}`).raw(true).safeIntegers(true).all()
-            .map(row => JSON.stringify((row as unknown[]).map(sqliteValue))).sort(),
-        };
-      });
-      const metadata = {userVersion: db.pragma("user_version", {simple:true}), applicationId: db.pragma("application_id", {simple:true}), encoding: db.pragma("encoding", {simple:true})};
-      const encoded = JSON.stringify({ schema, content, metadata });
-      if (Buffer.byteLength(encoded) > CHECKPOINT_LIMIT) fail();
-      return { path, digest: sha256(encoded) };
-    } finally {
-      db.close();
-    }
-  });
+  const logical = databases.map(path => ({path, digest: inspectCheckpointSqlite(path).logicalDigest}));
   return workerDigest({ files, logical });
 }
 function validArchivePath(path: string): boolean {

@@ -201,3 +201,14 @@ describe('lossless SQLite stopped custody equality', () => {
     } finally { db.close(); }
   });
 });
+
+it('distinguishes SQLite TEXT with different invalid UTF8 bytes', () => {
+  const f = fixture(); const path = join(f.root, 'raw-text.sqlite'); const db = new Database(path);
+  try {
+    db.exec("CREATE TABLE t(v TEXT); INSERT INTO t VALUES(CAST(x'80' AS TEXT))");
+    const before = stoppedSourceDigest([f.root], [path]);
+    db.exec("UPDATE t SET v=CAST(x'81' AS TEXT)");
+    expect(db.prepare('SELECT hex(v) AS v FROM t').get()).toEqual({v:'81'});
+    expect(stoppedSourceDigest([f.root], [path])).not.toBe(before);
+  } finally { db.close(); }
+});
