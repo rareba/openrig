@@ -1,4 +1,4 @@
-import { assertElasticEffectAllowed } from "./elastic-worker-guard.js";
+import { assertElasticEffectAllowed, assertElasticContinuationAllowed } from "./elastic-worker-guard.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type Database from "better-sqlite3";
 
@@ -16,6 +16,7 @@ interface Lease {
   serialOwner?: Lease;
   origin: "automatic" | "human" | "custody";
   lifecycle?: boolean;
+  continuationActionId?: string;
 }
 
 export class DeliveryGuardError extends Error {
@@ -139,6 +140,21 @@ export class SeatDeliveryGuard {
     });
   }
 
+  async continuationOperation<T>(actionId:string,fn:()=>Promise<T>):Promise<T> {
+    const action=assertElasticContinuationAllowed(actionId,this.db).action;
+    const bound=this.target(action.target.nodeId);
+    const expected={nodeId:action.target.nodeId,session:action.target.session,occupant:action.target.occupant,pane:action.target.pane};
+    if(!this.same(bound,expected)) throw new DeliveryGuardError('guard_target_changed','Continuation target changed.');
+    return this.serial(bound.nodeId,async()=>{
+      assertElasticContinuationAllowed(actionId,this.db);
+      if(!this.same(bound,this.target(bound.nodeId)))throw new DeliveryGuardError('guard_target_changed','Continuation target changed.');
+      const pref=this.preference(bound.nodeId);
+      if(pref.effective||pref.desired)throw new DeliveryGuardError('typing_guard_enabled','Continuation remains held by typing protection.');
+      const lease:Lease={target:bound,active:true,origin:'automatic',continuationActionId:actionId};lease.serialOwner=lease;
+      try{return await this.scope.run(new Map([[bound.nodeId,lease]]),fn);}finally{lease.active=false;}
+    });
+  }
+
   ownsLifecycle(nodeId: string): boolean {
     const lease = this.scope.getStore()?.get(nodeId);
     if (!lease?.active || !lease.lifecycle) return false;
@@ -230,10 +246,11 @@ export class SeatDeliveryGuard {
 
   /** Synchronous final-effect check: no await between this and issuing the write. */
   checkInput(name: string): void {
-    assertElasticEffectAllowed(this.db);
     const target = this.target(name);
     const lease = this.scope.getStore()?.get(target.nodeId);
     if (!lease) throw new DeliveryGuardError("guard_lease_required", "Input requires an active operation lease.");
+    if(lease.continuationActionId) assertElasticContinuationAllowed(lease.continuationActionId,this.db);
+    else assertElasticEffectAllowed(this.db);
     this.assertCurrent(name, lease);
     if (lease.origin === "custody") {
       throw new DeliveryGuardError("guard_lease_required", "Custody cleanup does not authorize input or writing lifecycle operations.");

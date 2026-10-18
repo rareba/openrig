@@ -1,3 +1,4 @@
+import { recordElasticNativeWake, finalizeElasticNativeWakeParent } from './elastic-continuation.js';
 import { ELASTIC_HUMAN_FORWARD_PREFIX, ELASTIC_HUMAN_FORWARD_GATE, type ElasticHumanWorker, type ElasticHumanProxyAuthority, type ElasticHumanProxyCreate, type ElasticHumanProxyMapping, type ElasticHumanForward, type ElasticHumanForwardSettle, type ElasticHumanProxyReconcile, type NativeHumanResponseCommit } from './elastic-human-proxy.js';
 import { authorizeElasticSuccessor } from "./elastic-worker-control.js";
 import { readWakeLadderBackstop } from "./queue-wake-ladder.js";
@@ -1090,6 +1091,7 @@ export class QueueRepository {
       if (binding) this.db.prepare("UPDATE outbox_entries SET guard_binding=? WHERE outbox_id=? AND guard_binding IS NULL")
         .run(JSON.stringify(binding), input.outboxId);
     }
+    recordElasticNativeWake(this.db, input.outboxId);
     return input.outboxId;
   }
 
@@ -1178,6 +1180,8 @@ export class QueueRepository {
     outboxId: string,
   ): Promise<"delivered" | "indeterminate" | "failed" | "skipped" | "retained"> {
     if (!this.outbox) return "skipped";
+    if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='elastic_worker_control'").get()
+      && this.db.prepare("SELECT 1 FROM elastic_worker_control WHERE phase!='ready'").get()) return "retained";
     if (!this.transport) return "skipped"; // no transport → stays pending for a later drain
     const alreadyHeld = this.outbox.getById(outboxId);
     if (alreadyHeld?.deliveryState === "retained" || alreadyHeld?.deliveryState === "retired") {
@@ -3859,7 +3863,9 @@ export class QueueRepository {
         transitionNote: `${HUMAN_RESPONSE_RECEIPT_PREFIX}${JSON.stringify({ ...receipt, fingerprint })}`,
         identityProvenance: input.identityProvenance,
       }).persistedEvents);
-      if (!receipt.replyHostId) this.assertTerminalClosureHasIntent(item.qitemId, receipt.replyQitemId, true);
+      if (!receipt.replyHostId) { this.assertTerminalClosureHasIntent(item.qitemId, receipt.replyQitemId, true);
+        finalizeElasticNativeWakeParent(this.db,`${WAKE_INTENT_PREFIX}${receipt.replyQitemId}`);
+      }
       return receipt;
     })();
     for (const event of events) this.eventBus.notifySubscribers(event);

@@ -1,3 +1,4 @@
+import { withdrawalRequestSchema } from '../domain/elastic-continuation.js';
 import { finalStatusRequestSchema } from './elastic-lifecycle-contract.js';
 import { GithubCredentialStore, githubMaterialSchema } from './elastic-worker-github.js';
 import { createPrivateKey } from "node:crypto";
@@ -9,7 +10,7 @@ import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { AzureWorkerBootstrap } from "./azure-worker-bootstrap.js";
 import { ElasticWorkerControl } from "../domain/elastic-worker-control.js";
-import { assertElasticEffectAllowed } from "../domain/elastic-worker-guard.js";
+import { assertElasticUnitStartAllowed } from "../domain/elastic-worker-guard.js";
 import {
   LinuxPrivilegedWorkerBoundary,
   assertRootPath,
@@ -83,6 +84,8 @@ const payloads = {
     })
     .strict(),
   "github-credential-install": z.object({ binding: enrollment, materialEnvelope: z.string().max(32 * 1024) }).strict(),
+  "withdraw-drain": withdrawalRequestSchema,
+  "finish-continuation": z.object({identity,generation:z.number().int().positive()}).strict(),
   "begin-drain": z.object({ identity, operationId: text }).strict(),
   quiesce: z.object({ binding: finalBinding }).strict(),
   "final-checkpoint-export": z
@@ -117,7 +120,7 @@ export async function runWorkerHelper(argv: string[]): Promise<unknown> {
     for (const pin of manifest.pins) if (pinDigest(pin.path, pin.kind) !== pin.sha256) throw Error();
     process.env.OPENRIG_ELASTIC_GUARD = manifest.linux.guard;
     process.env.OPENRIG_DB = manifest.linux.database;
-    assertElasticEffectAllowed(undefined, { allowDraining: true });
+    assertElasticUnitStartAllowed();
     return { allowed: true };
   }
   const os = new LinuxPrivilegedWorkerBoundary(manifest, manifestPath, digest);
@@ -168,6 +171,8 @@ export async function runWorkerHelper(argv: string[]): Promise<unknown> {
       finally { plaintext.fill(0); }
     }
     switch (operation) {
+      case "withdraw-drain": return lifecycle.withdraw(payloads["withdraw-drain"].parse(input));
+      case "finish-continuation": { const p=payloads["finish-continuation"].parse(input); return lifecycle.finishContinuation(p.identity,p.generation); }
       case "quiesce":
         return lifecycle.quiesce(payloads.quiesce.parse(input).binding);
       case "final-checkpoint-export":

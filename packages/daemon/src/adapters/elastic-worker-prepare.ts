@@ -7,7 +7,7 @@ import type { BootstrapOrchestrator } from '../domain/bootstrap-orchestrator.js'
 import type { RigRepository } from '../domain/rig-repository.js';
 import type { SessionRegistry } from '../domain/session-registry.js';
 import type { QueueRepository } from '../domain/queue-repository.js';
-import { assertElasticEffectAllowed } from '../domain/elastic-worker-guard.js';
+import { assertElasticEffectAllowed, assertElasticUnitStartAllowed } from '../domain/elastic-worker-guard.js';
 import { procIdentity, type LinuxWorkerManifest } from './linux-privileged-worker-boundary.js';
 import { durableWrite, noFollowRead, sha256 } from './elastic-worker-checkpoint.js';
 import { enrollmentDigest } from './elastic-worker-attempts.js';
@@ -141,10 +141,11 @@ export class ElasticWorkerPreparation {
             reject();
         this.directory = join(options.manifest.linux.home, 'elastic-preparation');
     }
-    private assertWorker(allowDraining = false): void {
+    private assertWorker(access:'effect'|'inspect' = 'effect'): void {
         if (process.getuid?.() !== this.options.manifest.uid || process.env.OPENRIG_DB !== this.options.manifest.linux.database)
             reject();
-        assertElasticEffectAllowed(this.options.services.rigs.db, { allowDraining });
+        if (access==='inspect') assertElasticUnitStartAllowed(this.options.services.rigs.db);
+        else assertElasticEffectAllowed(this.options.services.rigs.db);
     }
     private record(): PreparationRecord | null {
         const path = join(this.directory, 'record.json');
@@ -289,7 +290,7 @@ export class ElasticWorkerPreparation {
     }
     private empty(): WorkerPreparationEvidence { return { version: 1, observedAt: Date.now(), manifestDigest: this.options.manifestDigest, operationId: this.plan.operationId, planDigest: this.planDigest, state: 'pending', rung: 'enrolled', rigId: null, seats: [], repositoryCapabilities: [], publicReason: 'native_preparation_pending' }; }
     inspect(): WorkerPreparationEvidence {
-        this.assertWorker(true);
+        this.assertWorker('inspect');
         const evidence = this.empty();
         const record = this.record();
         if (!record || !['launching', 'launched'].includes(record.phase))

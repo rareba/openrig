@@ -1,3 +1,6 @@
+import Database from 'better-sqlite3';
+import { CONTINUATION_FRAME, continuationBootId, currentContinuationProcess, writeOwnedContinuation, acknowledgeOwnedContinuation, spawnOwnedContinuation, reconcileOwnedContinuation } from './elastic-owned-continuation.js';
+import { assertElasticContinuationAllowed } from '../domain/elastic-worker-guard.js';
 import { assertElasticEffectAllowed, assertElasticSeatAllowed } from "../domain/elastic-worker-guard.js";
 // OPR.0.4.6.PI1 — the pane-hosted pi-runner (compiled entry in the daemon dist).
 //
@@ -16,8 +19,8 @@ import { assertElasticEffectAllowed, assertElasticSeatAllowed } from "../domain/
 // a dead pi process prints the EXIT/ERROR marker and records `exited` in the
 // sidecar — never a silently frozen pane.
 //
-// Only node builtins and local runner helpers are imported so the compiled
-// entry stays runnable as `node <dist>/adapters/pi-runner.js` with no daemon deps.
+// The managed continuation boundary reads the native SQLite database. The
+// compiled runner uses the same pinned runtime dependencies as the daemon.
 
 import fs from "node:fs";
 import nodePath from "node:path";
@@ -393,6 +396,7 @@ export async function readPiSessionEntryIds(
 }
 
 export class RunnerCore {
+  private ownedContinuationId: string | undefined;
   private streaming = false;
   private sessionFile: string | undefined;
   private sessionId: string | undefined;
@@ -527,6 +531,13 @@ export class RunnerCore {
       record = result.frame;
     }
 
+    if(this.ownedContinuationId) {
+      try {
+        acknowledgeOwnedContinuation(this.ownedContinuationId,record);
+        const db=new Database(process.env.OPENRIG_DB??'',{fileMustExist:true});
+        try {reconcileOwnedContinuation(db,this.ownedContinuationId);}finally{db.close();}
+      } catch { /* The durable issued action remains unknown until exact native readback. */ }
+    }
     if (record.type === "response") {
       this.handleResponse(record);
       return;
@@ -544,6 +555,11 @@ export class RunnerCore {
 
   /** One aggregated paste block from pane stdin. */
   handleUserBlock(block: string): void {
+    if(block.startsWith(CONTINUATION_FRAME)) {
+      const id=block.slice(CONTINUATION_FRAME.length);
+      if(!/^[a-f0-9-]{36}$/.test(id))return;
+      this.handleOwnedContinuation(id);return;
+    }
     try { assertElasticEffectAllowed(); } catch { this.io.mirrorLine("[pi-runner] input denied by worker drain/seal"); return; }
     this.invalidateIdle();
     if (block === "/abort") {
@@ -566,6 +582,16 @@ export class RunnerCore {
     }
     this.io.sendRpc({ type: "prompt", message: block });
     this.io.mirrorLine(`you ▸ ${block}`);
+  }
+
+  handleOwnedContinuation(actionId:string):void {
+    try {
+      if(this.runtime!=='pi'||!this.ready||this.streaming)throw Error('elastic_continuation_not_idle');
+      const processIdentity=this.io.processIdentity?.();if(!processIdentity)throw Error('elastic_continuation_identity_missing');
+      const issued=writeOwnedContinuation(actionId,this.identity,{sessionFile:this.sessionFile,sessionId:this.sessionId},
+        {...processIdentity,bootId:continuationBootId()},command=>this.io.sendRpc(command));
+      if(issued){this.ownedContinuationId=actionId;this.invalidateIdle();}
+    } catch {this.io.mirrorLine('[pi-runner] owned continuation retained; native authority unavailable');}
   }
 
   /** Child process exit — honest, loud, durable. */
@@ -857,6 +883,7 @@ export class RunnerCore {
   private writeSidecar(patch: Partial<PiRunnerState>): void {
     this.io.writeSidecar({
       ready: this.ready,
+      ...(process.env.OPENRIG_ELASTIC_GUARD && this.io.processIdentity ? {processIdentity:{...this.io.processIdentity(),bootId:continuationBootId()}} : {}),
       // Launch-attempt scope: every write is stamped so the daemon can
       // distinguish THIS runner instance's truth from stale artifacts.
       launchId: this.identity.launchId,
@@ -873,6 +900,7 @@ export class RunnerCore {
 // ── CLI entry ────────────────────────────────────────────────────────────────
 
 interface RunnerArgs {
+  continuationActionId?: string;
   runtime?: RunnerRuntime;
   sessionName: string;
   stateRoot: string;
@@ -897,6 +925,7 @@ export function parseRunnerArgs(argv: string[]): RunnerArgs {
       return value;
     };
     switch (flag) {
+      case "--elastic-continuation": args.continuationActionId = next(); break;
       case "--session-name": args.sessionName = next(); break;
       case "--runtime": {
         const runtime = next();
@@ -1163,14 +1192,29 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // (or was added after it, and is then seen by the next one).
   const launchCredentialEvidence = args.openRouterCharge === true && runtime === "pi" ? credentialEvidence() : undefined;
 
-  assertElasticSeatAllowed(args.sessionName, runtime, args.stateRoot);
+  assertElasticSeatAllowed(args.sessionName, runtime, args.stateRoot, args.continuationActionId);
+  if(args.continuationActionId) {
+    const db=new Database(process.env.OPENRIG_DB??'',{fileMustExist:true});
+    try {
+      const {action}=assertElasticContinuationAllowed(args.continuationActionId,db);
+      process.env.OPENRIG_NODE_ID=action.target.nodeId;
+      process.env.OPENRIG_OCCUPANT_GENERATION=action.target.occupant;
+      childEnv.OPENRIG_NODE_ID=action.target.nodeId;
+      childEnv.OPENRIG_OCCUPANT_GENERATION=action.target.occupant;
+
+    } finally {db.close();}
+  }
   const elasticPi = process.env.OPENRIG_ELASTIC_GUARD ? process.env.OPENRIG_ELASTIC_PI : undefined;
   if (process.env.OPENRIG_ELASTIC_GUARD && !elasticPi) throw Error("elastic_worker_profile_denied");
-  const child = spawn(elasticPi ? process.execPath : command, elasticPi ? [elasticPi, "--no-extensions", ...childArgs] : childArgs, {
-    cwd: args.cwd,
-    env: childEnv,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  const child = (()=>{
+    if(args.continuationActionId) {
+      const db=new Database(process.env.OPENRIG_DB??'',{fileMustExist:true});
+      try{return spawnOwnedContinuation(db,args.continuationActionId,args,childEnv);}finally{db.close();}
+    }
+    return spawn(elasticPi ? process.execPath : command, elasticPi ? [elasticPi, "--no-extensions", ...childArgs] : childArgs, {
+      cwd: args.cwd, env: childEnv, stdio: ["pipe", "pipe", "pipe"],
+    });
+  })();
 
   // The child may close its pipe before the first RPC write completes.
   child.stdin.on("error", () => { /* spawn/exit handlers own the diagnosis */ });
@@ -1196,11 +1240,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     notice: (line) => { process.stdout.write(`${line}\n`); },
   });
 
+  const elasticProcessIdentity = process.env.OPENRIG_ELASTIC_GUARD && child.pid ? currentContinuationProcess(child.pid) : undefined;
   const io: RunnerIo = {
-    processIdentity: () => {
-      const startTime = (pid: number) => { const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]!; };
-      return { runnerPid: process.pid, childPid: child.pid ?? -1, runnerStartTime: startTime(process.pid), childStartTime: startTime(child.pid ?? -1) };
-    },
+    ...(elasticProcessIdentity ? {processIdentity: () => elasticProcessIdentity} : {}),
     sendRpc: (cmd) => {
       try { child.stdin.write(`${JSON.stringify(cmd)}\n`); } catch { /* exit handler reports */ }
     },
@@ -1288,6 +1330,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       } catch { /* surface non-JSON stdout through the core */ }
     }
     core.handlePiLine(line);
+    if(args.continuationActionId && core.isReady()) core.handleOwnedContinuation(args.continuationActionId);
   });
   // Re-deliver OMP identity until the daemon confirms the resume token.
   const identityRetry = runtime === "omp" ? setInterval(() => core.retrySessionIdentity(), IDENTITY_RETRY_MS) : undefined;

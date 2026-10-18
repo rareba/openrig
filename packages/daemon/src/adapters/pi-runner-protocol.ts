@@ -51,6 +51,7 @@ export const PI_RUNNER_ERROR_MARKER = "[pi-runner] ERROR";
 // ── Runner-state sidecar ─────────────────────────────────────────────────────
 
 export interface PiRunnerState {
+  processIdentity?: {bootId:string;runnerPid:number;childPid:number;runnerStartTime:string;childStartTime:string};
   idleProof?: { at: number; runnerPid: number; childPid: number; runnerStartTime: string; childStartTime: string; launchId: string; idle: boolean };
   ready: boolean;
   /** Launch-attempt scope (guard fold, code-review qitem-20260707011908):

@@ -258,3 +258,27 @@ it('rechecks pause and configuration after delayed pending readback before advan
   const running=service.reconcile(); service.pause(); finish('pending'); await running;
   expect(advances).toBe(0); expect(service.status().operation?.state).toBe('pending');
 });
+
+it('selects a proven native continuation for withdrawal and keeps the worker quarantined while other demand advances',async()=>{
+  const db=database(),b=boundary(),service=new ElasticFleetService(db,b.io,()=>time);service.configure(config);
+  b.set(snapshot([worker()],false));service.requestDrain('vm1');await service.reconcile();
+  b.io.hasOwnedContinuation=async()=>true;b.io.remove=async op=>{b.calls.push(op);throw Error('withdrawal pending');};
+  time+=1;b.set(snapshot([worker({active:1,clean:false})]));await service.reconcile();
+  expect(b.calls.map(c=>c.type)).toEqual(['beginDrain','remove']);
+  b.io.inspectOperation=async()=> 'withdrawn';await service.reconcile();
+  expect(service.status().operation?.state).toBe('withdrawn');
+  expect(db.prepare('SELECT state FROM elastic_fleet_drains WHERE worker_id=?').get('vm1')).toEqual({state:'continuation'});
+  time+=10000;b.set(snapshot([worker({active:1,clean:false})]));await service.reconcile();
+  expect(b.calls.at(-1)?.type).toBe('provision');
+});
+
+it('requires a fresh complete idle window before a distinct post-continuation drain',async()=>{
+  const db=database(),b=boundary(),service=new ElasticFleetService(db,b.io,()=>time);service.configure(config);
+  b.set(snapshot([worker()],false));service.requestDrain('vm1');await service.reconcile();
+  const old=b.calls[0]!.operationId;db.prepare("UPDATE elastic_fleet_drains SET state='continuation-finished' WHERE worker_id='vm1'").run();
+  const since=time;time+=1;b.set(snapshot([worker({state:'draining',idleSince:since})],false));await service.reconcile();
+  expect(b.calls).toHaveLength(1);
+  time+=config.policy.idleSeconds*1000;b.set(snapshot([worker({state:'draining',idleSince:since})],false));await service.reconcile();
+  expect(b.calls.map(c=>c.type)).toEqual(['beginDrain','beginDrain']);expect(b.calls[1]!.operationId).not.toBe(old);
+  expect(db.prepare('SELECT begin_operation_id FROM elastic_fleet_drains').get()).toEqual({begin_operation_id:b.calls[1]!.operationId});
+});

@@ -1,3 +1,4 @@
+import { ElasticContinuationExecutor } from './adapters/elastic-continuation-executor.js';
 import { ElasticWorkerPreparation, preparationPlanSchema } from './adapters/elastic-worker-prepare.js';
 import { loadForegroundManifest } from './adapters/elastic-worker-foreground.js';
 import { assertRootPath } from './adapters/linux-privileged-worker-boundary.js';
@@ -817,7 +818,7 @@ export function createApp(deps: AppDeps): Hono {
       services: { bootstrap: deps.bootstrapOrchestrator, rigs: deps.rigRepo, sessions: deps.sessionRegistry, queue: deps.queueRepo } });
   }
   app.route("/api/elastic-worker", elasticWorkerRoutes({ probe: deps.elasticWorkerProbe, bearerToken: deps.missionControlBearerToken ?? null,
-    queue: deps.queueRepo, preparation: elasticPreparation, ...(elasticPreparation ? { runtime: () => ({ selfHostId: getSelfHostId(), build: stampFields() }) } : {}) }));
+    queue: deps.queueRepo, preparation: elasticPreparation, ...(process.env.OPENRIG_ELASTIC_GUARD ? {continuation:new ElasticContinuationExecutor(deps.rigRepo.db,deps.tmuxAdapter)} : {}), ...(elasticPreparation ? { runtime: () => ({ selfHostId: getSelfHostId(), build: stampFields() }) } : {}) }));
   app.route("/api/elastic-fleet", elasticFleetRoutes({service:deps.elasticFleetService,bearerToken:deps.missionControlBearerToken??null}));
   app.route("/api/github-intake", githubIntakeRoutes({ service: deps.githubIntakeService, bearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/mission-control", humanResponsesRoutes({ queueRepo: deps.queueRepo, bearerToken: deps.missionControlBearerToken ?? null }));

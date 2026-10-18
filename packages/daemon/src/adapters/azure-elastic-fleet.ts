@@ -69,7 +69,7 @@ export interface AzureFleetOptions {
   sealForRemoval?: (context: AzureMutationContext) => Promise<AzureRemovalSeal>;
   retireRegistration?: (context: AzureMutationContext) => Promise<void>;
   /** Read-only durable native attempt/drain/retirement evidence. Never bootstrap or rotate credentials here. */
-  inspectNative?: (context: AzureNativeContext & { operation: FleetOperation }) => Promise<'succeeded' | 'pending' | 'unknown'>;
+  inspectNative?: (context: AzureNativeContext & { operation: FleetOperation }) => Promise<'succeeded' | 'pending' | 'unknown' | 'withdrawn'>;
 }
 const limits = { timeout: 30_000, maxBuffer: 1024 * 1024 };
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

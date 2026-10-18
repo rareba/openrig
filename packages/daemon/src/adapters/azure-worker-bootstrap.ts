@@ -2,7 +2,7 @@ import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, ran
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { openWorkerMaterial, sealEnrollment, type EnrollmentBinding } from '../domain/elastic-enrollment.js';
-import { ElasticWorkerControl, type ElasticWorkerIdentity, workerDigest } from '../domain/elastic-worker-control.js';
+import { ElasticWorkerControl, type ElasticWorkerIdentity, type ElasticWorkerState, workerDigest } from '../domain/elastic-worker-control.js';
 import { inspectElasticWorker, type WorkerCheckpoint, type WorkerProcessProof } from './elastic-worker-probe.js';
 import { azureWorkerId, type AzureRemovalSeal } from './azure-elastic-fleet.js';
 
@@ -25,6 +25,7 @@ export interface PrivilegedWorkerBoundary {
   /** Install only pinned programs/config; root-owned unit, User=openrig-elastic, KillMode=control-group. */
   configureWorker(material: WorkerRuntimeMaterial, bearer: string): void;
   startUnit(): void;
+  publishAdmission?(state: ElasticWorkerState, purpose: 'removal'|'continuation'|'transition', operationId: string): void;
   /** Durable root-owned ExecCondition marker; workers cannot remove it, and restart/boot must respect it. */
   installSealMarker(): void;
   stopUnit(): void;
@@ -138,7 +139,16 @@ export class AzureWorkerBootstrap {
     });
   }
   beginDrain(identity: ElasticWorkerIdentity, operationId: string) {
-    return this.guarded(() => { this.requireState(identity); return this.control.beginDrain(identity, operationId); });
+    return this.guarded(() => {
+      const state=this.requireState(identity);
+      const current=this.control.generation();
+      if(state.phase!=='ready' && !(state.phase==='draining' && (state.drainOperationId===operationId && current?.purpose==='removal'
+        || current?.purpose==='continuation' && current.retired_at && current.progress_at)))reject();
+      this.os.publishAdmission?.(state,'transition',operationId);
+      const drained=this.control.beginDrain(identity,operationId);
+      this.os.publishAdmission?.(drained,'removal',operationId);
+      return drained;
+    });
   }
   private probe(checkpoint: WorkerCheckpoint | null = null) {
     // Include archived nodes; unknown cwd is an inventory failure, never an empty root list.

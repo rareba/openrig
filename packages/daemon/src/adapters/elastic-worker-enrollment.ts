@@ -448,6 +448,12 @@ export class ElasticWorkerEnrollment {
         if (host.url !== endpoint.baseUrl) reject();
         return { host, probe, attempt: a };
     }
+    async continuationRequest(attempt:ElasticWorkerAttempt,configuration:AzureMutationContext['configuration'],method:'GET'|'POST',body?:{withdrawalId:string}) {
+        const {host}=await this.registeredEndpoint(attempt,configuration);
+        const endpoint=await this.trusted(attempt,configuration);
+        if(host.url!==endpoint.baseUrl)reject();
+        return this.rpc(attempt,endpoint,method,method==='GET'?'/api/elastic-worker/continuations':'/api/elastic-worker/continuations/advance',body);
+    }
     hostRegistry() { const loaded = loadHostRegistry(this.options.registryPath); if (!loaded.ok) reject(); return loaded.registry; }
     preparationPlan(): WorkerPreparationPlan { return preparationPlanSchema.parse(this.plan); }
     workerWorkspace(sessionName: string): string {

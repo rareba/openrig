@@ -1,5 +1,5 @@
 import { createElasticRuntime } from './adapters/elastic-runtime.js';
-import { assertElasticEffectAllowed } from "./domain/elastic-worker-guard.js";
+import { assertElasticUnitStartAllowed } from "./domain/elastic-worker-guard.js";
 import { loadForegroundManifest } from "./adapters/elastic-worker-foreground.js";
 import { fileURLToPath } from "node:url";
 import { discoverTailscaleSelfNames } from "./middleware/browser-boundary.js";
@@ -310,7 +310,7 @@ export function collectAllowlistedProviderAuthEnv(
 /** Assemble the daemon services and runtime adapters using the selected installation assets. */
 export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> {
   const elasticWorkerMode = process.env.OPENRIG_ELASTIC_GUARD !== undefined;
-  if (elasticWorkerMode) { loadForegroundManifest(); assertElasticEffectAllowed(undefined, { allowDraining: true }); }
+  if (elasticWorkerMode) { loadForegroundManifest(); assertElasticUnitStartAllowed(); }
   const daemonHome = os.homedir();
   const configuredCodexHome = process.env.CODEX_HOME || undefined;
   if (configuredCodexHome && !nodePath.isAbsolute(configuredCodexHome)) {

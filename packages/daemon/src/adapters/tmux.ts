@@ -1,3 +1,6 @@
+import { continuationTransportPlan, continuationManifest, verifyContinuationProcess } from './elastic-owned-continuation.js';
+import { assertElasticContinuationAllowed, withElasticContinuationTransport } from '../domain/elastic-worker-guard.js';
+import { continuationTransition } from '../domain/elastic-continuation.js';
 import { assertElasticTmuxEffectAllowed } from "../domain/elastic-worker-guard.js";
 import { DeliveryGuardError, type SeatDeliveryGuard } from "../domain/seat-delivery-guard.js";
 import { writeFile as fsWriteFile, unlink as fsUnlink } from "node:fs/promises";
@@ -672,6 +675,35 @@ export class TmuxAdapter {
    * buffer leaks. Unique temp + buffer names per call keep parallel `rig up`
    * seats from colliding.
    */
+  /** The only draining tmux entry. Callers supply an action ID, never text or shell argv. */
+  async sendOwnedContinuation(actionId:string):Promise<'issued'|'unknown'|'proved'> {
+    const guard=this.deliveryGuard;if(!guard)throw Error('elastic_continuation_lease_required');
+    return guard.continuationOperation(actionId,async()=>{
+      const row=assertElasticContinuationAllowed(actionId,guard.db),a=row.action;
+      if(row.stage==='proved')return 'proved';
+      if(row.stage!=='prepared')return 'unknown';
+      const manifest=continuationManifest();
+      const panes=await this.listPanes(a.target.session);
+      if(panes.length!==1||panes[0]!.id!==a.target.pane)throw Error('elastic_continuation_target_changed');
+      guard.checkInput(a.target.nodeId);
+      verifyContinuationProcess(a.target,a.effect.kind==='existing-runner'?'live':'absent',manifest);
+      const text=continuationTransportPlan(a,manifest);
+      const type=['tmux','send-keys','-t',a.target.pane,'-l','--',text];
+      guard.db.transaction(()=>{
+        assertElasticContinuationAllowed(actionId,guard.db);
+        continuationTransition(guard.db,actionId,'prepared','transport-issued');
+      }).immediate();
+      const issue=async(argv:string[])=>{
+        guard.checkInput(a.target.nodeId);
+        verifyContinuationProcess(a.target,a.effect.kind==='existing-runner'?'live':'absent',manifest);
+        return withElasticContinuationTransport(actionId,argv,()=>this.run(argv));
+      };
+      try {await issue(type);await issue(['tmux','send-keys','-t',a.target.pane,'Enter']);}
+      catch{return 'unknown';}
+      return 'issued';
+    });
+  }
+
   async sendText(target: string, text: string, beforeInput?: () => void, options?: { bracketed?: boolean }): Promise<TmuxResult> {
     return this.guardedInput(target, (pane, beforeWrite) => this.sendTextUnchecked(pane, text, () => { beforeWrite(); beforeInput?.(); }, options?.bracketed));
   }

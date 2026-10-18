@@ -1,3 +1,4 @@
+import { withdrawalRequestSchema } from '../domain/elastic-continuation.js';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -14,7 +15,9 @@ const roundSchema = z.object({ round: z.number().int().positive(), nonce: digest
   revision: z.number().int().nonnegative(), command: lifecycleCommandSchema,
   receipt: finalStatusReceiptSchema.nullable(), disposition: z.enum(['pending', 'completed', 'stale']),
 }).strict();
+const withdrawalSchema=z.object({request:withdrawalRequestSchema,receipt:z.object({withdrawalId:z.string().uuid(),generation:z.number().int().positive(),actionId:z.string().uuid()}).strict().nullable(),finished:z.boolean()}).strict();
 const stateSchema = z.object({ version: z.literal(1), sequence: z.number().int().nonnegative(), attemptId: digest,
+  withdrawal: withdrawalSchema.nullable().optional(),
   previous: digest.nullable(), beginOperationId: z.string(), drain: drainReceiptSchema.nullable(),
   binding: finalBindingSchema.nullable(), removalOperationId: z.string().nullable(), operationRevision: z.number().int().nonnegative().nullable(),
   configurationDigest: digest.nullable(), commands: z.array(lifecycleCommandSchema),
@@ -42,10 +45,15 @@ export class ElasticLifecycleJournal {
   begin(attemptId: string, operationId: string): LifecycleState {
     const current = this.read(attemptId);
     if (current) {
-      if (current.beginOperationId !== operationId) throw Error('elastic_drain_generation_conflict');
-      return current;
+      if(current.beginOperationId===operationId)return current;
+      const reused=readdirSync(join(this.store.root,attemptId)).filter(n=>/^input-lifecycle-\d{10}\.json$/.test(n))
+        .some(n=>stateSchema.parse(this.store.readPrivateInput(attemptId,n.slice(6,-5))).beginOperationId===operationId);
+      if(reused)throw Error('elastic_drain_generation_conflict');
+      if(!current.withdrawal?.finished || current.deleteIntent || current.commands.some(c=>c.operation==='quiesce'))throw Error('elastic_drain_generation_conflict');
+      return this.write({version:1,sequence:current.sequence+1,attemptId,previous:enrollmentDigest(current),beginOperationId:operationId,withdrawal:null,
+        drain:null,binding:null,removalOperationId:null,operationRevision:null,configurationDigest:null,commands:[],exported:null,checkpointReceiptDigest:null,rounds:[],deleteIntent:null,deleteConfirmed:false,retired:false});
     }
-    return this.write({ version: 1, sequence: 0, attemptId, previous: null, beginOperationId: operationId, drain: null,
+    return this.write({ version: 1, sequence: 0, attemptId, previous: null, withdrawal:null, beginOperationId: operationId, drain: null,
       binding: null, removalOperationId: null, operationRevision: null, configurationDigest: null, commands: [], exported: null,
       checkpointReceiptDigest: null, rounds: [], deleteIntent: null, deleteConfirmed: false, retired: false });
   }

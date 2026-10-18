@@ -1,3 +1,7 @@
+import { QueueRepository } from '../src/domain/queue-repository.js';
+import { OutboxHandler } from '../src/domain/outbox-handler.js';
+import { EventBus } from '../src/domain/event-bus.js';
+import { issueWithdrawalAction, nativeContinuation, type ContinuationTarget } from '../src/domain/elastic-continuation.js';
 import { afterEach, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, createReadStream } from 'node:fs';
 import { join } from 'node:path';
@@ -34,6 +38,10 @@ async function fixture() {
   cleanup.push(() => { db.close(); worker.close(); });
   let clock = Date.now();
   const native = new ElasticWorkerControl(worker, () => clock);
+  const queue=new QueueRepository(worker,new EventBus(worker));queue.attachOutbox(new OutboxHandler(worker));
+  let lateHuman=false,question:Awaited<ReturnType<typeof queue.create>>|undefined,replyId:string|undefined;
+  const continuationTarget:ContinuationTarget={nodeId:'node',session:'worker-a@elastic',occupant:'occupant',pane:'%1',conversation:'conversation',sessionFile:'/fixture/session.jsonl',stateRoot:'/fixture/state/pi',cwd:'/fixture',model:null,launchId:'launch',process:{bootId:'boot',runnerPid:10,childPid:11,runnerStartTime:'a',childStartTime:'b'}};
+
   const raw = JSON.parse(readFileSync(new URL('../../../integrations/azure-elastic/manifest.example.json', import.meta.url), 'utf8'));
   raw.pins.forEach((p: { sha256: string }) => p.sha256 = 'a'.repeat(64));
   raw.resourceId = '/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/fixture/providers/Microsoft.Compute/virtualMachineScaleSets/fixture';
@@ -91,7 +99,13 @@ async function fixture() {
       expect(args.join(' ')).not.toContain('capabilityEnvelope');
       operations.push(request.operation);
       const p = request.payload; let output: unknown;
-      if (request.operation === 'begin-drain') output = native.beginDrain(p.identity, p.operationId);
+      if (request.operation === 'begin-drain') {
+        if(lateHuman&&!question)question=await queue.create({sourceSession:'worker-a@elastic',destinationSession:'human@kernel',body:'Decision',summary:'Decision',evidenceRef:'/fixture',humanIntent:'decision',nudge:false});
+        output = native.beginDrain(p.identity, p.operationId);
+      } else if(request.operation==='withdraw-drain') {
+        const action=worker.transaction(()=>issueWithdrawalAction(worker,p,'existing-runner')).immediate();
+        output={withdrawalId:p.withdrawalId,generation:action.generation,actionId:action.actionId};
+      }
       else if (request.operation === 'quiesce') {
         native.sealAdmission(p.binding, p.binding.drainGeneration); stopped = true;
         worker.exec('CREATE TABLE shutdown_business(value TEXT); INSERT INTO shutdown_business VALUES (\'last shutdown write\')');
@@ -138,7 +152,12 @@ async function fixture() {
   const commands = new AzureWorkerCommandClient({ executable: '/fixture/az', azureConfigDirectory: root, privateDirectory: join(root, 'commands'), run });
   const enrollment = new ElasticWorkerEnrollment({ store, commands, manifestRaw, preparationPlan: plan, fleetEpoch: 'epoch', workerBuildCommit: 'c'.repeat(40), artifact,
     packageRecipe: recipe, checkpointCaPem: 'fixture', stageScript: script, helperScript: script, registryPath: registry, now: () => clock,
-    fetchImpl: async () => {
+    fetchImpl: async (url) => {
+      if(String(url).endsWith('/api/elastic-worker/continuations')) {
+        const outboxId=`wake-intent-${replyId}`;
+        const candidates=replyId?[{outboxId,queueDigest:nativeContinuation(worker,outboxId).native.queue_digest,target:continuationTarget}]:[];
+        return new Response(JSON.stringify({state:native.read(),candidates}));
+      }
       if (stopped) throw Error('worker HTTP stopped');
       return new Response(JSON.stringify({ version: 1, observedAt: clock, selfHostId: 'worker-host', build: { commit: 'c'.repeat(40), dirty: false }, state: native.read(), ledger: native.ledger(),
         filesystem: { complete: true, blockers: [], files: [], refs: [], digest: 'f'.repeat(64) }, process: { observedAt: clock, complete: true, idle: true, processes: 1, uid: manifest.uid, cgroup: '/system.slice/openrig-elastic.service' }, checkpointAcknowledged: false, drainEligible: true, clean: true,
@@ -156,6 +175,11 @@ async function fixture() {
   const io = createAzureElasticFleetIO({ run, now: () => clock, lifecycle, observeNative: async () => { throw Error('not used for removal'); },
     beginDrain: c => lifecycle.beginDrain(c), sealForRemoval: c => lifecycle.sealForRemoval(c), retireRegistration: c => lifecycle.retireRegistration(c) });
   return { root, db, worker, native, a, owner, store, lifecycle, makeLifecycle, custody, io, operations, context, turn, registry, configuration, instance,
+    prepareLateHuman:()=>{lateHuman=true;worker.exec(`INSERT INTO rigs(id,name) VALUES('rig','rig'); INSERT INTO nodes(id,rig_id,logical_id,runtime,cwd) VALUES('node','rig','owner','pi','/fixture');
+      INSERT INTO sessions(id,node_id,session_name,resume_type,resume_token) VALUES('session','node','worker-a@elastic','pi_session_file','/fixture/session.jsonl');
+      INSERT INTO bindings(id,node_id,tmux_session,tmux_pane) VALUES('binding','node','worker-a@elastic','%1');
+      INSERT INTO occupant_tenures(id,node_id,generation_ordinal,generation_uuid,kind) VALUES('tenure','node',1,'occupant','fresh');`);},
+    answerLateHuman:()=>{const reply=queue.recordHumanResponse({qitemId:question!.qitemId,requestRevision:question!.humanRequestRevision!,actorSession:'human@kernel',replyId:'answer',response:{kind:'custom',text:'Continue existing work'}});replyId=reply.replyQitemId;return reply;},
     unknown: (value: boolean) => unknown = value, pauseBeforePut: () => pauseBeforePut = true, slowFinal: () => slowFinal = true,
     finalHook: (hook: () => void) => finalHook = hook, unknownDelete: () => unknownDelete = true, dispatchDelay: () => dispatchDelay = true, replacement: () => replacement = true,
     pendingStatus: (value: boolean) => rootStatusPending = value, advanceClock: (wall: number, monotonic: number) => { clock += wall; mono += monotonic; }, lists: () => lists };
@@ -279,4 +303,33 @@ it.skipIf(process.platform !== 'linux')('refuses loss of the exact fleet claim a
   f.finalHook(() => { f.db.prepare("UPDATE elastic_native_owners SET owner='other-claim' WHERE scope='fleet'").run(); });
   await expect(f.turn(() => f.io.remove(f.context('remove').operation))).rejects.toThrow();
   expect(f.operations).not.toContain('delete'); expect(f.lifecycle.journal.read(f.a.id)?.deleteIntent).toBeNull();
+});
+
+it('withdraws an actual native human wake with immutable root begin/remove IDs and never replays unknown withdrawal',async()=>{
+  const f=await fixture();f.prepareLateHuman();await drain(f);f.answerLateHuman();
+  expect(await f.turn(()=>f.lifecycle.hasOwnedContinuation(f.a.workerId,f.context('remove').operation.configuration))).toBe(true);
+  f.unknown(true);await expect(f.turn(()=>f.lifecycle.sealForRemoval(f.context('remove')))).rejects.toThrow();
+  const first=f.lifecycle.journal.read(f.a.id)!;
+  expect(first).toMatchObject({beginOperationId:'drain-1',removalOperationId:'remove-1',binding:{removalOperationId:'drain-1'},withdrawal:{receipt:null}});
+  expect(f.native.read()).toMatchObject({phase:'draining',generation:2});
+  await expect(f.turn(()=>f.lifecycle.sealForRemoval(f.context('remove')))).rejects.toThrow();
+  expect(f.operations).toEqual(['begin-drain','withdraw-drain']);
+  f.unknown(false);await expect(f.turn(()=>f.lifecycle.sealForRemoval(f.context('remove')))).rejects.toThrow('withdrawn');
+  expect(await f.lifecycle.inspectNative({...f.context('remove'),operation:f.context('remove').operation})).toBe('withdrawn');
+  const state=f.lifecycle.journal.read(f.a.id)!;expect(state.withdrawal?.receipt?.generation).toBe(2);expect(state.deleteIntent).toBeNull();
+  expect(f.operations).toEqual(['begin-drain','withdraw-drain']);
+  const oldInput=first.commands.find(c=>c.operation==='begin-drain')!;
+  const bytes=f.store.readPrivateInput(f.a.id,oldInput.inputName);
+  await f.turn(async()=>{const finished=f.lifecycle.journal.advance(state,{withdrawal:{...state.withdrawal!,finished:true}});expect(finished.withdrawal?.finished).toBe(true);
+    const next=f.lifecycle.journal.begin(f.a.id,'drain-3');expect(next.commands).toEqual([]);expect(next.beginOperationId).toBe('drain-3');
+    expect(()=>f.lifecycle.journal.begin(f.a.id,'drain-1')).toThrow();});
+  expect(f.store.readPrivateInput(f.a.id,oldInput.inputName)).toEqual(bytes);
+});
+it.each(['intent','submitted','unknown'] as const)('never withdraws after a persisted quiesce %s',async state=>{
+  const f=await fixture();await drain(f);
+  await expect(f.turn(()=>f.lifecycle.sealForRemoval(f.context('remove')))).rejects.toThrow();
+  const current=f.lifecycle.journal.read(f.a.id)!;
+  await f.turn(async()=>{f.lifecycle.journal.advance(current,{commands:current.commands.map(c=>c.operation==='quiesce'?{...c,state}:c)});});
+  f.unknown(true);await expect(f.turn(()=>f.lifecycle.sealForRemoval(f.context('remove')))).rejects.toThrow();
+  expect(f.operations).toEqual(['begin-drain','quiesce']);expect(f.lifecycle.journal.read(f.a.id)?.withdrawal).toBeNull();
 });

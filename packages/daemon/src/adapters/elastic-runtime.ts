@@ -120,6 +120,7 @@ export class ElasticRuntime {
       inspectNative: context => context.operation.type === 'provision' ? this.enrollment.inspectNative(context) : lifecycle.inspectNative(context),
     });
     const io: FleetIO = {
+      hasOwnedContinuation: (workerId,configuration) => lifecycle.hasOwnedContinuation(workerId,configuration),
       recoverAttempts: () => {
         const policy = this.service.status().config?.policy;
         if (policy?.enabled && policy.mode === 'active') this.store.recoverStoppedLocks();
@@ -137,7 +138,7 @@ export class ElasticRuntime {
         if (purpose !== 'reconcile') return { ...this.snapshot, now: Date.now() };
         try { this.owner.assertHeld('fleet'); } catch { return { ...this.snapshot, now: Date.now() }; }
         if (!policy.enabled || this.service.status().paused) return { ...this.snapshot, now: Date.now() };
-        if (policy.mode === 'active') await this.activate();
+        if (policy.mode === 'active') {await this.activate();await lifecycle.reconcileContinuations(config);}
         else {
           const azure = validateAzurePoolConfiguration(config.provider, policy.poolId);
           const account = z.object({ id: z.string(), state: z.literal('Enabled') }).passthrough().parse(await this.commands.run(['account', 'show', '--subscription', azure.subscription]));

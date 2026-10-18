@@ -7,7 +7,7 @@ import {
 } from "./linux-privileged-worker-boundary.js";
 import { noFollowRead, sha256 } from "./elastic-worker-checkpoint.js";
 import { ElasticWorkerControl } from "../domain/elastic-worker-control.js";
-import { assertElasticEffectAllowed } from "../domain/elastic-worker-guard.js";
+import { assertElasticUnitStartAllowed } from "../domain/elastic-worker-guard.js";
 import {
   inspectElasticWorker,
   inspectWorkerFilesystem,
@@ -60,7 +60,7 @@ export function createElasticForegroundProbe(
     throw Error("elastic_worker_unavailable");
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   const control = new ElasticWorkerControl(db);
-  assertElasticEffectAllowed(db, { allowDraining: true });
+  assertElasticUnitStartAllowed(db);
   return () =>
     inspectElasticWorker({
       control,

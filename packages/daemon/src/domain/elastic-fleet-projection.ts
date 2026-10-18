@@ -109,7 +109,8 @@ export class ElasticFleetProjection implements GithubIntakeAdmission {
     idleSince(attempt: ElasticWorkerAttempt, observation: ManagedWorkerObservation, maximumGapMs: number): number | null {
         const p = observation.probe;
         const now = this.now();
-        const eligible = !!p && observation.worker.state === 'ready' && observation.worker.active === 0 && observation.drainEligible === true && p.ledger.complete && p.ledger.clean && p.process.complete && p.process.idle && p.filesystem.complete && !p.filesystem.blockers.length && p.observedAt <= now && now - p.observedAt <= 5000;
+        const finished=!!this.db.prepare("SELECT 1 FROM elastic_fleet_drains WHERE worker_id=? AND state='continuation-finished'").get(attempt.workerId);
+        const eligible = !!p && (observation.worker.state === 'ready' || finished && observation.worker.state === 'draining') && observation.worker.active === 0 && observation.drainEligible === true && p.ledger.complete && p.ledger.clean && p.process.complete && p.process.idle && p.filesystem.complete && !p.filesystem.blockers.length && p.observedAt <= now && now - p.observedAt <= 5000;
         return this.db.transaction(() => {
             const previous = this.db.prepare('SELECT * FROM elastic_idle_windows WHERE worker_id=?').get(attempt.workerId) as {
                 identity: string;

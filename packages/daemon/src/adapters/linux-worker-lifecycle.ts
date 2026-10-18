@@ -1,3 +1,5 @@
+import { issueWithdrawalAction, withdrawalRequestSchema, readContinuationAction, type WithdrawalRequest } from '../domain/elastic-continuation.js';
+import { validateWithdrawalTarget } from './elastic-owned-continuation.js';
 import { finalStatusRequestSchema, finalStatusReceiptSchema } from './elastic-lifecycle-contract.js';
 import { inspectManagedTmuxIpc, retireStoppedTmuxIpc, type ManagedTmuxIpc } from "./managed-tmux-ipc.js";
 import { execFileSync } from "node:child_process";
@@ -58,6 +60,7 @@ export class LinuxWorkerLifecycle {
       state.vmId !== binding.vmId ||
       state.manifestDigest !== binding.manifestDigest ||
       state.generation !== binding.drainGeneration ||
+      this.control.generation()?.purpose !== 'removal' ||
       state.drainOperationId !== binding.removalOperationId ||
       binding.workerId !== azureWorkerId(m.resourceId, instance.vmId) ||
       binding.fleetEpoch !== instance.fleetEpoch ||
@@ -108,9 +111,43 @@ export class LinuxWorkerLifecycle {
     if (!proof.complete || proof.blockers.length) fail();
     return proof;
   }
+  /** Helper already holds the one root operation.lock. Publication recovery never changes selectors. */
+  withdraw(request:WithdrawalRequest) {
+    const input=withdrawalRequestSchema.parse(request), state=this.control.read();
+    const instance=this.os.instance();
+    if(input.identity.manifestDigest!==this.os.manifestDigest || input.identity.vmId!==instance.vmId
+      || input.identity.workerId!==azureWorkerId(this.os.manifest.resourceId,instance.vmId))fail();
+    if(!state || state.phase==='sealed' || state.workerId!==input.identity.workerId || state.vmId!==input.identity.vmId
+      || state.manifestDigest!==input.identity.manifestDigest || existsSync(this.path('quiesced.json')) || existsSync(this.path('quiesce-intent.json')))fail();
+    const name=`withdrawal-${input.withdrawalId}.json`;
+    if(existsSync(this.path(name))) {if(workerDigest(this.read(name))!==workerDigest(input))fail();}
+    else this.save(name,input);
+    const previous=this.control.db.prepare('SELECT action_id FROM elastic_continuation_actions WHERE withdrawal_id=?').get(input.withdrawalId) as {action_id:string}|undefined;
+    if(previous) {
+      const row=readContinuationAction(this.control.db,previous.action_id);
+      if(state.generation!==row.action.generation || this.control.generation()?.selector_digest!==workerDigest(input))fail();
+      this.os.publishAdmission(state,'continuation',input.withdrawalId);
+      return {withdrawalId:input.withdrawalId,generation:state.generation,actionId:row.action.actionId};
+    }
+    if(state.generation!==input.generation || state.drainOperationId!==input.operationId || this.control.generation()?.purpose!=='removal')fail();
+    const kind=validateWithdrawalTarget(this.control.db,input.target,this.os.manifest);
+    this.os.publishAdmission(state,'transition',input.withdrawalId);
+    const action=this.control.db.transaction(()=>issueWithdrawalAction(this.control.db,input,kind)).immediate();
+    this.os.publishAdmission(this.control.read()!,'continuation',input.withdrawalId);
+    return {withdrawalId:input.withdrawalId,generation:action.generation,actionId:action.actionId};
+  }
+  finishContinuation(identity:{workerId:string;vmId:string;manifestDigest:string},generation:number) {
+    const state=this.control.read();
+    if(!state || workerDigest(identity)!==workerDigest({workerId:state.workerId,vmId:state.vmId,manifestDigest:state.manifestDigest}) || state.generation!==generation)fail();
+    this.control.retireContinuation();
+    return {generation,retired:true as const,dispositionDigest:this.control.generation()!.disposition_digest};
+  }
   quiesce(binding: FinalBinding): { quiesced: true; binding: FinalBinding } {
     const state = this.state(binding);
     if (state.phase === "ready") fail();
+    const intent={binding};
+    if(existsSync(this.path('quiesce-intent.json'))) {if(workerDigest(this.read('quiesce-intent.json'))!==workerDigest(intent))fail();}
+    else this.save('quiesce-intent.json',intent);
     const existing = existsSync(this.path("quiesced.json"));
     if (
       existing &&

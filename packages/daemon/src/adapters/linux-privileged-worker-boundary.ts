@@ -1,3 +1,4 @@
+import type { ElasticWorkerState } from '../domain/elastic-worker-control.js';
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
@@ -614,6 +615,10 @@ export class LinuxPrivilegedWorkerBoundary implements PrivilegedWorkerBoundary {
     )
       reject();
     linuxCommand("/usr/bin/systemctl", ["start", this.manifest.unit]);
+  }
+  publishAdmission(state:ElasticWorkerState,purpose:'removal'|'continuation'|'transition',operationId:string):void {
+    durableWrite(this.manifest.linux.guard,JSON.stringify({version:1,phase:purpose==='transition'?'transition':state.phase,
+      workerId:state.workerId,vmId:state.vmId,manifestDigest:state.manifestDigest,generation:state.generation,purpose,operationId}),0o644);
   }
   installSealMarker(): void {
     const m = this.manifest;

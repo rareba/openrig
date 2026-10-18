@@ -1,5 +1,7 @@
+import { validateAzurePoolConfiguration } from './azure-elastic-fleet.js';
+import { withdrawalRequestSchema, continuationTargetSchema } from '../domain/elastic-continuation.js';
 import type Database from 'better-sqlite3';
-import { createHash, createPublicKey, randomBytes } from 'node:crypto';
+import { createHash, createPublicKey, randomBytes, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { z } from 'zod';
 import type { FleetMutation, FleetOperation } from '../domain/elastic-fleet.js';
@@ -71,11 +73,11 @@ export class ElasticManagedLifecycle {
   }
   private async dispatch(a: ElasticWorkerAttempt, context: AzureMutationContext, command: LifecycleCommand): Promise<LifecycleCommand> {
     this.authority(context.operation);
-    this.obligations(a);
+    if(command.operation!=='withdraw-drain' && command.operation!=='finish-continuation')this.obligations(a);
     const state = await this.options.commands.submitManagedCommand(this.commandAttempt(a, command), command.operation, {
       configuration: context.configuration, endpoint: this.endpoint(a), script: this.options.helperScript,
       payload: this.options.store.readPrivateInput(a.id, command.inputName),
-      assertDispatch: () => { this.authority(context.operation); this.obligations(a); },
+      assertDispatch: () => { this.authority(context.operation); if(command.operation!=='withdraw-drain' && command.operation!=='finish-continuation')this.obligations(a); },
     });
     return { ...command, state };
   }
@@ -139,12 +141,77 @@ export class ElasticManagedLifecycle {
     } else state = this.journal.advance(state, { binding, removalOperationId: context.operation.operationId, operationRevision: context.operation.revision, configurationDigest: enrollmentDigest(context.operation.configuration) });
     return state;
   }
+  async hasOwnedContinuation(workerId:string,configuration:import('../domain/elastic-fleet.js').ElasticFleetConfiguration):Promise<boolean> {
+    this.options.owner.assertHeld('fleet');
+    const a=this.attempt(workerId),state=this.journal.read(a.id);
+    if(!state?.drain||state.withdrawal||state.deleteIntent||state.commands.some(c=>c.operation==='quiesce'))return false;
+    const provider=validateAzurePoolConfiguration(configuration.provider,configuration.policy.poolId);
+    const view=z.object({state:z.object({generation:z.number(),drainOperationId:z.string().nullable()}),candidates:z.array(z.object({outboxId:z.string(),queueDigest:z.string(),target:continuationTargetSchema}))})
+      .parse(await this.options.enrollment.continuationRequest(a,provider,'GET'));
+    return view.state.generation===state.drain.generation&&view.state.drainOperationId===state.beginOperationId&&view.candidates.length>0;
+  }
+  private async withdrawForContinuation(a:ElasticWorkerAttempt,context:AzureMutationContext,state:LifecycleState):Promise<void> {
+    if(state.deleteIntent || state.commands.some(c=>c.operation==='quiesce'))refuse('elastic_quiesce_already_intended');
+    if(!state.withdrawal) {
+      const view=z.object({state:z.object({generation:z.number(),drainOperationId:z.string().nullable()}),candidates:z.array(z.object({outboxId:z.string(),queueDigest:z.string(),target:continuationTargetSchema}))})
+        .parse(await this.options.enrollment.continuationRequest(a,context.configuration,'GET'));
+      const candidate=view.candidates[0];
+      if(!candidate || view.state.generation!==state.drain?.generation || view.state.drainOperationId!==state.beginOperationId)refuse('elastic_owned_continuation_unavailable');
+      const request=withdrawalRequestSchema.parse({identity:{workerId:a.workerId,vmId:a.binding.vmId,manifestDigest:a.binding.manifestDigest},generation:view.state.generation,
+        operationId:state.beginOperationId,withdrawalId:randomUUID(),...candidate});
+      state=this.journal.advance(state,{withdrawal:{request,receipt:null,finished:false}});
+    }
+    const w=state.withdrawal!;
+    if(!w.receipt) {
+      const result=await this.advanceCommand(a,context,state,'withdraw-drain',w.request,raw=>{
+        const receipt=z.object({withdrawalId:z.string().uuid(),generation:z.number().int().positive(),actionId:z.string().uuid()}).strict().parse(raw);
+        if(receipt.withdrawalId!==w.request.withdrawalId||receipt.generation!==w.request.generation+1)refuse();return receipt;
+      });
+      if(!result.completed)refuse('elastic_withdrawal_pending');
+      const receipt=z.object({withdrawalId:z.string().uuid(),generation:z.number().int().positive(),actionId:z.string().uuid()}).strict()
+        .parse(result.state.commands.find(c=>c.operation==='withdraw-drain')?.result);
+      state=this.journal.advance(result.state,{withdrawal:{...w,receipt}});
+      this.options.db.transaction(()=>{
+        this.options.db.prepare("UPDATE elastic_fleet_drains SET state='continuation',updated_at=? WHERE worker_id=? AND begin_operation_id=?").run(this.now(),a.workerId,state.beginOperationId);
+        this.options.db.prepare('DELETE FROM elastic_idle_windows WHERE worker_id=?').run(a.workerId);
+      }).immediate();
+    }
+    refuse('elastic_removal_withdrawn');
+  }
+  /** Bounded progress of quarantined native lineages while the fleet can work on other workers. */
+  async reconcileContinuations(configuration:import('../domain/elastic-fleet.js').ElasticFleetConfiguration):Promise<void> {
+    this.options.owner.assertHeld('fleet');
+    for(const a of this.options.store.list()) {
+      let state=this.journal.read(a.id);const w=state?.withdrawal;
+      if(!state||!w?.receipt||w.finished||!state.removalOperationId)continue;
+      const row=this.options.db.prepare('SELECT * FROM elastic_fleet_operations WHERE operation_id=?').get(state.removalOperationId) as {operation_id:string;type:'remove';state:'withdrawn';worker_id:string;count:number;target_capacity:number;revision:number;snapshot:string;configuration:string;error:string|null;created_at:number;updated_at:number}|undefined;
+      if(!row||row.state!=='withdrawn'||enrollmentDigest(JSON.parse(row.configuration))!==enrollmentDigest(configuration))continue;
+      const operation: FleetMutation={operationId:row.operation_id,type:row.type,state:row.state,workerId:row.worker_id,count:row.count,targetCapacity:row.target_capacity,
+        revision:row.revision,snapshot:JSON.parse(row.snapshot),error:row.error,createdAt:row.created_at,updatedAt:row.updated_at,configuration,policy:configuration.policy};
+      try {
+        this.authority(operation);
+        const provider=validateAzurePoolConfiguration(configuration.provider,configuration.policy.poolId);
+        if(!state.commands.some(c=>c.operation==='finish-continuation'))await this.options.enrollment.continuationRequest(a,provider,'POST',{withdrawalId:w.request.withdrawalId});
+        const observed=await this.options.enrollment.observeManagedWorker(a,provider);
+        if(!observed.probe?.ledger.clean||!observed.probe.process.complete||!observed.probe.process.idle)continue;
+        const context:AzureMutationContext={operation,configuration:provider,instance:{resourceId:a.identity.childResourceId,instanceId:a.identity.instanceId,vmId:a.binding.vmId,workerId:a.workerId,protected:true,provisioningState:'Succeeded'}};
+        const result=await this.advanceCommand(a,context,state,'finish-continuation',{identity:{workerId:a.workerId,vmId:a.binding.vmId,manifestDigest:a.binding.manifestDigest},generation:w.receipt.generation},raw=>{
+          const value=z.object({generation:z.number().int().positive(),retired:z.literal(true),dispositionDigest:z.string()}).strict().parse(raw);
+          if(value.generation!==w.receipt!.generation)refuse();return value;
+        });
+        if(!result.completed)continue;
+        state=this.journal.advance(result.state,{withdrawal:{...w,finished:true}});
+        this.options.db.prepare("UPDATE elastic_fleet_drains SET state='continuation-finished',updated_at=? WHERE worker_id=? AND begin_operation_id=?").run(this.now(),a.workerId,state.beginOperationId);
+        this.options.db.prepare('DELETE FROM elastic_idle_windows WHERE worker_id=?').run(a.workerId);
+      } catch { /* Native unknown effects retain this worker; continue disjoint lineages. */ }
+    }
+  }
   async sealForRemoval(context: AzureMutationContext): Promise<AzureRemovalSeal> {
     this.authority(context.operation);
     const a = this.attempt(context.operation.workerId);
-    this.obligations(a);
     let state = this.bindRemoval(a, context);
     if (state.deleteIntent) refuse('elastic_delete_reconciliation_required');
+    if(state.withdrawal){await this.withdrawForContinuation(a,context,state);refuse();}
     const binding = state.binding!;
     const done = (operation: ManagedWorkerOperation) => state.commands.some(c => c.operation === operation && c.state === 'succeeded');
     if (!done('quiesce')) {
@@ -152,7 +219,7 @@ export class ElasticManagedLifecycle {
         const observed = await this.options.enrollment.observeManagedWorker(a, context.configuration);
         if (!observed.probe || observed.probe.state.phase !== 'draining' || observed.probe.state.generation !== binding.drainGeneration
           || observed.probe.state.drainOperationId !== state.beginOperationId || !observed.drainEligible || !observed.probe.ledger.clean
-          || !observed.probe.process.complete || !observed.probe.process.idle) refuse('elastic_owned_continuation_required');
+          || !observed.probe.process.complete || !observed.probe.process.idle) {await this.withdrawForContinuation(a,context,state);refuse();}
       }
       await this.advanceCommand(a, context, state, 'quiesce', { binding }, raw => {
         const parsed = z.object({ quiesced: z.literal(true), binding: finalBindingSchema }).strict().parse(raw);
@@ -176,12 +243,13 @@ export class ElasticManagedLifecycle {
       let attemptId: string;
       try { attemptId = this.options.custody.registerAttempt({ ...material, trust: { manifestRaw: this.options.manifestRaw, instance: this.endpoint(a).instance } }).attemptId; }
       finally { material.controllerPrivateKeyPem.fill(0); }
-      let payload = this.options.store.readPrivateInput(a.id, 'life-upload');
+      const uploadInput=`life-upload-${enrollmentDigest(state.beginOperationId)}`;
+      let payload = this.options.store.readPrivateInput(a.id, uploadInput);
       if (!payload) {
         if (!a.workerPublicKeyPem) refuse();
         const capability = this.options.custody.reserve({ attemptId, binding, summary, maxBytes: summary.ciphertextBytes, expiresAt: this.now() + 3600000 });
         const plaintext = Buffer.from(JSON.stringify(capability));
-        try { payload = this.options.store.savePrivateInput(a.id, 'life-upload', { binding,
+        try { payload = this.options.store.savePrivateInput(a.id, uploadInput, { binding,
           capabilityEnvelope: sealCheckpointCapability(plaintext, a.binding, createPublicKey(a.workerPublicKeyPem)) }); }
         finally { plaintext.fill(0); }
       }
@@ -301,9 +369,10 @@ export class ElasticManagedLifecycle {
       vmId: intent.vmId, workerId: a.workerId, protected: true, provisioningState: 'Succeeded' } });
     return true;
   }
-  async inspectNative(context: AzureNativeContext & { operation: FleetOperation }): Promise<'pending' | 'unknown' | 'succeeded'> {
+  async inspectNative(context: AzureNativeContext & { operation: FleetOperation }): Promise<'pending' | 'unknown' | 'succeeded' | 'withdrawn'> {
     const a = this.attempt(context.operation.workerId), state = this.journal.read(a.id);
     if (!state) return context.operation.type === 'beginDrain' ? 'pending' : 'unknown';
+    if(context.operation.type==='remove'&&state.removalOperationId===context.operation.operationId&&state.withdrawal?.receipt)return 'withdrawn';
     if (context.operation.type === 'beginDrain') return state.drain?.drainOperationId === context.operation.operationId ? 'succeeded' : this.inspectLast(a, state, context.configuration);
     if (state.removalOperationId !== context.operation.operationId) return state.binding ? 'unknown' : 'pending';
     if (state.deleteIntent) {

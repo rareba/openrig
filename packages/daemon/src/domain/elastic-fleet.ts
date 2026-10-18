@@ -8,7 +8,7 @@ export interface ElasticFleetConfiguration { policy: FleetPolicy; provider?: Rec
 export interface FleetOperation {
   operationId: string;
   type: "provision" | "beginDrain" | "remove";
-  state: "pending" | "succeeded";
+  state: "pending" | "succeeded" | "withdrawn";
   workerId: string | null;
   count: number;
   /** Absolute desired managed, nonpermanent pool capacity, fixed before IO. */
@@ -20,10 +20,12 @@ export interface FleetOperation {
   updatedAt: number;
 }
 export interface FleetMutation extends FleetOperation { policy: FleetPolicy; configuration: ElasticFleetConfiguration }
-export type FleetOperationResult = "succeeded" | "pending" | "unknown";
+export type FleetOperationResult = "succeeded" | "pending" | "unknown" | "withdrawn";
 export interface FleetIO {
   /** Runs only inside the held native fleet scope, before attempt mutation. */
   recoverAttempts?(): void;
+  /** Read-only native selection; the removal lifecycle still proves and issues withdrawal. */
+  hasOwnedContinuation?(workerId:string,configuration:ElasticFleetConfiguration):Promise<boolean>;
   /** Advance a confirmed pending operation. Unknown operations are only inspected. */
   advanceOperation?(operation: FleetMutation): Promise<FleetOperationResult>;
   validateConfiguration?(configuration: ElasticFleetConfiguration): void;
@@ -31,7 +33,7 @@ export interface FleetIO {
   provision(operation: FleetMutation): Promise<void>;
   beginDrain(operation: FleetMutation): Promise<void>;
   remove(operation: FleetMutation): Promise<void>;
-  inspectOperation(operation: FleetOperation, configuration: ElasticFleetConfiguration): Promise<"succeeded" | "pending" | "unknown">;
+  inspectOperation(operation: FleetOperation, configuration: ElasticFleetConfiguration): Promise<"succeeded" | "pending" | "unknown" | "withdrawn">;
 }
 export interface ElasticFleetStatus {
   config: ElasticFleetConfiguration | null;
@@ -47,7 +49,7 @@ export interface ElasticFleetStatus {
 interface ConfigRow { config: string | null; revision: number; paused: number; history: string; last_plan: string | null; error: string | null; reconcile_owner: string | null }
 interface OperationRow { operation_id: string; type: FleetOperation["type"]; state: FleetOperation["state"]; worker_id: string | null;
   count: number; target_capacity: number; revision: number; snapshot: string; configuration: string; error: string | null; created_at: number; updated_at: number }
-interface DrainRow { worker_id: string; pool_id: string; state: "requested" | "draining" | "removed"; begin_operation_id: string | null }
+interface DrainRow { worker_id: string; pool_id: string; state: "requested" | "draining" | "continuation" | "continuation-finished" | "removed"; begin_operation_id: string | null }
 const liveOwners = new Set<string>();
 const emptyHistory: FleetHistory = { lastObservedAt: null, demandSamples: 0 };
 const policyKeys = ["poolId", "enabled", "mode", "maxWorkers", "slotsPerWorker", "capabilities", "pollIntervalSeconds", "scaleOutSamples", "idleSeconds"];
@@ -133,9 +135,11 @@ export class ElasticFleetService {
     return this.status();
   }
   private overlay(snapshot: FleetSnapshot): FleetSnapshot {
-    const draining = new Set(this.drainingWorkerIds());
+    const drains=this.drains();
+    const draining = new Set(drains.map(d=>d.worker_id));
+    const quarantined=new Set(drains.filter(d=>d.state.startsWith('continuation')).map(d=>d.worker_id));
     return { ...snapshot, now: this.now(), workers: Array.isArray(snapshot.workers)
-      ? snapshot.workers.map((worker) => draining.has(worker.id) ? { ...worker, state: "draining" as const } : worker) : snapshot.workers };
+      ? snapshot.workers.map((worker) => quarantined.has(worker.id) ? {...worker,state:"quarantined" as const} : draining.has(worker.id) ? { ...worker, state: "draining" as const } : worker) : snapshot.workers };
   }
   async plan(): Promise<FleetPlan | null> {
     const state = this.status(); if (!state.config) return null;
@@ -146,6 +150,12 @@ export class ElasticFleetService {
   }
   private error(code: string | null): void {
     this.db.prepare("UPDATE elastic_fleet_config SET error = ?, updated_at = ? WHERE id = 1").run(code, this.now());
+  }
+  private withdrew(row:OperationRow):void {
+    this.db.transaction(()=>{
+      this.db.prepare("UPDATE elastic_fleet_operations SET state='withdrawn',error=NULL,updated_at=? WHERE operation_id=? AND state='pending'").run(this.now(),row.operation_id);
+      this.db.prepare("UPDATE elastic_fleet_drains SET state='continuation',updated_at=? WHERE worker_id=?").run(this.now(),row.worker_id);
+    }).immediate();
   }
   private finish(row: OperationRow): void {
     this.db.transaction(() => {
@@ -165,7 +175,7 @@ export class ElasticFleetService {
       const target = type === "provision" ? managed + count : type === "remove" ? Math.max(0, managed - 1) : managed;
       const id = randomUUID(); const now = this.now();
       if (type === "beginDrain") {
-        this.db.prepare("INSERT INTO elastic_fleet_drains (worker_id, pool_id, state, begin_operation_id, created_at, updated_at) VALUES (?, ?, 'requested', ?, ?, ?) ON CONFLICT(worker_id) DO UPDATE SET begin_operation_id = excluded.begin_operation_id, updated_at = excluded.updated_at")
+        this.db.prepare("INSERT INTO elastic_fleet_drains (worker_id, pool_id, state, begin_operation_id, created_at, updated_at) VALUES (?, ?, 'requested', ?, ?, ?) ON CONFLICT(worker_id) DO UPDATE SET state='requested',begin_operation_id = excluded.begin_operation_id, updated_at = excluded.updated_at")
           .run(workerId, config.policy.poolId, id, now, now);
       }
       this.db.prepare("INSERT INTO elastic_fleet_operations (operation_id, type, state, worker_id, count, target_capacity, revision, snapshot, configuration, created_at, updated_at) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)")
@@ -198,7 +208,8 @@ export class ElasticFleetService {
     if (pending) {
       try {
         const inspected = await this.io.inspectOperation(operation(pending), JSON.parse(pending.configuration));
-        if (inspected === "succeeded") this.finish(pending);
+        if(inspected==='withdrawn')this.withdrew(pending);
+        else if (inspected === "succeeded") this.finish(pending);
         else {
           const current = this.status();
           const saved = configuration(JSON.parse(pending.configuration));
@@ -206,7 +217,8 @@ export class ElasticFleetService {
             && current.config.policy.mode === 'active' && isDeepStrictEqual(current.config, saved);
           const result = mayAdvance && this.io.advanceOperation
             ? await this.io.advanceOperation({ ...operation(pending), policy: saved.policy, configuration: saved }) : inspected;
-          if (result === 'succeeded') this.finish(pending);
+          if(result==='withdrawn')this.withdrew(pending);
+          else if (result === 'succeeded') this.finish(pending);
           else this.error(result === 'pending' ? 'operation_pending' : 'operation_unknown');
         }
       } catch { this.error("inspection_failed"); }
@@ -225,14 +237,18 @@ export class ElasticFleetService {
     // The planner validates the complete native inventory before retirement can proceed.
     if (plan.reasons.some((reason) => ["invalid_snapshot", "invalid_history", "snapshot_not_fresh", "worker_not_fresh", "unknown_worker_telemetry", "provider_unavailable", "invalid_policy"].includes(reason))) return this.status();
     let type: FleetOperation["type"] | null = null; let workerId: string | null = null; let count = 0;
-    const drain = this.drains()[0];
+    const drain = this.drains().find(d=>d.state!=='continuation');
     if (drain) {
       const native = observed.workers.find((worker) => worker.id === drain.worker_id);
       if (drain.pool_id === config.policy.poolId && native?.managed && !native.permanent
         && ["ready", "draining"].includes(native.state)) {
         workerId = native.id;
-        if (drain.state === "requested") type = "beginDrain";
-        else if (native.active === 0 && native.clean === true && native.pendingHumanReturns === false && drain.begin_operation_id) {
+        if(drain.state==='continuation-finished') {
+          if(native.active===0&&native.clean===true&&native.pendingHumanReturns===false&&native.idleSince!==null
+            && this.now()-native.idleSince>=config.policy.idleSeconds*1000)type='beginDrain';
+        } else if (drain.state === "requested") type = "beginDrain";
+        else if (drain.begin_operation_id && (native.active===0 && native.clean===true && native.pendingHumanReturns===false
+          || await this.io.hasOwnedContinuation?.(native.id,config).catch(()=>false))) {
           const begin = this.db.prepare("SELECT state, updated_at FROM elastic_fleet_operations WHERE operation_id = ? AND type = 'beginDrain' AND worker_id = ?").get(drain.begin_operation_id, native.id) as { state: string; updated_at: number } | undefined;
           if (begin?.state === "succeeded" && snapshot.observedAt > begin.updated_at && native.observedAt > begin.updated_at) type = "remove";
         }

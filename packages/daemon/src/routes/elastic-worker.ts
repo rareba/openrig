@@ -1,3 +1,4 @@
+import type { ElasticContinuationExecutor } from '../adapters/elastic-continuation-executor.js';
 import type { QueueRepository } from '../domain/queue-repository.js';
 import { z } from 'zod';
 import type { ElasticWorkerPreparation } from '../adapters/elastic-worker-prepare.js';
@@ -6,7 +7,7 @@ import { authBearerTokenMiddleware } from '../middleware/auth-bearer-token.js';
 import type { ElasticWorkerProbe } from '../adapters/elastic-worker-probe.js';
 export type ElasticWorkerProbeReader = () => ElasticWorkerProbe | Promise<ElasticWorkerProbe>;
 /** Root control-plane mutations deliberately have no daemon HTTP equivalent. */
-export function elasticWorkerRoutes(options: { bearerToken: string | null; queue?: QueueRepository; probe?: ElasticWorkerProbeReader; preparation?: ElasticWorkerPreparation; runtime?: () => { selfHostId: string | null; build: unknown } }) {
+export function elasticWorkerRoutes(options: { continuation?:ElasticContinuationExecutor; bearerToken: string | null; queue?: QueueRepository; probe?: ElasticWorkerProbeReader; preparation?: ElasticWorkerPreparation; runtime?: () => { selfHostId: string | null; build: unknown } }) {
   const app = new Hono();
   app.use('*', async (c,next) => {
     if (!options.bearerToken) return c.json({ error: 'elastic_worker_unavailable' },503);
@@ -17,6 +18,16 @@ export function elasticWorkerRoutes(options: { bearerToken: string | null; queue
     const input = z.object({after:z.coerce.number().int().nonnegative(),through:z.coerce.number().int().nonnegative().optional(),limit:z.coerce.number().int().min(1).max(100)}).strict().safeParse(c.req.query());
     if (!input.success) return c.json({error:'invalid_question_cursor'},400);
     try { return c.json(options.queue.elasticHumanQuestions(input.data)); } catch { return c.json({error:'invalid_question_cursor'},400); }
+  });
+  app.get('/continuations',c=>{
+    if(!options.continuation)return c.json({error:'elastic_continuation_unavailable'},503);
+    try{return c.json(options.continuation.inspect());}catch{return c.json({error:'elastic_continuation_unavailable'},409);}
+  });
+  app.post('/continuations/advance',async c=>{
+    if(!options.continuation)return c.json({error:'elastic_continuation_unavailable'},503);
+    const request=z.object({withdrawalId:z.string().uuid()}).strict().safeParse(await c.req.json().catch(()=>null));
+    if(!request.success)return c.json({error:'invalid_continuation'},400);
+    try{return c.json(await options.continuation.advance(request.data.withdrawalId));}catch{return c.json({error:'elastic_continuation_retained'},409);}
   });
   app.get('/probe', async c => {
     if (!options.probe) return c.json({ error: 'elastic_worker_unavailable' },503);

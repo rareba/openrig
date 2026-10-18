@@ -1,3 +1,4 @@
+import { elasticContinuationSchema } from './migrations/120_elastic_continuation.js';
 import { elasticCoordinatorSchema } from './migrations/119_elastic_coordinator.js';
 import { elasticHumanProxySchema } from './migrations/118_elastic_human_proxy.js';
 import { elasticWorkerSchema } from "./migrations/117_elastic_worker.js";
@@ -241,4 +242,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   elasticWorkerSchema,
   elasticHumanProxySchema,
   elasticCoordinatorSchema,
+  elasticContinuationSchema,
 ];
