@@ -3468,7 +3468,7 @@ export class QueueRepository {
       const intent: ElasticHumanForward = { version: 1, intentId: `${ELASTIC_HUMAN_FORWARD_PREFIX}${receipt.replyQitemId}`, mapping,
         proxyRevision: input.requestRevision, proxyReplyId: input.replyId, localReceiptQitemId: receipt.replyQitemId, fingerprint,
         originInput: { qitemId: mapping.originQitemId, replyId: `elastic-${createHash('sha256').update(JSON.stringify([mapping.mappingId, input.replyId])).digest('hex')}`,
-          requestRevision: mapping.originRevision, actorSession: mapping.originHuman, identityProvenance: input.identityProvenance ?? 'claimed:v1', response: parseHumanResponse(input.response)! } };
+          requestRevision: mapping.originRevision, actorSession: mapping.originHuman, identityProvenance: input.identityProvenance === 'transport:v1' ? 'relay:v1' : input.identityProvenance ?? 'claimed:v1', response: parseHumanResponse(input.response)! } };
       this.db.prepare("UPDATE elastic_human_proxies SET state='forward-pending',intent_id=?,receipt_qitem_id=? WHERE mapping_id=? AND state='open'")
         .run(intent.intentId, receipt.replyQitemId, mapping.mappingId);
       authorizeElasticSuccessor(this.db, item.qitemId, receipt.replyQitemId, input.actorSession, mapping.coordinatorManager, 'human-response');
@@ -3504,7 +3504,7 @@ export class QueueRepository {
       if (!t.transitionNote?.startsWith(HUMAN_RESPONSE_RECEIPT_PREFIX) || t.actorSession !== intent.mapping.coordinatorHuman) return false;
       const r = JSON.parse(t.transitionNote.slice(HUMAN_RESPONSE_RECEIPT_PREFIX.length)) as HumanResponseReceipt & { fingerprint: string };
       return r.replyQitemId === intent.localReceiptQitemId && r.fingerprint === intent.fingerprint
-        && (t.identityProvenance ?? 'claimed:v1') === (intent.originInput.identityProvenance ?? 'claimed:v1');
+        && (t.identityProvenance === 'transport:v1' ? 'relay:v1' : t.identityProvenance ?? 'claimed:v1') === (intent.originInput.identityProvenance ?? 'claimed:v1');
     });
     if (!response || !nativeReceipt || intent.version !== 1 || intent.localReceiptQitemId !== localReceiptId
       || intent.intentId !== `${ELASTIC_HUMAN_FORWARD_PREFIX}${localReceiptId}` || intent.originInput.replyId !== originReplyId
@@ -3520,6 +3520,41 @@ export class QueueRepository {
       throw new QueueRepositoryError('elastic_human_forward_invariant', 'Mapped answer lacks its exact durable passive receipt and typed forwarding intent.');
     }
     this.assertElasticHumanNoDependents(mapping);
+  }
+
+  /** Keyset window over the native question rows. The immutable rowid high-water bounds
+   * each sweep; subsequent sweeps see changed questions and new rows without first-page starvation. */
+  elasticHumanQuestions(input: { after: number; through?: number; limit: number }): { items: QueueItem[]; next: number; through: number; complete: boolean } {
+    if (!Number.isSafeInteger(input.after) || input.after < 0 || !Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100 || (input.through !== undefined && (!Number.isSafeInteger(input.through) || input.through < input.after))) throw new QueueRepositoryError('invalid_pagination', 'Invalid question cursor.');
+    return this.db.transaction(() => {
+      const through = input.through ?? (this.db.prepare('SELECT COALESCE(max(rowid),0) n FROM queue_items').get() as {n:number}).n;
+      const rows = this.db.prepare(`SELECT rowid cursor,qitem_id FROM queue_items WHERE rowid>? AND rowid<=? AND state='pending' AND is_human_seat_session(destination_session)=1 AND COALESCE(human_intent,'decision')='decision'
+        AND NOT EXISTS(SELECT 1 FROM elastic_human_proxies m WHERE m.proxy_qitem_id=queue_items.qitem_id OR m.receipt_qitem_id=queue_items.qitem_id) ORDER BY rowid LIMIT ?`).all(input.after, through, input.limit + 1) as {cursor:number;qitem_id:string}[];
+      const page = rows.slice(0,input.limit); const complete = rows.length <= input.limit;
+      return {items: page.map(r => this.getByIdOrThrow(r.qitem_id)), next: complete ? through : page[page.length-1]!.cursor, through, complete};
+    })();
+  }
+  /** Each bad authority is retained independently; its cursor still permits later origins. */
+  scanElasticHumanForwards(after: number, limit = 25): { items: Array<{cursor:number; intent: ElasticHumanForward} | {cursor:number; error:string}>; next:number; complete:boolean } {
+    if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) throw new QueueRepositoryError('invalid_pagination','Invalid forward cursor.');
+    const rows = this.db.prepare("SELECT m.rowid cursor,o.body FROM elastic_human_proxies m JOIN outbox_entries o ON o.outbox_id=m.intent_id WHERE m.state='forward-pending' AND m.rowid>? ORDER BY m.rowid LIMIT ?").all(after,limit+1) as {cursor:number;body:string}[];
+    const items = rows.slice(0,limit).map(row => {
+      try { const intent = JSON.parse(row.body) as ElasticHumanForward; this.validateElasticHumanMapping(intent.mapping); this.assertMappedProxyResponseHasForwardIntent(intent); return {cursor:row.cursor,intent}; }
+      catch { return {cursor:row.cursor,error:'elastic_forward_authority_or_invariant_unavailable'}; }
+    });
+    return {items,next:items.at(-1)?.cursor ?? after,complete:rows.length<=limit};
+  }
+  reconcileDiscoveredElasticHuman(input: ElasticHumanProxyCreate): QueueItem | null {
+    const row = this.db.prepare("SELECT mapping,state FROM elastic_human_proxies WHERE worker_id=? AND origin_qitem_id=? AND state IN ('open','forward-pending','awaiting-origin','conflict')").get(input.worker.workerId,input.origin.qitemId) as {mapping:string;state:string}|undefined;
+    if (!row) return this.createElasticHumanProxy(input);
+    const mapping = JSON.parse(row.mapping) as ElasticHumanProxyMapping;
+    this.validateElasticHumanMapping(mapping);
+    if (row.state === 'awaiting-origin') {
+      try { return this.reconcileElasticHumanProxy({proxyQitemId:mapping.proxyQitemId, worker:input.worker, origin:input.origin, disposition:'remaining'}); }
+      catch (error) { if (error instanceof QueueRepositoryError && error.code==='elastic_human_reconcile_required' || error instanceof QueueRepositoryError && error.code==='elastic_human_origin_conflict') return null; throw error; }
+    }
+    if (row.state === 'open' && mapping.originRevision !== input.origin.humanRequestRevision) return this.reconcileElasticHumanProxy({proxyQitemId:mapping.proxyQitemId,worker:input.worker,origin:input.origin,disposition:'origin-changed'});
+    return null;
   }
 
   /** Bounded stable pending tuples, including uncertain/restart outcomes. Retry SAME originInput.

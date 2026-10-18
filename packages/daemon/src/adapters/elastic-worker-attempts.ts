@@ -1,5 +1,6 @@
+import { nativeOwnerIdentity, nativeOwnerStopped, type ElasticNativeOwner } from './elastic-native-owner.js';
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes } from 'node:crypto';
-import { closeSync, existsSync, openSync, readdirSync, unlinkSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readdirSync, unlinkSync, writeFileSync, fsyncSync, lstatSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { CheckpointPrivateStore } from './elastic-checkpoint-private-store.js';
@@ -24,9 +25,18 @@ function reject(): never { throw Error('elastic_attempt_rejected'); }
 export class ElasticWorkerAttemptStore {
     private readonly files: CheckpointPrivateStore;
     readonly root: string;
-    constructor(root: string) { this.files = new CheckpointPrivateStore(root); this.root = root; }
+    constructor(root: string, private readonly owner?: ElasticNativeOwner) {
+        this.files = new CheckpointPrivateStore(root); this.root = root;
+        if (owner) {
+            const path = join(root, 'coordinator-owner.json');
+            const binding = JSON.stringify({version:1,database:owner.identity.database});
+            if (existsSync(path)) { if (this.files.read(path,8192).toString() !== binding) throw Error('native_attempt_database_conflict'); }
+            else this.files.write(path,binding);
+        }
+    }
     private directory(id: string): string { return this.files.existing(digest.parse(id)); }
     createOrRead(input: AttemptIdentity): ElasticWorkerAttempt {
+        this.owner?.assertHeld('fleet');
         const identity = attemptIdentitySchema.parse(input);
         if (identity.childResourceId.toLowerCase() !== `${identity.resourceId}/virtualMachines/${identity.instanceId}`.toLowerCase())
             reject();
@@ -41,6 +51,7 @@ export class ElasticWorkerAttemptStore {
         }
         const lock = join(dir, 'create.lock');
         const fd = openSync(lock, 'wx', 0o600);
+        try { writeFileSync(fd, JSON.stringify(nativeOwnerIdentity(lock))); fsyncSync(fd); } catch { /* A legacy/partial lock remains nonrecoverable. */ }
         closeSync(fd);
         this.files.sync(dir);
         try {
@@ -75,9 +86,11 @@ export class ElasticWorkerAttemptStore {
         return record;
     }
     advance(id: string, expectedRevision: number, patch: AttemptPatch): ElasticWorkerAttempt {
+        this.owner?.assertHeld('fleet');
         const dir = this.directory(id);
         const lock = join(dir, 'advance.lock');
         const fd = openSync(lock, 'wx', 0o600);
+        try { writeFileSync(fd, JSON.stringify(nativeOwnerIdentity(lock))); fsyncSync(fd); } catch { /* A legacy/partial lock remains nonrecoverable. */ }
         closeSync(fd);
         this.files.sync(dir);
         try {
@@ -98,6 +111,23 @@ export class ElasticWorkerAttemptStore {
     list(): ElasticWorkerAttempt[] {
         this.files.directory(this.root);
         return readdirSync(this.root).filter(n => /^[a-f0-9]{64}$/.test(n)).map(id => this.read(id));
+    }
+    /** Only a production store constructed with the SAME fleet owner can recover locks.
+     * Unknown/legacy/other-host locks remain retained; no elapsed-time takeover exists. */
+    recoverStoppedLocks(): void {
+        if (!this.owner) throw Error('native_attempt_owner_required');
+        this.owner.assertHeld('fleet');
+        for (const name of readdirSync(this.root).filter(n => /^[a-f0-9]{64}$/.test(n))) {
+            const dir = this.directory(name);
+            for (const kind of ['create.lock', 'advance.lock']) {
+                const path = join(dir, kind); if (!existsSync(path)) continue;
+                const before = lstatSync(path); const bytes = this.files.read(path, 8192).toString();
+                if (!nativeOwnerStopped(JSON.parse(bytes), nativeOwnerIdentity(path))) throw Error('native_attempt_owner_unproven');
+                const after = lstatSync(path);
+                if (before.ino !== after.ino || before.dev !== after.dev || readFileSync(path,'utf8') !== bytes) throw Error('native_attempt_owner_changed');
+                unlinkSync(path); this.files.sync(dir);
+            }
+        }
     }
     listPending(): ElasticWorkerAttempt[] { return this.list().filter(a => a.phase !== 'ready' && a.phase !== 'blocked'); }
     privateKey(id: string): Buffer {

@@ -118,6 +118,11 @@ describe("P18 provenance thread — header-absent delivery must not launder clai
     expect(db.prepare("SELECT identity_provenance FROM queue_transitions WHERE qitem_id = ? ORDER BY rowid LIMIT 1").get(qitemId)).toEqual({ identity_provenance: "origin-unknown:v1" });
   });
 
+  it.each([['transport:v1','relay:v1'],['relay:v1','relay:v1'],['claimed:v1','claimed:v1'],['invalid','claimed:v1'],['origin-unknown:v1','origin-unknown:v1']])('preserves or degrades carried provenance %s to %s across another native hop',async(carried,expected)=>{
+    const response=await app.request('/api/queue/create',{method:'POST',headers:{'Content-Type':'application/json','X-OpenRig-Session':'me@rig','X-OpenRig-Relay':'coordinator','X-OpenRig-Provenance':carried!},body:JSON.stringify({destinationSession:'dest@rig',body:'relayed'})});
+    expect(response.status).toBe(201);const item=await response.json() as {qitemId:string};expect(db.prepare('SELECT identity_provenance FROM queue_transitions WHERE qitem_id=? ORDER BY rowid LIMIT 1').get(item.qitemId)).toEqual({identity_provenance:expected});
+  });
+
   // queue_transitions table — create (queue.ts:470)
   it("queue create: header ABSENT + body sourceSession → delivers, transition records claimed:v1 (NOT transport:v1)", async () => {
     const res = await app.request("/api/queue/create", {

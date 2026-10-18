@@ -5,6 +5,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "exports": {
+    "./host-registry-lock": { "types": "./dist/host-registry-lock-surface.d.ts", "import": "./dist/host-registry-lock-surface.js" },
     "./bundle-behaviour": { "types": "./dist/bundle-behaviour-surface.d.ts", "import": "./dist/bundle-behaviour-surface.js" },
     "./spec-validation": {
       "types": "./dist/spec-validation-surface.d.ts",

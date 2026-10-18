@@ -150,6 +150,7 @@ export const migrationsForFullTestDb = [coreSchema, bindingsSessionsSchema, even
  * its exclusion); the guard's redundant-exclusion check then keeps the two in sync.
  */
 export const migrationsForFullTestDbExclusions: Record<string, string> = {
+  "119_elastic_coordinator.sql": "Opt-in elastic coordinator; focused suites apply ALL_MIGRATIONS.",
   "118_elastic_human_proxy.sql": "Opt-in mapped human proxy; dedicated tests use ALL_MIGRATIONS.",
   "117_elastic_worker.sql": "Opt-in elastic worker fence; dedicated tests use ALL_MIGRATIONS.",
   "116_elastic_fleet.sql": "Elastic fleet subsystem; focused lifecycle tests apply this migration inline.",

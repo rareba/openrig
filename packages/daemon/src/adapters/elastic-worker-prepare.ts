@@ -1,3 +1,4 @@
+import { inspectWorkerCapacity, type WorkerCapacity, type CapacitySeat } from './elastic-worker-capacity.js';
 import { execFile } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -22,6 +23,7 @@ export const preparationPlanSchema = z.object({ version: z.literal(1), operation
 export type WorkerPreparationPlan = z.infer<typeof preparationPlanSchema>;
 export interface PreparationSeatEvidence {
     sessionName: string;
+    repositoryId: number;
     nodeId: string | null;
     generation: string | null;
     cwd: string;
@@ -49,6 +51,7 @@ export interface WorkerPreparationEvidence {
         write: boolean;
     }>;
     publicReason: string;
+    capacity?: WorkerCapacity;
 }
 export interface WorkerPreparationServices {
     bootstrap: BootstrapOrchestrator;
@@ -297,6 +300,7 @@ export class ElasticWorkerPreparation {
             return { ...evidence, state: 'unknown', publicReason: 'native_launch_outcome_unknown' };
         evidence.rigId = rig.rig.id;
         const sessions = this.options.services.sessions.getLatestLiveSessions(rig.rig.id);
+        const capacitySeats: CapacitySeat[] = [];
         evidence.seats = this.plan.seats.map(s => {
             const current = sessions.filter(x => x.sessionName === s.sessionName);
             const native = current.length === 1 ? current[0] : undefined;
@@ -318,7 +322,7 @@ export class ElasticWorkerPreparation {
                     const m = this.options.manifest;
                     const runnerEnvironment = Object.fromEntries(readFileSync(`/proc/${parent.pid}/environ`, 'utf8').split('\0').filter(Boolean).map(value => { const i = value.indexOf('='); return [value.slice(0, i), value.slice(i + 1)]; }));
                     if (parent.startTime === proof.runnerStartTime && child.startTime === proof.childStartTime && parent.uid === m.uid && child.uid === m.uid && child.ppid === parent.pid && parent.cgroup === `/system.slice/${m.unit}` && child.cgroup === parent.cgroup && parent.executable === m.linux.node && child.executable === m.linux.node && parent.argv[1] === join(resolve(m.linux.helper, '..'), 'pi-runner.js') && parent.argv[parent.argv.indexOf('--launch-id') + 1] === runner?.launchId && child.argv[1] === m.linux.pi && runnerEnvironment.OPENRIG_OCCUPANT_GENERATION === generation && runnerEnvironment.OPENRIG_NODE_ID === native?.nodeId && runnerEnvironment.OPENRIG_SESSION_NAME === s.sessionName)
-                        active = !proof.idle;
+                        { const work = this.options.services.queue.list({ destinationSession:s.sessionName, state:['pending','in-progress'], limit:101 }); active = work.length >= 101 ? null : !proof.idle || work.length > 0; capacitySeats.push({ sessionName: s.sessionName, nodeId: native!.nodeId, generation: generation!, cwd, runtime: 'pi', model: this.plan.model, launchId: runner!.launchId!, runner: parent, child, descendants: [], occupancy: active === null ? 'unknown' : active ? 'occupied' : 'free' }); }
                 }
                 providerReady = providerReady && active !== null;
                 const owner = this.plan.owner;
@@ -336,8 +340,9 @@ export class ElasticWorkerPreparation {
                 }
             }
             catch { /* Missing/stale evidence never creates capacity. */ }
-            return { sessionName: s.sessionName, nodeId: native?.nodeId ?? null, generation, cwd, runtime: 'pi', model: this.plan.model, launched, providerReady, toolProven, active };
+            return { sessionName: s.sessionName, repositoryId: s.repository.id, nodeId: native?.nodeId ?? null, generation, cwd, runtime: 'pi', model: this.plan.model, launched, providerReady, toolProven, active };
         });
+        evidence.capacity = inspectWorkerCapacity(this.options.manifest, capacitySeats);
         if (rig.nodes.length !== this.plan.seats.length)
             return { ...evidence, state: 'blocked', publicReason: 'finite_native_identity_mismatch' };
         if (evidence.seats.every(s => s.launched))

@@ -1,3 +1,4 @@
+import { accountWorkerCapacity, type CapacitySeat } from '../src/adapters/elastic-worker-capacity.js';
 import { describe, expect, it } from 'vitest';
 import { parseManagedWorkerProbe, managedHostId } from '../src/adapters/elastic-worker-enrollment.js';
 const attempt = { workerId: 'fixture-worker', binding: { vmId: '11111111-1111-4111-8111-111111111111', manifestDigest: 'a'.repeat(64) } };
@@ -56,6 +57,9 @@ function fixture(unknown = false) {
     }>();
     let puts = 0;
     let providerReady = false;
+    let busy = false;
+    const proc=(pid:number,ppid:number,argv:string[])=>({pid,ppid,startTime:String(pid),uid:490,cgroup:'/system.slice/openrig-elastic.service',executable:manifest.linux.node,argv,state:'S'});
+    const capacity=()=>{const seats:CapacitySeat[]=preparationPlan.seats.map((s,i)=>({sessionName:s.sessionName,nodeId:s.sessionName,generation:'fixture-generation',cwd:'/fixture/work',runtime:'pi',model:preparationPlan.model,launchId:'launch-'+i,runner:proc(20+i*10,10,[manifest.linux.node,resolve(manifest.linux.helper,'../pi-runner.js'),'--launch-id','launch-'+i]),child:proc(21+i*10,20+i*10,[manifest.linux.node,manifest.linux.pi]),descendants:[],occupancy:busy&&i===0?'occupied':'free'})); const inventory=[proc(10,1,[manifest.linux.node,manifest.linux.daemon]),...seats.flatMap(s=>[s.runner,s.child]),...(busy?[{...proc(22,21,['/bin/bash','-c','ongoing']),executable:'/bin/bash'}]:[])]; return accountWorkerCapacity(manifest,seats,inventory,10,10000);};
     let controllerKey = '';
     const key = generateKeyPairSync('rsa', { modulusLength: 3072 });
     const store = new ElasticWorkerAttemptStore(root);
@@ -102,9 +106,9 @@ function fixture(unknown = false) {
                 providerReady = true;
                 return new Response('{}');
             }
-            return new Response(JSON.stringify({ version: 1, observedAt: 10000, selfHostId: 'fixture-native-host', build: { commit: 'c'.repeat(40), dirty: false }, state: { version: 1, workerId: instance.workerId, vmId, manifestDigest, phase: 'ready', generation: 0, drainOperationId: null, drainStartedAt: null }, ledger: { complete: true, custody: 7, runnable: 0, claims: 0, unresolvedOutbox: 0, pendingHumanReturns: false, pendingActivationIntents: false, pendingTransfers: false, clean: false, digest: 'a'.repeat(64) }, filesystem: { complete: true, blockers: [], files: [], refs: [], digest: 'a'.repeat(64) }, process: { observedAt: 10000, complete: true, idle: true, processes: 7, uid: 490, cgroup: '/system.slice/openrig-elastic.service' }, checkpointAcknowledged: false, clean: false, drainEligible: false, preparation: { version: 1, observedAt: 10000, manifestDigest, operationId: preparationPlan.operationId, planDigest: createHash('sha256').update(JSON.stringify(preparationPlan)).digest('hex'), state: providerReady ? 'ready' : 'pending', rung: providerReady ? 'tool-proven' : 'enrolled', rigId: providerReady ? 'fixture-rig' : null, seats: providerReady ? preparationPlan.seats.map(s => ({ sessionName: s.sessionName, nodeId: s.sessionName, generation: 'fixture-generation', cwd: '/fixture/work', runtime: 'pi', model: preparationPlan.model, launched: true, providerReady: true, toolProven: true, active: false })) : [], repositoryCapabilities: providerReady ? [{ repositoryId: 1, publicRead: true, privateRead: false, write: false }] : [], publicReason: 'fixture-native' } }));
+            return new Response(JSON.stringify({ version: 1, observedAt: 10000, selfHostId: 'fixture-native-host', build: { commit: 'c'.repeat(40), dirty: false }, state: { version: 1, workerId: instance.workerId, vmId, manifestDigest, phase: 'ready', generation: 0, drainOperationId: null, drainStartedAt: null }, ledger: { complete: true, custody: 7, runnable: 0, claims: 0, unresolvedOutbox: 0, pendingHumanReturns: false, pendingActivationIntents: false, pendingTransfers: false, clean: false, digest: 'a'.repeat(64) }, filesystem: { complete: true, blockers: [], files: [], refs: [], digest: 'a'.repeat(64) }, process: { observedAt: 10000, complete: !busy, idle: !busy, processes: 7, uid: 490, cgroup: '/system.slice/openrig-elastic.service' }, checkpointAcknowledged: false, clean: false, drainEligible: false, preparation: { version: 1, observedAt: 10000, manifestDigest, operationId: preparationPlan.operationId, planDigest: createHash('sha256').update(JSON.stringify(preparationPlan)).digest('hex'), state: providerReady ? 'ready' : 'pending', rung: providerReady ? 'tool-proven' : 'enrolled', rigId: providerReady ? 'fixture-rig' : null, seats: providerReady ? preparationPlan.seats.map(s => ({ sessionName: s.sessionName, repositoryId:s.repository.id, nodeId: s.sessionName, generation: 'fixture-generation', cwd: '/fixture/work', runtime: 'pi', model: preparationPlan.model, launched: true, providerReady: true, toolProven: true, active: busy && s.sessionName==='worker-a@elastic' })) : [], repositoryCapabilities: providerReady ? [{ repositoryId: 1, publicRead: true, privateRead: false, write: false }] : [], publicReason: 'fixture-native', capacity:providerReady?capacity():undefined } }));
         } };
-    return { context, options, store, puts: () => puts, registryPath };
+    return { context, options, store, puts: () => puts, registryPath, setBusy:()=>{busy=true;} };
 }
 it('concretely stages, wraps enrollment, registers without touching permanent hosts and gates readiness', async () => {
     const f = fixture();
@@ -121,6 +125,21 @@ it('concretely stages, wraps enrollment, registers without touching permanent ho
     expect(loaded.ok && loaded.registry.hosts.map(h => h.id)).toContain('permanent');
     expect((await service.inspectEnrollment(f.context)).state).toBe('ready');
     expect(f.puts()).toBe(3);
+    f.setBusy();
+    let clock = 10000;
+    f.options.now = () => clock;
+    const originalFetch = f.options.fetchImpl;
+    f.options.fetchImpl = async (input, init) => {
+        const response = await originalFetch(input, init);
+        const raw = await response.json(); clock = 10001; raw.observedAt = clock;
+        return new Response(JSON.stringify(raw));
+    };
+    const observed=await service.observeManagedWorker(f.store.list()[0]!,f.context.configuration);
+    expect(observed.worker.state).toBe('ready');
+    expect(observed.worker.active).toBe(1);
+    expect(observed.probe?.preparation.capacity?.seats.map(s=>s.occupancy)).toEqual(['occupied','free']);
+    expect(observed.probe?.process.complete).toBe(false);
+    expect(observed.drainEligible).toBe(false);
 });
 it('retains original key/request after unknown PUT and missing GET across restart without another submission', async () => {
     const f = fixture(true);
@@ -170,4 +189,34 @@ it('requires exactly one ready attempt per added incarnation after restart witho
     expect(await inspect([f.context.instance, second], withBaseline)).toBe('unknown');
     expect(f.store.list()).toEqual(before);
     expect(f.puts()).toBe(3);
+});
+
+import { createDb } from '../src/db/connection.js';
+import { migrate } from '../src/db/migrate.js';
+import { ALL_MIGRATIONS } from '../src/db/all-migrations.js';
+import { SessionRegistry } from '../src/domain/session-registry.js';
+import { QueueRepository } from '../src/domain/queue-repository.js';
+import { EventBus } from '../src/domain/event-bus.js';
+import { Hono } from 'hono';
+import { queueRoutes } from '../src/routes/queue.js';
+import { bindCoordinatorReadinessPlan, ElasticEnrolledWorkerDirectory } from '../src/adapters/elastic-coordinator-admission.js';
+import { ElasticFleetProjection } from '../src/domain/elastic-fleet-projection.js';
+import { readinessTaskBody } from '../src/adapters/elastic-worker-prepare.js';
+it('delivers two stable real-owner native readiness tasks only after exact registration and reconciles an unknown create without duplicate',async()=>{
+ const f=fixture();const db=createDb(join(f.options.store.root,'native.sqlite'));migrate(db,ALL_MIGRATIONS);
+ try {
+  db.prepare("INSERT INTO rigs(id,name) VALUES('owner-rig','coordinator')").run();db.prepare("INSERT INTO nodes(id,rig_id,logical_id,role,runtime) VALUES('owner-node','owner-rig','manager','manager','pi')").run();const sessions=new SessionRegistry(db);sessions.registerSession('owner-node','manager@coordinator');
+  expect(()=>bindCoordinatorReadinessPlan({plan:f.options.preparationPlan,sessions,manager:'invented@coordinator',hostId:'coordinator'})).toThrow('owner_required');
+  Object.assign(f.options.preparationPlan,bindCoordinatorReadinessPlan({plan:f.options.preparationPlan,sessions,manager:'manager@coordinator',hostId:'coordinator'}));
+  const queue=new QueueRepository(db,new EventBus(db),{validateRig:()=>true});const app=new Hono();app.use('*',async(c,next)=>{c.set('queueRepo' as never,queue as never);await next();});app.route('/api/queue',queueRoutes());
+  let creates=0,lost=true;const original=f.options.fetchImpl;
+  f.options.fetchImpl=async(input,init)=>{const url=new URL(String(input));if(url.pathname.startsWith('/api/queue/')){expect(loadHostRegistry(f.registryPath).ok).toBe(true);const response=await app.request(url.pathname,{...init});if(url.pathname.endsWith('/create')){creates++;if(lost){lost=false;throw Error('lost-native-create-ack');}}return response;}return original(input,init);};
+  const enrollment=new ElasticWorkerEnrollment(f.options);await enrollment.advanceEnrollment(f.context);await enrollment.advanceEnrollment(f.context);await enrollment.advanceEnrollment(f.context);await enrollment.advanceEnrollment(f.context);
+  const directory=new ElasticEnrolledWorkerDirectory({store:f.store,enrollment,configuration:()=>f.context.configuration,sessions,coordinatorManager:'manager@coordinator',coordinatorHuman:'human@kernel',originHuman:'operator@external',projection:new ElasticFleetProjection(db),fetchImpl:f.options.fetchImpl});
+  const attempt=f.store.list()[0]!;await directory.readiness(attempt.id);await directory.readiness(attempt.id);
+  expect(creates).toBe(2);expect(queue.list({limit:10})).toHaveLength(2);
+  const plan=enrollment.preparationPlan();expect(plan.owner!.tasks).toHaveLength(2);
+  for(const task of plan.owner!.tasks){const actual=queue.getById(task.qitemId)!;expect(actual.sourceSession).toBe('manager@coordinator@coordinator');expect(actual.destinationSession).toBe(task.sessionName);expect(actual.body).toBe(readinessTaskBody({qitemId:task.qitemId,nonce:task.nonce,sourceSession:'manager@coordinator',originHostId:'coordinator'},task.sessionName,enrollment.workerWorkspace(task.sessionName),plan.manifestDigest));expect(actual.chainOfRecord).toContain(task.qitemId);}
+  expect((await enrollment.inspectEnrollment(f.context)).state).toBe('pending');
+ } finally {db.close();}
 });

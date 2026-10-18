@@ -363,3 +363,22 @@ describe("GitHub intake durable native queue dispatch", () => {
   });
 
 });
+
+it('atomically preserves the first reservation when independent SQLite consumers resume stale source snapshots', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'intake-source-race-'));
+  try {
+    const file = join(dir, 'db.sqlite'); const f = setup([issue(), issue(2)], file);
+    await f.service.reconcile(); f.ready(); f.ready(2); await f.service.reconcile();
+    const first = [...f.tasks.values()][0]!; first.state = 'done';
+    const otherDb = createDb(file); databases.push(otherDb);
+    const second = new GithubIntakeService(otherDb, new QueueRepository(otherDb, new EventBus(otherDb)), f.io);
+    let readers = 0; let release!: () => void; let both!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; }); const arrived = new Promise<void>(resolve => { both = resolve; });
+    f.io.getTask = async () => { if (++readers === 2) both(); await barrier; return first; };
+    const before = vi.mocked(f.io.createTask).mock.calls.length;
+    const running = [f.service.reconcile(), second.reconcile()]; await arrived; release(); await Promise.all(running);
+    expect(vi.mocked(f.io.createTask).mock.calls.length - before).toBe(1);
+    const assigned = f.service.status().issues.find(row => row.issue.number === 2)!;
+    expect(assigned.qitemId).toBeTruthy(); expect(second.status().issues.find(row => row.issue.number === 2)!.qitemId).toBe(assigned.qitemId);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

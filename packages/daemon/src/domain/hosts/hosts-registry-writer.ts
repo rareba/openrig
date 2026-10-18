@@ -1,3 +1,4 @@
+import { withHostRegistryLock } from './hosts-registry-lock.js';
 // OPR.0.4.6.MH1 FR-5/FR-6 — the daemon-side hosts-registry WRITE twin
 // (arch B1 ruling, pins P1–P4).
 //
@@ -14,11 +15,8 @@
 // via the narrow named add/pair routes (P1 — no generic registry-write
 // route exists).
 //
-// Concurrency (P4): atomic tmp+rename, whole-file LAST-WRITE-WINS on a
-// concurrent add — the ceiling is one operator-scale registry file; NO
-// locking machinery by design. Two simultaneous adds may drop one entry;
-// re-running the add re-converges (add-time validation = load-time
-// validation, verbatim).
+// Concurrency: native writers serialize with the shared process-proved writer lock.
+// External editors do not participate; observed drift refuses publication.
 
 import { existsSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -35,6 +33,7 @@ export type AddHostResult =
   | { ok: false; error: string };
 
 export function addHostEntry(rawEntry: Record<string, unknown>, path: string = defaultHostRegistryPath()): AddHostResult {
+  try { return withHostRegistryLock(path, (unchanged) => {
   // Load what exists; a MISSING file is a valid starting point for `add`
   // (the verb exists so operators never hand-create the YAML), but a present-
   // but-invalid file is a loud error — never silently clobber operator state.
@@ -58,9 +57,11 @@ export function addHostEntry(rawEntry: Record<string, unknown>, path: string = d
     mkdirSync(dirname(path), { recursive: true });
     const tmp = join(dirname(path), `.hosts.yaml.tmp-${process.pid}`);
     writeFileSync(tmp, stringifyYaml({ hosts: validated.registry.hosts }), { mode: 0o600 });
+    unchanged();
     renameSync(tmp, path);
   } catch (err) {
     return { ok: false, error: `failed to write host registry at ${path}: ${(err as Error).message}` };
   }
   return { ok: true, path, entry };
+  }); } catch (error) { return {ok:false,error:error instanceof Error?error.message:'host_registry_writer_unavailable'}; }
 }

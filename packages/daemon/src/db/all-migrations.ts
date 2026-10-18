@@ -1,3 +1,4 @@
+import { elasticCoordinatorSchema } from './migrations/119_elastic_coordinator.js';
 import { elasticHumanProxySchema } from './migrations/118_elastic_human_proxy.js';
 import { elasticWorkerSchema } from "./migrations/117_elastic_worker.js";
 // The canonical ordered migration list. SINGLE SOURCE: the daemon boot path
@@ -239,4 +240,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   elasticFleetSchema,
   elasticWorkerSchema,
   elasticHumanProxySchema,
+  elasticCoordinatorSchema,
 ];

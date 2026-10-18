@@ -1,3 +1,4 @@
+import { withHostRegistryLock } from '@openrig/daemon/host-registry-lock';
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -338,11 +339,10 @@ export type AddHostResult =
 /** OPR.0.4.6.MH1 (arch P3/P4): the CLI half of the ONE registry write
  *  contract — the daemon twin (packages/daemon/src/domain/hosts/
  *  hosts-registry-writer.ts) mirrors this verbatim, byte-parity-pinned by
- *  test. Concurrency ceiling (P4): atomic tmp+rename, whole-file
- *  LAST-WRITE-WINS on a concurrent add — one operator-scale registry
- *  file, NO locking machinery by design; a dropped concurrent entry
- *  re-converges by re-running the add. */
+ *  test. Native writers use the shared process-proved registry lock; external
+ *  editors remain whole-file writers and observed drift refuses publication. */
 export function addHostEntry(rawEntry: Record<string, unknown>, path: string = defaultHostRegistryPath()): AddHostResult {
+  try { return withHostRegistryLock(path, (unchanged) => {
   // Load what exists; a MISSING file is a valid starting point for `add`
   // (the verb exists so operators never hand-create the YAML), but a present-
   // but-invalid file is a loud error — never silently clobber operator state.
@@ -366,9 +366,11 @@ export function addHostEntry(rawEntry: Record<string, unknown>, path: string = d
     mkdirSync(dirname(path), { recursive: true });
     const tmp = join(dirname(path), `.hosts.yaml.tmp-${process.pid}`);
     writeFileSync(tmp, yaml().stringify({ hosts: validated.registry.hosts }), { mode: 0o600 });
+    unchanged();
     renameSync(tmp, path);
   } catch (err) {
     return { ok: false, error: `failed to write host registry at ${path}: ${(err as Error).message}` };
   }
   return { ok: true, path, entry };
+  }); } catch (error) { return {ok:false,error:error instanceof Error?error.message:'host_registry_writer_unavailable'}; }
 }

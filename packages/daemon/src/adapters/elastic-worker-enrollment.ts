@@ -1,3 +1,5 @@
+import { piSeatPaths } from './pi-runner-protocol.js';
+import { capacitySchema, accountWorkerCapacity } from './elastic-worker-capacity.js';
 import { createHash, createPrivateKey, createPublicKey } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { z } from 'zod';
@@ -19,7 +21,7 @@ const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const count = z.number().int().nonnegative();
 const time = z.number().int().nonnegative();
 const stateSchema = z.object({ version: z.literal(1), workerId: z.string().min(1), vmId: z.string().uuid(), manifestDigest: hash, phase: z.enum(['ready', 'draining', 'sealed']), generation: count, drainOperationId: z.string().nullable(), drainStartedAt: time.nullable() }).strict();
-const preparationSchema = z.object({ version: z.literal(1), observedAt: time, manifestDigest: hash, operationId: z.string(), planDigest: hash, state: z.enum(['pending', 'ready', 'blocked', 'unknown']), rung: z.enum(['enrolled', 'launched', 'provider-ready', 'tool-proven']), rigId: z.string().nullable(), seats: z.array(z.object({ sessionName: z.string(), nodeId: z.string().nullable(), generation: z.string().nullable(), cwd: z.string(), runtime: z.literal('pi'), model: z.string(), launched: z.boolean(), providerReady: z.boolean(), toolProven: z.boolean(), active: z.boolean().nullable() }).strict()).max(4), repositoryCapabilities: z.array(z.object({ repositoryId: z.number().int().positive(), publicRead: z.boolean(), privateRead: z.boolean(), write: z.boolean() }).strict()).max(4), publicReason: z.string().max(128) }).strict();
+const preparationSchema = z.object({ version: z.literal(1), observedAt: time, manifestDigest: hash, operationId: z.string(), planDigest: hash, state: z.enum(['pending', 'ready', 'blocked', 'unknown']), rung: z.enum(['enrolled', 'launched', 'provider-ready', 'tool-proven']), rigId: z.string().nullable(), seats: z.array(z.object({ sessionName: z.string(), repositoryId: z.number().int().positive(), nodeId: z.string().nullable(), generation: z.string().nullable(), cwd: z.string(), runtime: z.literal('pi'), model: z.string(), launched: z.boolean(), providerReady: z.boolean(), toolProven: z.boolean(), active: z.boolean().nullable() }).strict()).max(4), repositoryCapabilities: z.array(z.object({ repositoryId: z.number().int().positive(), publicRead: z.boolean(), privateRead: z.boolean(), write: z.boolean() }).strict()).max(4), publicReason: z.string().max(128), capacity: capacitySchema.optional() }).strict();
 const probeSchema = z.object({ version: z.literal(1), observedAt: time, selfHostId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), build: z.object({ commit: z.string().regex(/^[a-f0-9]{40}$/), dirty: z.literal(false) }).passthrough(), state: stateSchema,
     ledger: z.object({ complete: z.boolean(), custody: count, runnable: count, claims: count, unresolvedOutbox: count, pendingHumanReturns: z.boolean(), pendingActivationIntents: z.boolean(), pendingTransfers: z.boolean(), clean: z.boolean(), digest: hash }).strict(),
     filesystem: z.object({ complete: z.boolean(), blockers: z.array(z.string()).max(1024), files: z.array(z.object({ path: z.string(), bytes: count, sha256: hash }).strict()).max(100000), refs: z.array(z.object({ repo: z.string(), ref: z.string(), sha: z.string() }).strict()).max(100000), digest: hash }).passthrough(),
@@ -32,7 +34,7 @@ export function parseManagedWorkerProbe(value: unknown, attempt: Pick<ElasticWor
 }, commit: string, now: number): ManagedWorkerProbe {
     const p = probeSchema.parse(value);
     if (p.state.workerId !== attempt.workerId || p.state.vmId !== attempt.binding.vmId || p.state.manifestDigest !== attempt.binding.manifestDigest || p.preparation.manifestDigest !== attempt.binding.manifestDigest || p.build.commit !== commit
-        || [p.observedAt, p.process.observedAt, p.preparation.observedAt].some(at => at > now || now - at > 5000))
+        || [p.observedAt, p.process.observedAt, p.preparation.observedAt, ...(p.preparation.capacity ? [p.preparation.capacity.observedAt] : [])].some(at => at > now || now - at > 5000))
         reject();
     return p;
 }
@@ -102,6 +104,7 @@ export interface EnrollmentResult {
     publicReason: string;
 }
 export interface ManagedWorkerObservation {
+    idleCustodyDigest?: string;
     worker: FleetWorkerObservation;
     probe: ManagedWorkerProbe | null;
     drainEligible: boolean | null;
@@ -132,7 +135,12 @@ export class ElasticWorkerEnrollment {
     private id(context: EnrollmentContext): string { const i = this.identity(context); return enrollmentDigest([i.resourceId.toLowerCase(), i.vmId.toLowerCase(), i.operationId, i.fleetEpoch]); }
     private check(a: ElasticWorkerAttempt, context: EnrollmentContext): void { if (enrollmentDigest(a.identity) !== enrollmentDigest(this.identity(context)))
         reject(); }
+    private checkAttempt(a: ElasticWorkerAttempt): void {
+        if (a.identity.configurationDigest !== this.configurationDigest || a.identity.fleetEpoch !== this.options.fleetEpoch || a.binding.manifestDigest !== this.manifestDigest
+            || a.identity.resourceId !== this.manifest.resourceId || a.identity.specDigest !== this.plan.specDigest || a.identity.checkoutDigest !== enrollmentDigest(this.plan.seats)) reject();
+    }
     private async trusted(a: ElasticWorkerAttempt, configuration: AzureMutationContext['configuration']): Promise<TrustedWorkerEndpoint> {
+        this.checkAttempt(a);
         const instance: AzureInstance = { resourceId: a.identity.childResourceId, instanceId: a.identity.instanceId, vmId: a.binding.vmId, workerId: a.workerId, protected: true, provisioningState: 'Succeeded' };
         const current = await this.options.commands.resolveTrustedInstance(configuration, instance, a.binding, { port: this.manifest.port, imageReference: this.manifest.linux.imageReference });
         const saved = this.options.store.readPrivateInput(a.id, 'trusted-endpoint');
@@ -339,11 +347,22 @@ export class ElasticWorkerEnrollment {
     private checkProbePlan(probe: ManagedWorkerProbe): void {
         if (probe.preparation.operationId !== this.plan.operationId || probe.preparation.planDigest !== enrollmentDigest(this.plan) || probe.process.uid !== this.manifest.uid)
             reject();
-        if (probe.preparation.seats.length && (probe.preparation.seats.length !== this.plan.seats.length || probe.preparation.seats.some(s => !this.plan.seats.some(p => p.sessionName === s.sessionName && s.model === this.plan.model))))
+        if (probe.preparation.seats.length && (probe.preparation.seats.length !== this.plan.seats.length || probe.preparation.seats.some(s => !this.plan.seats.some(p => p.sessionName === s.sessionName && s.model === this.plan.model && s.repositoryId === p.repository.id))))
             reject();
     }
+    private currentCapacity(p: ManagedWorkerProbe): boolean {
+        const c = p.preparation.capacity;
+        return !!c?.complete && c.processes === c.inventory.length && accountWorkerCapacity(this.manifest, structuredClone(c.seats), c.inventory, c.inventory.find(p => p.executable === this.manifest.linux.node && p.argv[1] === this.manifest.linux.daemon)?.pid ?? -1, c.observedAt).complete && c.uid === this.manifest.uid && c.cgroup === `/system.slice/${this.manifest.unit}` && c.seats.length === this.plan.seats.length
+          && new Set(c.seats.map(s => s.sessionName)).size === c.seats.length && c.seats.every(s => {
+            const native = p.preparation.seats.find(n => n.sessionName === s.sessionName);
+            return !!native && s.nodeId === native.nodeId && s.generation === native.generation && s.cwd === native.cwd && s.model === native.model && s.occupancy === (native.active === true ? 'occupied' : native.active === false ? 'free' : 'unknown')
+              && s.occupancy !== 'unknown' && s.runner.uid === c.uid && s.child.uid === c.uid && s.runner.cgroup === c.cgroup && s.child.cgroup === c.cgroup
+              && s.runner.executable === this.manifest.linux.node && s.child.executable === this.manifest.linux.node && s.child.argv[1] === this.manifest.linux.pi
+              && s.child.ppid === s.runner.pid && (s.occupancy !== 'free' || s.descendants.length === 0);
+          });
+    }
     private schedulable(p: ManagedWorkerProbe): boolean {
-        return p.state.phase === 'ready' && p.process.complete && p.ledger.complete && p.filesystem.complete && p.preparation.state === 'ready' && p.preparation.rung === 'tool-proven' && p.preparation.seats.length === this.plan.seats.length && p.preparation.seats.every(s => s.launched && s.providerReady && s.toolProven && s.generation && s.active !== null);
+        return p.state.phase === 'ready' && this.currentCapacity(p) && p.ledger.complete && p.preparation.state === 'ready' && p.preparation.rung === 'tool-proven' && p.preparation.seats.length === this.plan.seats.length && p.preparation.seats.every(s => s.launched && s.providerReady && s.toolProven && s.generation && s.active !== null);
     }
     async inspectEnrollment(context: EnrollmentContext): Promise<EnrollmentResult> {
         try {
@@ -364,7 +383,7 @@ export class ElasticWorkerEnrollment {
     }
     async bootstrap(context: AzureMutationContext): Promise<void> { const result = await this.advanceEnrollment(context); if (result.state !== 'ready')
         throw Error(result.publicReason); }
-    /** Registry writer remains whole-file LWW. Single coordinator serializes, and drift is retained. */
+    /** Native CLI/daemon writers serialize; external whole-file editor drift remains fail-closed. */
     async ensureElasticRegistration(attempt: ElasticWorkerAttempt, configuration: AzureMutationContext['configuration'], suppliedProbe?: ManagedWorkerProbe): Promise<ElasticWorkerAttempt> {
         const a = this.options.store.read(attempt.id);
         const endpoint = await this.trusted(a, configuration);
@@ -400,20 +419,51 @@ export class ElasticWorkerEnrollment {
         }
         return this.options.store.advance(a.id, a.revision, { registration, phase: 'registered', publicReason: 'native_registered' });
     }
+    /** Recorded registration is an address book only; every network consumer resolves it afresh. */
+    recordedEndpoint(attempt: ElasticWorkerAttempt) {
+        const a = this.options.store.read(attempt.id);
+        this.checkAttempt(a);
+        if (!a.registration || a.registration.hostId !== managedHostId(a.workerId)) reject();
+        const loaded = loadHostRegistry(this.options.registryPath);
+        if (!loaded.ok) reject();
+        const host = loaded.registry.hosts.find(h => h.id === a.registration!.hostId);
+        if (!host || host.transport !== 'http' || host.hostId !== a.registration.selfHostId || host.url !== a.registration.baseUrl || host.bearer_file !== this.options.store.tokenPath(a.id) || host.bearer_env) reject();
+        return host;
+    }
+    /** Fresh ARM, authenticated native identity and exact registered endpoint. No question may select it. */
+    async registeredEndpoint(attempt: ElasticWorkerAttempt, configuration: AzureMutationContext['configuration']) {
+        const a = this.options.store.read(attempt.id);
+        if (!a.registration) reject();
+        const endpoint = await this.trusted(a, configuration);
+        const probe = parseManagedWorkerProbe(await this.rpc(a, endpoint, 'GET', '/api/elastic-worker/probe'), a, this.options.workerBuildCommit, (this.options.now ?? Date.now)());
+        this.checkProbePlan(probe);
+        if (a.registration.baseUrl !== endpoint.baseUrl || a.registration.selfHostId !== probe.selfHostId || a.registration.hostId !== managedHostId(a.workerId)) reject();
+        const host = this.recordedEndpoint(a);
+        if (host.url !== endpoint.baseUrl) reject();
+        return { host, probe, attempt: a };
+    }
+    hostRegistry() { const loaded = loadHostRegistry(this.options.registryPath); if (!loaded.ok) reject(); return loaded.registry; }
+    preparationPlan(): WorkerPreparationPlan { return preparationPlanSchema.parse(this.plan); }
+    workerWorkspace(sessionName: string): string {
+        if (!this.plan.seats.some(s => s.sessionName === sessionName)) reject();
+        return `${this.manifest.ownedRoots[0]}/workspaces/${enrollmentDigest(this.plan).slice(0,24)}/${sessionName}`;
+    }
     async observeManagedWorker(attempt: ElasticWorkerAttempt, configuration: AzureMutationContext['configuration']): Promise<ManagedWorkerObservation> {
         const a = this.options.store.read(attempt.id);
         const now = (this.options.now ?? Date.now)();
         const base: FleetWorkerObservation = { id: a.workerId, managed: true, permanent: false, state: a.phase === 'ready' ? 'quarantined' : 'provisioning', capabilities: [], slots: this.plan.seats.length, active: null, observedAt: now, idleSince: null, clean: null, pendingHumanReturns: null };
         try {
             const endpoint = await this.trusted(a, configuration);
-            const probe = parseManagedWorkerProbe(await this.rpc(a, endpoint, 'GET', '/api/elastic-worker/probe'), a, this.options.workerBuildCommit, now);
+            const probe = parseManagedWorkerProbe(await this.rpc(a, endpoint, 'GET', '/api/elastic-worker/probe'), a, this.options.workerBuildCommit, (this.options.now ?? Date.now)());
             this.checkProbePlan(probe);
             if (a.registration && (a.registration.baseUrl !== endpoint.baseUrl || a.registration.selfHostId !== probe.selfHostId))
                 reject();
             const ready = this.schedulable(probe);
             const active = probe.preparation.seats.every(s => s.active !== null) ? probe.preparation.seats.filter(s => s.active).length : null;
             const capabilities = ready ? probe.preparation.repositoryCapabilities.flatMap(r => [r.publicRead ? `github:${r.repositoryId}:public-read` : '', r.privateRead ? `github:${r.repositoryId}:private-read` : '', r.write ? `github:${r.repositoryId}:write` : ''].filter(Boolean)) : [];
-            return { worker: { ...base, state: probe.state.phase === 'draining' ? 'draining' : ready && !!a.registration ? 'ready' : 'quarantined', capabilities, active, observedAt: probe.observedAt, clean: probe.drainEligible ?? null, pendingHumanReturns: probe.ledger.pendingHumanReturns }, probe, drainEligible: probe.drainEligible ?? null, publicReason: ready ? 'native_worker_ready' : 'native_tool_proof_pending' };
+            const runtimeSidecars = new Set(this.plan.seats.map(s => piSeatPaths(this.manifest.linux.stateRoot, s.sessionName).runnerStatePath));
+            const idleCustodyDigest = enrollmentDigest({ ledger: probe.ledger.digest, files: probe.filesystem.files.filter(f => !runtimeSidecars.has(f.path)), refs: probe.filesystem.refs });
+            return { idleCustodyDigest, worker: { ...base, state: probe.state.phase === 'draining' ? 'draining' : ready && !!a.registration ? 'ready' : 'quarantined', capabilities, active, observedAt: probe.observedAt, clean: probe.drainEligible ?? null, pendingHumanReturns: probe.ledger.pendingHumanReturns }, probe, drainEligible: probe.drainEligible ?? null, publicReason: ready ? 'native_worker_ready' : 'native_tool_proof_pending' };
         }
         catch {
             return { worker: base, probe: null, drainEligible: null, publicReason: 'native_observation_unavailable' };

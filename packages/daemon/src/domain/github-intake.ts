@@ -63,6 +63,11 @@ export interface GithubIntakeIO {
   findSuccessor?(host: string, task: GithubTask): Promise<{ host: string; task: GithubTask } | null>;
   createTask(host: string, input: QueueCreateInput & { qitemId: string }): Promise<GithubTask>;
 }
+export interface GithubIntakeAdmission {
+  targets(): GithubIntakeTarget[];
+  observations(): GithubTargetObservation[];
+  authorize(target: GithubIntakeTarget, issue: GithubIssue, capability: string | null, qitemId: string, phase: 'reserve' | 'delivery' | 'retry'): void;
+}
 export interface GithubEligibilityRequest {
   repositoryId: string;
   number: number;
@@ -89,7 +94,7 @@ const waiting = (task: GithubTask) => task.waitingForHuman === true || hasLiveHu
 
 /** A source/custody index only: execution and human waits remain native queue items. */
 export class GithubIntakeService {
-  constructor(private db: Database.Database, readonly queue: QueueRepository, private io: GithubIntakeIO, private now = () => new Date()) {}
+  constructor(private db: Database.Database, readonly queue: QueueRepository, private io: GithubIntakeIO, private now = () => new Date(), private admission?: GithubIntakeAdmission) {}
 
   configure(config: GithubIntakeConfig): ReturnType<GithubIntakeService["status"]> {
     if (!config || typeof config.enabled !== "boolean" || !text(config.assignee) || !positive(config.hostCapacity)
@@ -125,6 +130,7 @@ export class GithubIntakeService {
   }
 
   markEligibility(request: GithubEligibilityRequest): ReturnType<GithubIntakeService["status"]> {
+    this.db.transaction(() => {
     const row = this.rows().find(r => r.repository_id === request.repositoryId && r.issue_number === request.number);
     if (!row || !row.in_scope || (JSON.parse(row.issue_json) as GithubIssue).updatedAt !== request.revision
       || (request.priority !== undefined && !QUEUE_PRIORITIES.includes(request.priority))
@@ -140,6 +146,7 @@ export class GithubIntakeService {
       qitem_id=NULL,target_host=NULL,target_session=NULL,target_machine=NULL,current_host=NULL,current_session=NULL,stage=NULL,delivery=NULL,pickup=NULL,error=NULL
       WHERE repository_id=? AND issue_number=?`).run(request.eligibility, request.revision, request.capability ?? null, request.reason, request.priority ?? "routine", request.repositoryId, request.number);
     this.db.prepare("UPDATE github_intake_config SET revision=revision+1 WHERE id=1").run();
+    }).immediate();
     return this.status();
   }
 
@@ -196,7 +203,11 @@ export class GithubIntakeService {
         this.db.prepare(`UPDATE github_intake_issues SET eligibility='triage',priority='routine',approved_revision=NULL,capability=NULL,reason='Source revision changed; review again'
           WHERE qitem_id IS NULL AND approved_revision IS NOT NULL AND approved_revision != json_extract(issue_json,'$.updatedAt')`).run();
       })();
-      const observations = await this.io.observeTargets(config);
+      const manual = config.targets;
+      const dynamic = this.admission?.targets() ?? [];
+      if (dynamic.some(t => manual.some(m => targetKey(m) === targetKey(t) || m.host === t.host || m.physicalHost === t.physicalHost))) throw Error('Ambiguous elastic/manual target identity');
+      const observations = [...await this.io.observeTargets(config), ...(this.admission?.observations() ?? [])];
+      config.targets = [...manual, ...dynamic];
       this.assertCurrent(revision);
       if (!Array.isArray(observations) || observations.some(o => typeof o.available !== "boolean" || !Number.isSafeInteger(o.active) || o.active < 0 || (o.hostActive !== undefined && o.hostActive !== null && (!Number.isSafeInteger(o.hostActive) || o.hostActive < 0)))) throw new Error("Invalid host observations");
       const rows = this.rows();
@@ -281,6 +292,7 @@ export class GithubIntakeService {
           if ((usage.get(targetKey(target)) ?? 0) > target.capacity || (!occupiedManagerTriage && occupied > config.hostCapacity)) {
             this.update(row, { error: "Reserved retry waiting for target and physical host capacity" }); continue;
           }
+          this.db.transaction(() => { this.assertCurrent(revision); this.admission?.authorize(target, issue, row.capability, row.qitem_id!, 'retry'); })();
           await this.deliver(row, issue, revision); continue;
         }
         const stage = row.eligibility === "ready" && row.approved_revision === issue.updatedAt ? "ready" : row.eligibility === "triage" ? "triage" : null;
@@ -300,6 +312,10 @@ export class GithubIntakeService {
         // This committed reservation is the outbox. Native queue create commits its own wake intent.
         this.db.transaction(() => {
           this.assertCurrent(revision);
+          const current = this.rows().find(r => r.repository_id === row.repository_id && r.issue_number === row.issue_number);
+          if (!current?.in_scope || current.qitem_id || current.generation !== row.generation || (JSON.parse(current.issue_json) as GithubIssue).updatedAt !== issue.updatedAt
+            || current.eligibility !== row.eligibility || current.approved_revision !== row.approved_revision || current.capability !== row.capability) throw Error('Source reservation superseded; retain existing custody');
+          this.admission?.authorize(target, issue, row.capability, `qitem-gh-${hash}`, 'reserve');
           this.update(row, { qitem_id: `qitem-gh-${hash}`, target_host: target.host, target_session: target.session, target_machine: target.physicalHost, current_host: target.host, current_session: target.session, generation, stage, delivery: "reserved", pickup: "unknown", error: null });
         })();
         usage.set(targetKey(target), (usage.get(targetKey(target)) ?? 0) + 1);
@@ -316,9 +332,12 @@ export class GithubIntakeService {
     this.db.transaction(() => {
       this.assertCurrent(revision);
       const current = this.rows().find(r => r.repository_id === row.repository_id && r.issue_number === row.issue_number);
-      if (!current?.in_scope || current.qitem_id !== row.qitem_id || (current.stage === "ready" && (current.eligibility !== "ready" || current.approved_revision !== issue.updatedAt))) {
+      if (!current?.in_scope || current.qitem_id !== row.qitem_id || current.target_host !== row.target_host || current.target_session !== row.target_session || current.generation !== row.generation || (JSON.parse(current.issue_json) as GithubIssue).updatedAt !== issue.updatedAt || (current.stage === "ready" && (current.eligibility !== "ready" || current.approved_revision !== issue.updatedAt))) {
         throw new Error("Dispatch superseded by source or approval change");
       }
+      const target = this.admission?.targets().find(t => t.host === row.target_host && t.session === row.target_session);
+      if (target) this.admission!.authorize(target, issue, row.capability, row.qitem_id!, 'delivery');
+      else if (this.admission) this.admission.authorize({host: row.target_host!, session: row.target_session!, physicalHost: row.target_machine!, capacity: 1, capabilities: []}, issue, row.capability, row.qitem_id!, 'delivery');
     })();
     const triageDecision = JSON.stringify({ repositoryId: issue.repositoryId, number: issue.number, revision: issue.updatedAt, eligibility: "ready", capability: "<configured capability: review, release, acceptance or code>", priority: "routine", reason: "<exact next action; current ownership; branch/PR and dependency checks; downstream review/acceptance capacity; priority rationale>" }, null, 2);
     const triage = `Triage this issue; verify current ownership, branches/PRs, dependencies and downstream review/acceptance capacity. Prefer finishing existing review, release or acceptance over expanding implementation work. Do not implement yet.

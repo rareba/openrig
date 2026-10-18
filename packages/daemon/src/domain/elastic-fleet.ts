@@ -1,3 +1,4 @@
+import type { ElasticNativeOwner } from '../adapters/elastic-native-owner.js';
 import type Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -75,7 +76,7 @@ function operation(row: OperationRow): FleetOperation {
 
 /** One durable writer; ownership never expires automatically after a process crash. */
 export class ElasticFleetService {
-  constructor(private readonly db: Database.Database, private readonly io: FleetIO, private readonly now: () => number = Date.now) {}
+  constructor(private readonly db: Database.Database, private readonly io: FleetIO, private readonly now: () => number = Date.now, private readonly nativeOwner?: ElasticNativeOwner) {}
 
   private row(): ConfigRow { return this.db.prepare("SELECT * FROM elastic_fleet_config WHERE id = 1").get() as ConfigRow; }
   private latestOperation(pending = false): OperationRow | undefined {
@@ -120,6 +121,7 @@ export class ElasticFleetService {
     return this.status();
   }
   releaseReconcile(input: { owner: string; operatorConfirmedStopped: true }): ElasticFleetStatus {
+    if (this.nativeOwner) throw Error('native_owner_proof_required');
     if (input.operatorConfirmedStopped !== true || !input.owner || liveOwners.has(input.owner)) throw Error("owner_not_stopped");
     const result = this.db.prepare("UPDATE elastic_fleet_config SET reconcile_owner = NULL WHERE id = 1 AND reconcile_owner = ?").run(input.owner);
     if (result.changes !== 1) throw Error("owner_mismatch");
@@ -170,6 +172,10 @@ export class ElasticFleetService {
     }).immediate();
   }
   async reconcile(): Promise<ElasticFleetStatus> {
+    if (this.nativeOwner) return this.nativeOwner.run('fleet', async () => { this.nativeOwner!.recoverFleet(); return this.reconcileExclusive(); });
+    return this.reconcileExclusive();
+  }
+  private async reconcileExclusive(): Promise<ElasticFleetStatus> {
     const owner = `${process.pid}:${randomUUID()}`;
     if (this.db.prepare("UPDATE elastic_fleet_config SET reconcile_owner = ? WHERE id = 1 AND reconcile_owner IS NULL").run(owner).changes !== 1) return this.status();
     liveOwners.add(owner);

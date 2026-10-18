@@ -189,7 +189,7 @@ export const RELAY_HEADER = "x-openrig-relay";
  *
  * Relayed request (a forwarding daemon re-stamped the header): NEVER `transport:v1` — the actor was, at
  * best, verified ONE HOP AWAY, so the strongest honest claim is `relay:v1`, and ONLY when the forwarder
- * explicitly carried a `transport:v1` marker. Rail 1 — DEGRADE DOWN AS THE DEFAULT BRANCH: any other
+ * explicitly carried a `transport:v1` or existing `relay:v1` marker. Rail 1 — DEGRADE DOWN AS THE DEFAULT BRANCH: any other
  * carried value, AND a MISSING marker (an old forwarder that predates this plumbing), records `claimed:v1`.
  * NB the honesty nuance: a missing marker and a forwarder-declared `claimed:v1` are INDISTINGUISHABLE here
  * and that is correct — both are "not verified at this boundary". `claimed:v1` on a relayed row therefore
@@ -204,5 +204,5 @@ export function resolveRecordedProvenance(
   if (c.req.header(ORIGIN_UNKNOWN_HEADER) === "true") return "origin-unknown:v1";
   if (!relayed) return identity.provenance; // transport:v1 (proven here) | claimed:v1 (the deferral)
   const carried = c.req.header(IDENTITY_PROVENANCE_HEADER)?.trim();
-  return carried === "origin-unknown:v1" ? carried : carried === "transport:v1" ? "relay:v1" : "claimed:v1";
+  return carried === "origin-unknown:v1" ? carried : (carried === "transport:v1" || carried === "relay:v1") ? "relay:v1" : "claimed:v1";
 }
