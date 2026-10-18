@@ -150,6 +150,7 @@ export const migrationsForFullTestDb = [coreSchema, bindingsSessionsSchema, even
  * its exclusion); the guard's redundant-exclusion check then keeps the two in sync.
  */
 export const migrationsForFullTestDbExclusions: Record<string, string> = {
+  "117_elastic_worker.sql": "Opt-in elastic worker fence; dedicated tests use ALL_MIGRATIONS.",
   "116_elastic_fleet.sql": "Elastic fleet subsystem; focused lifecycle tests apply this migration inline.",
   "082_archive_identity_provenance.sql": "archive extension; 054 is excluded from this core fixture. Archive identity regressions use ALL_MIGRATIONS.",
   "026_inbox_entries.sql": "inbox subsystem table — not on the shared core edge (inbox suites migrate it inline).",

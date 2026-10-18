@@ -34,27 +34,27 @@ function keySize(key: KeyObject, type: 'public' | 'private'): number {
   return Math.ceil(bits / 8);
 }
 /** Hybrid encryption only; origin authentication must come from the exact Azure operation. */
-export function sealEnrollment(plaintext: Buffer, binding: EnrollmentBinding, publicKey: KeyObject): string {
+function seal(plaintext: Buffer, binding: EnrollmentBinding, publicKey: KeyObject, material: boolean): string {
   try {
-    keySize(publicKey, 'public'); const associated = aad(binding);
-    if (!Buffer.isBuffer(plaintext) || plaintext.length < 1 || plaintext.length > 1024) fail();
+    keySize(publicKey, 'public'); const associated = material ? Buffer.concat([Buffer.from('openrig-worker-material-v1\0'), aad(binding)]) : aad(binding);
+    if (!Buffer.isBuffer(plaintext) || plaintext.length < 1 || plaintext.length > (material ? 64 * 1024 : 1024)) fail();
     const key = randomBytes(32); const iv = randomBytes(12);
     try {
       const cipher = createCipheriv('aes-256-gcm', key, iv); cipher.setAAD(associated);
       const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
       const wrappedKey = publicEncrypt({ key: publicKey, padding: constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' }, key);
       const result = JSON.stringify({ binding, wrappedKey: wrappedKey.toString('base64'), iv: iv.toString('base64'), ciphertext: ciphertext.toString('base64'), tag: cipher.getAuthTag().toString('base64') });
-      if (Buffer.byteLength(result) > 4096) fail(); return result;
+      if (Buffer.byteLength(result) > (material ? 96 * 1024 : 4096)) fail(); return result;
     } finally { key.fill(0); }
   } catch { return fail(); }
 }
 /** Accept exactly one complete bounded JSON envelope, bound to the persisted attempt. */
-export function openEnrollment(envelope: string, expected: EnrollmentBinding, privateKey: KeyObject): Buffer {
+function open(envelope: string, expected: EnrollmentBinding, privateKey: KeyObject, material: boolean): Buffer {
   try {
-    const size = keySize(privateKey, 'private'); const associated = aad(expected);
-    if (typeof envelope !== 'string' || Buffer.byteLength(envelope) > 4096) fail();
+    const size = keySize(privateKey, 'private'); const expectedAad = aad(expected); const associated = material ? Buffer.concat([Buffer.from('openrig-worker-material-v1\0'), expectedAad]) : expectedAad;
+    if (typeof envelope !== 'string' || Buffer.byteLength(envelope) > (material ? 96 * 1024 : 4096)) fail();
     const parsed: unknown = JSON.parse(envelope);
-    if (!object(parsed) || Object.keys(parsed).sort().join(',') !== 'binding,ciphertext,iv,tag,wrappedKey' || !aad(parsed.binding).equals(associated)) fail();
+    if (!object(parsed) || Object.keys(parsed).sort().join(',') !== 'binding,ciphertext,iv,tag,wrappedKey' || !aad(parsed.binding).equals(expectedAad)) fail();
     // Reject duplicate JSON fields and alternate encodings: the producer emits this canonical shape.
     if (JSON.stringify(parsed) !== envelope) fail();
     const key = privateDecrypt({ key: privateKey, padding: constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' }, decode(parsed.wrappedKey, size));
@@ -62,7 +62,13 @@ export function openEnrollment(envelope: string, expected: EnrollmentBinding, pr
       if (key.length !== 32) fail();
       const decipher = createDecipheriv('aes-256-gcm', key, decode(parsed.iv, 12));
       decipher.setAAD(associated); decipher.setAuthTag(decode(parsed.tag, 16));
-      return Buffer.concat([decipher.update(decode(parsed.ciphertext, 1, 1024)), decipher.final()]);
+      return Buffer.concat([decipher.update(decode(parsed.ciphertext, 1, material ? 64 * 1024 : 1024)), decipher.final()]);
     } finally { key.fill(0); }
   } catch { return fail(); }
 }
+
+export function sealEnrollment(plaintext: Buffer, binding: EnrollmentBinding, publicKey: KeyObject): string { return seal(plaintext, binding, publicKey, false); }
+export function openEnrollment(envelope: string, expected: EnrollmentBinding, privateKey: KeyObject): Buffer { return open(envelope, expected, privateKey, false); }
+/** Separate AAD domain and 64 KiB plaintext limit for protected Run Command configuration input. */
+export function sealWorkerMaterial(plaintext: Buffer, binding: EnrollmentBinding, publicKey: KeyObject): string { return seal(plaintext, binding, publicKey, true); }
+export function openWorkerMaterial(envelope: string, expected: EnrollmentBinding, privateKey: KeyObject): Buffer { return open(envelope, expected, privateKey, true); }

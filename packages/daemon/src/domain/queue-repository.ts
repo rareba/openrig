@@ -1,3 +1,4 @@
+import { authorizeElasticSuccessor } from "./elastic-worker-control.js";
 import { readWakeLadderBackstop } from "./queue-wake-ladder.js";
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
@@ -1558,7 +1559,7 @@ export class QueueRepository {
       // caller id-reuse bug — a structured error, never a silent overwrite.
       // Local (non-forwarded) creates that pass an explicit --id keep the same
       // safety for free.
-      if (input.qitemId && isQitemPrimaryKeyConflict(err)) {
+      if (input.qitemId && (isQitemPrimaryKeyConflict(err) || (err instanceof Error && err.message === 'elastic_worker_fenced'))) {
         const existing = this.getById(input.qitemId);
         if (existing) {
           if (
@@ -1829,6 +1830,7 @@ export class QueueRepository {
     const events: Array<{ name: string; payload: import("./types.js").RigEvent }> = [];
 
     const txn = this.db.transaction(() => {
+      authorizeElasticSuccessor(this.db, source.qitemId, newId, input.fromSession, input.toSession);
       this.db
         .prepare(
           `UPDATE queue_items
@@ -2004,6 +2006,7 @@ export class QueueRepository {
     const events: Array<{ name: string; payload: import("./types.js").RigEvent }> = [];
 
     const txn = this.db.transaction(() => {
+      authorizeElasticSuccessor(this.db, source.qitemId, newId, input.fromSession, input.toSession);
       this.db
         .prepare(
           `UPDATE queue_items
@@ -3450,6 +3453,7 @@ export class QueueRepository {
           throw new QueueRepositoryError("remote_human_response_required", "The original manager is on another host. Its exact durable native queue receipt is required before recording this answer.");
         }
       } else {
+        authorizeElasticSuccessor(this.db, item.qitemId, receipt.replyQitemId, input.actorSession, reply.destinationSession, 'human-response');
         const created = this.createWithinTransaction(reply);
         this.stageWakeIntent(created.qitemId, input.actorSession, reply.destinationSession, input.identityProvenance ?? null, true);
         events.push(created.persistedEvent);

@@ -1,3 +1,4 @@
+import { elasticWorkerRoutes, type ElasticWorkerProbeReader } from "./routes/elastic-worker.js";
 import { healthDiagnosisRoutes } from "./routes/health-diagnosis.js";
 import type { HealthDiagnosisService } from "./domain/health-diagnosis.js";
 import type { HealthPolicyStore } from "./domain/health-policy.js";
@@ -346,6 +347,7 @@ export interface AppDeps {
   healthPolicy?: HealthPolicyStore;
   healthCheckpoints?: HealthCheckpointSource;
   contextMonitor?: { pollOnce(): Promise<void> };
+  elasticWorkerProbe?: ElasticWorkerProbeReader;
   /**
    * OPR.0.4.3.14 — Claude compaction enforcer, exposed to routes for the manual
    * compaction trigger (POST /api/compaction/trigger). Constructed once in
@@ -792,6 +794,7 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/rigs/:rigId/chat", chatRoutes());
   app.route("/api/stream", streamRoutes());
   app.route("/api/queue", queueRoutes());
+  app.route("/api/elastic-worker", elasticWorkerRoutes({ probe: deps.elasticWorkerProbe, bearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/github-intake", githubIntakeRoutes({ service: deps.githubIntakeService, bearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/mission-control", humanResponsesRoutes({ queueRepo: deps.queueRepo, bearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/mission-control", humanRelayRoutes({ service: deps.humanRelayService, queueRepo: deps.queueRepo, bearerToken: deps.missionControlBearerToken ?? null }));

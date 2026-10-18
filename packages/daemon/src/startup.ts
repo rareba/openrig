@@ -214,6 +214,8 @@ interface DaemonOptions {
    * comparison + 401 on missing/mismatch.
    */
   bearerToken?: string | null;
+  /** Explicit managed-image native probe. Absent means unavailable; never infer capability from healthz. */
+  elasticWorkerProbe?: import("./routes/elastic-worker.js").ElasticWorkerProbeReader;
   /**
    * Terminal bearer token for live-terminal routes. Null means the
    * daemon bind posture is already trusted (loopback/tailnet), matching
@@ -1258,6 +1260,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   }, { tmux: tmuxAdapter, seatLaunchEnvironment });
 
   const deps: AppDeps = {
+    elasticWorkerProbe: opts?.elasticWorkerProbe,
     rigRepo,
     sessionRegistry,
     daemonLifecycleStore,
