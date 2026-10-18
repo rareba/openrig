@@ -69,8 +69,6 @@ export class ElasticNativeOwner {
             if (prior) {
                 if (!nativeOwnerStopped(JSON.parse(prior.identity), this.identity))
                     throw Error('native_owner_live_or_unknown');
-                if (scope === 'fleet')
-                    this.db.prepare("INSERT INTO elastic_native_owners VALUES('fleet-prior',?,?) ON CONFLICT(scope) DO NOTHING").run(prior.owner, prior.identity);
                 if (this.db.prepare('DELETE FROM elastic_native_owners WHERE scope=? AND owner=? AND identity=?').run(scope, prior.owner, prior.identity).changes !== 1)
                     throw Error('native_owner_changed');
             }
@@ -85,25 +83,42 @@ export class ElasticNativeOwner {
             this.db.prepare('DELETE FROM elastic_native_owners WHERE scope=? AND owner=?').run(scope, owner);
         }
     }
-    /** Under the native owner, clear only the exact fleet lock left by a proved stopped owner.
-     * Missing/legacy metadata remains an explicit prerequisite, never an operator Boolean. */
+    /** Publish the exact service reconcile owner and native identity in its claim transaction. */
+    claimFleet(owner: string): boolean {
+        this.assertHeld('fleet');
+        return this.db.transaction(() => {
+            this.assertHeld('fleet');
+            if (this.db.prepare('SELECT 1 FROM elastic_native_owners WHERE scope=?').get('fleet-reconcile')) throw Error('native_fleet_association_exists');
+            if (this.db.prepare('UPDATE elastic_fleet_config SET reconcile_owner=? WHERE id=1 AND reconcile_owner IS NULL').run(owner).changes !== 1) return false;
+            this.db.prepare('INSERT INTO elastic_native_owners VALUES(?,?,?)').run('fleet-reconcile', owner, JSON.stringify(this.identity));
+            return true;
+        }).immediate();
+    }
+    /** Release the service lock and its association together; neither may clear another owner. */
+    releaseFleet(owner: string): void {
+        this.assertHeld('fleet');
+        this.db.transaction(() => {
+            const proof = this.db.prepare("SELECT owner,identity FROM elastic_native_owners WHERE scope='fleet-reconcile'").get() as { owner: string; identity: string } | undefined;
+            if (!proof || proof.owner !== owner || proof.identity !== JSON.stringify(this.identity)) throw Error('native_fleet_owner_mismatch');
+            if (this.db.prepare('UPDATE elastic_fleet_config SET reconcile_owner=NULL WHERE id=1 AND reconcile_owner=?').run(owner).changes !== 1) throw Error('native_fleet_owner_changed');
+            this.db.prepare("DELETE FROM elastic_native_owners WHERE scope='fleet-reconcile' AND owner=? AND identity=?").run(owner, proof.identity);
+        }).immediate();
+    }
+    /** Association survives recovery crashes independently of the current guard owner.
+     * Legacy/unmatched UUIDs remain blocked even when their PID prefixes happen to match. */
     recoverFleet(): void {
         this.assertHeld('fleet');
-        const row = this.db.prepare('SELECT reconcile_owner FROM elastic_fleet_config WHERE id=1').get() as {
-            reconcile_owner: string | null;
-        };
-        if (!row.reconcile_owner) { this.db.prepare("DELETE FROM elastic_native_owners WHERE scope='fleet-prior'").run(); return; }
-        const match = /^(\d+):/.exec(row.reconcile_owner);
-        // The lock must be the one recorded with the previous native owner, not just a PID string.
-        const proof = this.db.prepare("SELECT identity FROM elastic_native_owners WHERE scope='fleet-prior'").get() as {
-            identity: string;
-        } | undefined;
-        if (!proof || !match || !nativeOwnerStopped(JSON.parse(proof.identity), this.identity))
-            throw Error('native_fleet_owner_unproven');
-        const prior = nativeOwnerSchema.parse(JSON.parse(proof.identity));
-        if (String(prior.pid) !== match[1])
-            throw Error('native_fleet_owner_mismatch');
-        if (this.db.prepare('UPDATE elastic_fleet_config SET reconcile_owner=NULL WHERE id=1 AND reconcile_owner=?').run(row.reconcile_owner).changes !== 1) throw Error('native_fleet_owner_changed');
-        this.db.prepare("DELETE FROM elastic_native_owners WHERE scope='fleet-prior' AND identity=?").run(proof.identity);
+        this.db.transaction(() => {
+            const row = this.db.prepare('SELECT reconcile_owner FROM elastic_fleet_config WHERE id=1').get() as { reconcile_owner: string | null };
+            const proof = this.db.prepare("SELECT owner,identity FROM elastic_native_owners WHERE scope='fleet-reconcile'").get() as { owner: string; identity: string } | undefined;
+            if (!row.reconcile_owner) {
+                if (proof) throw Error('native_fleet_association_unmatched');
+                return;
+            }
+            if (!proof || proof.owner !== row.reconcile_owner) throw Error('native_fleet_owner_unproven');
+            if (!nativeOwnerStopped(JSON.parse(proof.identity), this.identity)) throw Error('native_fleet_owner_live_or_unknown');
+            if (this.db.prepare('UPDATE elastic_fleet_config SET reconcile_owner=NULL WHERE id=1 AND reconcile_owner=?').run(proof.owner).changes !== 1) throw Error('native_fleet_owner_changed');
+            if (this.db.prepare("DELETE FROM elastic_native_owners WHERE scope='fleet-reconcile' AND owner=? AND identity=?").run(proof.owner, proof.identity).changes !== 1) throw Error('native_fleet_association_changed');
+        }).immediate();
     }
 }

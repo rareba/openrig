@@ -100,6 +100,22 @@ export class ElasticHumanForwarder {
         }
         if (origins.length)
             this.progress('origin-rotation', (start + Math.min(batch, origins.length)) % origins.length);
+        const mappings = this.options.queue.scanElasticHumanMappings(this.cursor('mapping-readbacks'), batch);
+        for (const row of mappings.items) {
+            if ('error' in row) { stats.retained++; continue; }
+            const mapping = row.mapping;
+            try {
+                const origin = origins.find(o => o.worker.workerId === mapping.worker.workerId && o.worker.vmId === mapping.worker.vmId && o.worker.nativeHostId === mapping.worker.nativeHostId && o.worker.fleetEpoch === mapping.worker.fleetEpoch && o.worker.manifestDigest === mapping.worker.manifestDigest);
+                if (!origin) throw Error('mapped_origin_unavailable');
+                const read = await this.request(origin, `/api/queue/${encodeURIComponent(mapping.originQitemId)}`);
+                if (!read.ok) throw Error('mapped_origin_readback_unavailable');
+                const question = parseNativeHumanQuestion(read.payload);
+                if (question.qitemId !== mapping.originQitemId) throw Error('mapped_origin_identity_changed');
+                if (question.state !== 'pending') this.options.queue.reconcileElasticHumanProxy({ proxyQitemId: mapping.proxyQitemId, worker: origin.worker, origin: question, disposition: 'origin-changed' });
+                else this.options.queue.reconcileDiscoveredElasticHuman({ worker: origin.worker, origin: question, coordinatorManager: mapping.coordinatorManager, coordinatorHuman: mapping.coordinatorHuman });
+            } catch { stats.retained++; }
+        }
+        this.progress('mapping-readbacks', mappings.complete ? 0 : mappings.next);
         const page = this.options.queue.scanElasticHumanForwards(this.cursor('forwards'), batch);
         for (const row of page.items) {
             if ('error' in row) {

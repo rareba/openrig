@@ -3534,6 +3534,16 @@ export class QueueRepository {
       return {items: page.map(r => this.getByIdOrThrow(r.qitem_id)), next: complete ? through : page[page.length-1]!.cursor, through, complete};
     })();
   }
+  /** Existing proxies require readback even after an origin stops appearing in pending discovery. */
+  scanElasticHumanMappings(after: number, limit = 25): { items: Array<{ cursor: number; mapping: ElasticHumanProxyMapping } | { cursor: number; error: string }>; next: number; complete: boolean } {
+    if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) throw new QueueRepositoryError('invalid_pagination', 'Invalid mapping cursor.');
+    const rows = this.db.prepare("SELECT rowid cursor,mapping FROM elastic_human_proxies WHERE state IN ('open','awaiting-origin') AND rowid>? ORDER BY rowid LIMIT ?").all(after, limit + 1) as { cursor: number; mapping: string }[];
+    const items = rows.slice(0, limit).map(row => {
+      try { const mapping = JSON.parse(row.mapping) as ElasticHumanProxyMapping; this.validateElasticHumanMapping(mapping); return { cursor: row.cursor, mapping }; }
+      catch { return { cursor: row.cursor, error: 'elastic_mapping_authority_unavailable' }; }
+    });
+    return { items, next: items.at(-1)?.cursor ?? after, complete: rows.length <= limit };
+  }
   /** Each bad authority is retained independently; its cursor still permits later origins. */
   scanElasticHumanForwards(after: number, limit = 25): { items: Array<{cursor:number; intent: ElasticHumanForward} | {cursor:number; error:string}>; next:number; complete:boolean } {
     if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) throw new QueueRepositoryError('invalid_pagination','Invalid forward cursor.');

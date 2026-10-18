@@ -177,12 +177,14 @@ export class ElasticFleetService {
   }
   private async reconcileExclusive(): Promise<ElasticFleetStatus> {
     const owner = `${process.pid}:${randomUUID()}`;
-    if (this.db.prepare("UPDATE elastic_fleet_config SET reconcile_owner = ? WHERE id = 1 AND reconcile_owner IS NULL").run(owner).changes !== 1) return this.status();
+    const claimed = this.nativeOwner ? this.nativeOwner.claimFleet(owner) : this.db.prepare("UPDATE elastic_fleet_config SET reconcile_owner = ? WHERE id = 1 AND reconcile_owner IS NULL").run(owner).changes === 1;
+    if (!claimed) return this.status();
     liveOwners.add(owner);
     try { await this.reconcileOwned(owner); }
     finally {
       liveOwners.delete(owner);
-      this.db.prepare("UPDATE elastic_fleet_config SET reconcile_owner = NULL WHERE id = 1 AND reconcile_owner = ?").run(owner);
+      if (this.nativeOwner) this.nativeOwner.releaseFleet(owner);
+      else this.db.prepare("UPDATE elastic_fleet_config SET reconcile_owner = NULL WHERE id = 1 AND reconcile_owner = ?").run(owner);
     }
     return this.status();
   }

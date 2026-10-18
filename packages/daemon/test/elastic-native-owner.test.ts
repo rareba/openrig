@@ -14,8 +14,8 @@ import { loadHostRegistry } from '../src/domain/hosts/hosts-registry-reader.js';
 const cleanup: Array<() => void> = [];
 afterEach(() => cleanup.splice(0).reverse().forEach(fn => fn()));
 function root() { const dir = realpathSync(mkdtempSync(join(tmpdir(), 'elastic-owner-'))); cleanup.push(() => rmSync(dir, { recursive: true, force: true })); return dir; }
-async function deadOwner(file: string, scope: string) {
-    const child = spawn(process.execPath, ['--input-type=module', '-e', `import Database from 'better-sqlite3'; import {ElasticNativeOwner} from ${JSON.stringify(new URL('../src/adapters/elastic-native-owner.ts', import.meta.url).href)}; const db=new Database(process.argv[1]); const owner=new ElasticNativeOwner(db,process.argv[1]); await owner.run(process.argv[2],async()=>{process.stdout.write(JSON.stringify(owner.identity)+'\\n');await new Promise(()=>{});});`, file, scope], { env: { ...process.env, NODE_OPTIONS: '--import tsx' }, stdio: ['ignore', 'pipe', 'pipe'] });
+async function deadOwner(file: string, scope: string, claimFleet = false) {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', `import Database from 'better-sqlite3'; import {ElasticNativeOwner} from ${JSON.stringify(new URL('../src/adapters/elastic-native-owner.ts', import.meta.url).href)}; const db=new Database(process.argv[1]); const owner=new ElasticNativeOwner(db,process.argv[1]); await owner.run(process.argv[2],async()=>{${claimFleet ? `owner.claimFleet(process.pid+':'+crypto.randomUUID());` : ''}process.stdout.write(JSON.stringify(owner.identity)+'\\n');await new Promise(()=>{});});`, file, scope], { env: { ...process.env, NODE_OPTIONS: '--import tsx' }, stdio: ['ignore', 'pipe', 'pipe'] });
     let text = '';
     await new Promise<void>((resolve, reject) => { child.stdout.on('data', chunk => { text += chunk; if (text.includes('\n'))
         resolve(); }); child.once('exit', code => { if (!text)
@@ -33,9 +33,12 @@ it('recovers exact stopped native SQLite owner while live/other-boot/legacy/DB d
     migrate(db, ALL_MIGRATIONS);
     const first = new ElasticNativeOwner(db, path), second = new ElasticNativeOwner(db, path);
     await first.run('consumer', async () => { await expect(second.run('consumer', async () => { })).rejects.toThrow('live_or_unknown'); });
-    const prior = await deadOwner(path, 'fleet');
+    const prior = await deadOwner(path, 'fleet', true);
     expect(nativeOwnerStopped(prior, first.identity)).toBe(true);
-    db.prepare("UPDATE elastic_fleet_config SET reconcile_owner=? WHERE id=1").run(`${prior.pid}:durable-original`);
+    const saved = db.prepare("SELECT owner FROM elastic_native_owners WHERE scope='fleet-reconcile'").get() as {owner:string};
+    expect(db.prepare('SELECT reconcile_owner FROM elastic_fleet_config WHERE id=1').get()).toEqual({reconcile_owner:saved.owner});
+    await deadOwner(path, 'fleet'); // A second crash after native guard recovery must not replace the original association.
+    expect(db.prepare("SELECT owner FROM elastic_native_owners WHERE scope='fleet-reconcile'").get()).toEqual(saved);
     await first.run('fleet', async () => { first.recoverFleet(); expect(db.prepare('SELECT reconcile_owner FROM elastic_fleet_config WHERE id=1').get()).toEqual({ reconcile_owner: null }); });
     for (const changed of [{ ...prior, boot: 'another-boot' }, { ...prior, host: 'another-host' }, { ...prior, database: 'another-db' }, {}]) {
         db.prepare("INSERT OR REPLACE INTO elastic_native_owners VALUES('bad','saved',?)").run(JSON.stringify(changed));
@@ -99,4 +102,38 @@ it('recovers guarded attempt locks from exact stopped native owner without repla
     const before = store.read(id);
     await owner.run('fleet', async () => { store.recoverStoppedLocks(); expect(existsSync(lock)).toBe(false); expect(store.read(id)).toEqual(before); expect(() => store.advance(id, before.revision, { command: { ...before.command!, name: 'replacement' } })).toThrow(); store.advance(id, before.revision, { command: { ...before.command!, state: 'submitted' } }); });
     expect(store.read(id).command?.name).toBe('original-command');
+});
+it('retains a same-PID unrelated fleet reconcile UUID without an exact native acquisition association', async () => {
+    const dir = root(), path = join(dir, 'db.sqlite'); const db = createDb(path); cleanup.push(() => db.close()); migrate(db, ALL_MIGRATIONS);
+    const owner = new ElasticNativeOwner(db, path); const prior = await deadOwner(path, 'fleet', true);
+    const association = db.prepare("SELECT owner,identity FROM elastic_native_owners WHERE scope='fleet-reconcile'").get();
+    const unrelated = `${prior.pid}:00000000-0000-4000-8000-000000000001`;
+    db.prepare('UPDATE elastic_fleet_config SET reconcile_owner=? WHERE id=1').run(unrelated);
+    await owner.run('fleet', async () => { expect(() => owner.recoverFleet()).toThrow(); });
+    expect(db.prepare('SELECT reconcile_owner FROM elastic_fleet_config WHERE id=1').get()).toEqual({ reconcile_owner: unrelated });
+    expect(db.prepare("SELECT owner,identity FROM elastic_native_owners WHERE scope='fleet-reconcile'").get()).toEqual(association);
+    db.prepare("DELETE FROM elastic_native_owners WHERE scope='fleet-reconcile'").run();
+    await owner.run('fleet', async () => { expect(() => owner.recoverFleet()).toThrow('unproven'); });
+    expect(db.prepare('SELECT reconcile_owner FROM elastic_fleet_config WHERE id=1').get()).toEqual({ reconcile_owner: unrelated });
+});
+
+import { ElasticFleetService, type FleetIO } from '../src/domain/elastic-fleet.js';
+it('recovers the exact recorded fleet claim then inspects the original pending operation without another mutation', async () => {
+    const dir=root(),path=join(dir,'db.sqlite');const db=createDb(path);cleanup.push(()=>db.close());migrate(db,ALL_MIGRATIONS);
+    const ownerModule=new URL('../src/adapters/elastic-native-owner.ts',import.meta.url).href;
+    const fleetModule=new URL('../src/domain/elastic-fleet.ts',import.meta.url).href;
+    const program=`import Database from 'better-sqlite3';import {ElasticNativeOwner} from ${JSON.stringify(ownerModule)};import {ElasticFleetService} from ${JSON.stringify(fleetModule)};
+const db=new Database(process.argv[1]);const owner=new ElasticNativeOwner(db,process.argv[1]);let time=10000;
+const io={observe:async()=>({now:time,observedAt:time,providerAvailable:true,workers:[],demands:[{id:'original-issue',capability:'code'}]}),provision:async operation=>{process.stdout.write(JSON.stringify(operation)+'\\n');await new Promise(()=>{});},beginDrain:async()=>{throw Error('unexpected drain')},remove:async()=>{throw Error('unexpected remove')},inspectOperation:async()=>{throw Error('unexpected inspection')}};
+const service=new ElasticFleetService(db,io,()=>time,owner);service.configure({policy:{poolId:'fixture',enabled:true,mode:'active',maxWorkers:1,slotsPerWorker:2,capabilities:['code'],pollIntervalSeconds:10,scaleOutSamples:2,idleSeconds:900}});await service.reconcile();time+=10000;await service.reconcile();`;
+    const child=spawn(process.execPath,['--import','tsx','--input-type=module','-e',program,path],{stdio:['ignore','pipe','pipe']});
+    let bytes='';await new Promise<void>((resolve,reject)=>{child.stdout.on('data',chunk=>{bytes+=chunk;if(bytes.includes('\n'))resolve();});child.once('exit',code=>{if(!bytes)reject(Error('fleet fixture exited '+code));});});
+    const submitted=JSON.parse(bytes.trim());const saved=db.prepare("SELECT owner,identity FROM elastic_native_owners WHERE scope='fleet-reconcile'").get() as {owner:string;identity:string};
+    expect(db.prepare('SELECT reconcile_owner FROM elastic_fleet_config WHERE id=1').get()).toEqual({reconcile_owner:saved.owner});expect(saved.owner).toMatch(new RegExp('^'+child.pid+':'));
+    const exited=once(child,'exit');child.kill('SIGKILL');await exited;
+    const inspected:string[]=[];let mutations=0;
+    const io:FleetIO={observe:async()=>{throw Error('pending operation must be inspected first')},provision:async()=>{mutations++},beginDrain:async()=>{mutations++},remove:async()=>{mutations++},inspectOperation:async operation=>{inspected.push(operation.operationId);expect(operation.targetCapacity).toBe(submitted.targetCapacity);return 'pending';}};
+    const restarted=new ElasticFleetService(db,io,()=>30000,new ElasticNativeOwner(db,path));await restarted.reconcile();
+    expect(inspected).toEqual([submitted.operationId]);expect(mutations).toBe(0);expect(restarted.status().operation?.operationId).toBe(submitted.operationId);expect(restarted.status().operation?.state).toBe('pending');
+    expect(db.prepare("SELECT owner FROM elastic_native_owners WHERE scope='fleet-reconcile'").get()).toBeUndefined();
 });

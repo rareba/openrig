@@ -68,7 +68,7 @@ async function fixture() {
     };
     const directory = { all: async () => [endpoint], resolve: async (w: typeof worker) => { if (JSON.stringify(w) !== JSON.stringify(worker))
             throw Error(); return endpoint; } };
-    const make = () => new ElasticHumanForwarder({ db, queue: coordinator, owner: new ElasticNativeOwner(db, join(root, 'coordinator.db')), coordinatorHostId: 'coordinator', coordinatorManager: 'manager@coordinator', coordinatorHuman: 'human@kernel', directory, fetchImpl, now: () => now, batch: 20 });
+    const make = (fetchOverride: typeof fetch = fetchImpl) => new ElasticHumanForwarder({ db, queue: coordinator, owner: new ElasticNativeOwner(db, join(root, 'coordinator.db')), coordinatorHostId: 'coordinator', coordinatorManager: 'manager@coordinator', coordinatorHuman: 'human@kernel', directory, fetchImpl: fetchOverride, now: () => now, batch: 20 });
     // resolveBearer uses a fixture-only env token; no real credential reader.
     const previous = process.env.ELASTIC_FORWARD_FIXTURE_TOKEN;
     process.env.ELASTIC_FORWARD_FIXTURE_TOKEN = 'fixture-bearer';
@@ -178,4 +178,45 @@ it('does not repeat an unchanged clarification and creates one new sequence afte
     await f.make().run();
     expect(f.coordinator.listAttention()).toHaveLength(1);
     expect(f.db.prepare('SELECT sequence FROM elastic_human_proxies ORDER BY sequence').all()).toEqual([{ sequence: 0 }, { sequence: 1 }]);
+});
+it('suppresses an existing open proxy when the origin is answered directly before any local answer', async () => {
+    const f = await fixture(); await f.ask('qitem-direct-first'); await f.make().run();
+    const proxy = f.coordinator.getById(f.coordinator.listAttention()[0]!.qitemId)!;
+    const origin = f.origin.getById('qitem-direct-first')!;
+    f.origin.recordHumanResponse({ qitemId: origin.qitemId, replyId: 'direct-first', actorSession: 'operator@external', requestRevision: origin.humanRequestRevision!, response: { kind: 'choice', questionId: 'go', optionId: 'yes' } });
+    await f.make().run();
+    expect(f.coordinator.getById(proxy.qitemId)?.humanForwardingStatus).toBe('conflict');
+    expect(() => f.answer(proxy.qitemId)).toThrow();
+    expect(f.creates()).toBe(0);
+    expect(f.db.prepare("SELECT count(*) n FROM outbox_entries WHERE outbox_id LIKE 'elastic-human-forward-%'").get()).toEqual({ n: 0 });
+});
+it('revisits an awaiting clarification after its origin becomes terminal without inventing another forwarded receipt', async () => {
+    const f = await fixture(); await f.ask('qitem-terminal-clarification'); await f.make().run();
+    const proxy = f.coordinator.getById(f.coordinator.listAttention()[0]!.qitemId)!;
+    f.coordinator.recordHumanResponse({ qitemId: proxy.qitemId, replyId: 'clarify-terminal', requestRevision: proxy.humanRequestRevision!, actorSession: 'human@kernel', response: { kind: 'clarification', text: 'Why?' } });
+    await f.make().run();
+    const origin = f.origin.getById('qitem-terminal-clarification')!;
+    f.origin.recordHumanResponse({ qitemId: origin.qitemId, replyId: 'direct-terminal', requestRevision: origin.humanRequestRevision!, actorSession: 'operator@external', response: { kind: 'choice', questionId: 'go', optionId: 'no' } });
+    await f.make().run();
+    expect(f.coordinator.getById(proxy.qitemId)?.humanForwardingStatus).toBe('conflict');
+    expect(f.db.prepare('SELECT sequence,state FROM elastic_human_proxies').all()).toEqual([{ sequence: 0, state: 'conflict' }]);
+    expect(f.creates()).toBe(1);
+    expect(f.db.prepare("SELECT delivery_state FROM outbox_entries WHERE outbox_id LIKE 'elastic-human-forward-%'").all()).toEqual([{ delivery_state: 'delivered' }]);
+});
+it('pages existing terminal-origin mappings past100 while an unavailable first origin retains its own custody', async () => {
+    const f = await fixture();
+    for (let i = 0; i < 105; i++) await f.ask(`qitem-terminal-page-${i}`);
+    for (let i = 0; i < 6; i++) await f.make().run();
+    const proxies = f.coordinator.listAttention({ limit: 200 });
+    for (let i = 0; i < 105; i++) {
+        const origin = f.origin.getById(`qitem-terminal-page-${i}`)!;
+        f.origin.recordHumanResponse({ qitemId: origin.qitemId, replyId: `direct-${i}`, requestRevision: origin.humanRequestRevision!, actorSession: 'operator@external', response: { kind: 'choice', questionId: 'go', optionId: 'yes' } });
+    }
+    // Native readback of the first mapping is unavailable; all later readbacks remain real HTTP.
+    const base = f.endpoint.host.url;
+    const fetchImpl: typeof fetch = async (input, init) => String(input) === `${base}/api/queue/qitem-terminal-page-0` ? new Response('{}', { status: 503 }) : fetch(input, init);
+    for (let i = 0; i < 6; i++) await f.make(fetchImpl).run();
+    const mappings = f.db.prepare('SELECT state,count(*) n FROM elastic_human_proxies GROUP BY state').all();
+    expect(mappings).toEqual([{ state: 'conflict', n: 104 }, { state: 'open', n: 1 }]);
+    expect(f.creates()).toBe(0); expect(proxies).toHaveLength(105);
 });
