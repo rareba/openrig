@@ -26,7 +26,10 @@ export interface AzureNativeObservation {
   observedAt: number;
   demands: FleetDemand[];
   permanentWorkers: FleetWorkerObservation[];
+  /** Exact ARM coverage. Unknown workers must be explicitly quarantined with unknown telemetry. */
   managedWorkers: FleetWorkerObservation[];
+  /** Trusted native adapter derives these from durable pending enrollment, never ARM absence. */
+  provisioningAttempts?: Array<{ workerId: string; vmId: string; operationId: string }>;
 }
 export interface AzureRemovalSeal {
   workerId: string;
@@ -128,9 +131,10 @@ const defaultRun: AzureArgvRunner = (args, bounds) => new Promise((resolve, reje
 export function createAzureElasticFleetIO(options: AzureFleetOptions): FleetIO {
   const run = options.run ?? defaultRun; const now = options.now ?? Date.now;
   const config = (configuration: ElasticFleetConfiguration) => validateAzurePoolConfiguration(configuration.provider,configuration.policy.poolId);
-  async function command(configuration: AzurePoolConfiguration, args: string[]): Promise<unknown> {
+  async function command(configuration: AzurePoolConfiguration, args: string[], response: 'json' | 'bodyless-delete' = 'json'): Promise<unknown> {
     const stdout = await run([...args,'--subscription',configuration.subscription,'--only-show-errors','--output','json'],limits);
     if (typeof stdout !== 'string' || Buffer.byteLength(stdout) > limits.maxBuffer) reject();
+    if (response === 'bodyless-delete' && stdout.trim() === '') return undefined;
     return JSON.parse(stdout);
   }
   const scope = (configuration: AzurePoolConfiguration) => ['--resource-group',configuration.resourceGroup,'--name',configuration.scaleSetName];
@@ -167,13 +171,18 @@ export function createAzureElasticFleetIO(options: AzureFleetOptions): FleetIO {
     const permanent = observation.permanentWorkers.map(worker=>nativeWorker(worker,current,policy.pollIntervalSeconds*1000));
     if (permanent.some(worker=>worker.managed || !worker.permanent || instances.some(instance=>instance.workerId===worker.id))) reject();
     const managed = observation.managedWorkers.map(worker=>nativeWorker(worker,current,policy.pollIntervalSeconds*1000));
-    if (managed.some(worker=>!worker.managed || worker.permanent || !instances.some(instance=>instance.workerId===worker.id))) reject();
+    if (managed.length !== instances.length || managed.some(worker=>!worker.managed || worker.permanent || !instances.some(instance=>instance.workerId===worker.id))) reject();
     if (new Set([...permanent,...managed].map(worker=>worker.id)).size !== permanent.length+managed.length) reject();
+    const attempts = observation.provisioningAttempts === undefined ? [] : observation.provisioningAttempts;
+    if (!Array.isArray(attempts) || attempts.some(attempt => !object(attempt) || !exact(attempt,['workerId','vmId','operationId'])
+      || !text(attempt.workerId) || typeof attempt.vmId !== 'string' || !uuid.test(attempt.vmId) || !text(attempt.operationId)
+      || !instances.some(instance => instance.workerId === attempt.workerId && instance.vmId === attempt.vmId))
+      || new Set(attempts.map(attempt => attempt.workerId)).size !== attempts.length) reject();
     const workers = instances.map((instance):FleetWorkerObservation=>{
       const registered=managed.find(worker=>worker.id===instance.workerId);
-      if (registered?.state==='ready' && (!instance.protected || instance.provisioningState!=='Succeeded')) reject();
-      return registered ?? {id:instance.workerId,managed:true,permanent:false,state:'provisioning',capabilities:[...policy.capabilities],slots:policy.slotsPerWorker,active:0,
-        observedAt:observation.observedAt,idleSince:null,clean:true,pendingHumanReturns:false};
+      if (!registered || (registered.state==='ready' && (!instance.protected || instance.provisioningState!=='Succeeded'))
+        || (registered.state==='provisioning' && !attempts.some(attempt => attempt.workerId===instance.workerId && attempt.vmId===instance.vmId))) reject();
+      return registered;
     });
     if ([...workers,...permanent].some(worker=>worker.observedAt>observation.observedAt)) reject();
     return {observedAt:observation.observedAt,now:current,demands,workers:[...workers,...permanent],providerAvailable:true};
@@ -228,7 +237,7 @@ export function createAzureElasticFleetIO(options: AzureFleetOptions): FleetIO {
         ||seal.coordinatorCheckpointAcknowledged!==true||seal.clean!==true||seal.pendingHumanReturns!==false||!integer(seal.observedAt)||seal.observedAt<started||seal.observedAt>checked
         ||!integer(seal.drainConfirmedAt)||seal.observedAt<=seal.drainConfirmedAt)reject();
       const fresh=await target(operation,configuration);if(fresh.vmId!==instance.vmId||fresh.instanceId!==instance.instanceId)reject();
-      await command(configuration,['vmss','delete-instances',...scope(configuration),'--instance-ids',instance.instanceId]);
+      await command(configuration,['vmss','delete-instances',...scope(configuration),'--instance-ids',instance.instanceId],'bodyless-delete');
       const after=await inventory(configuration);if(after.instances.some(item=>item.instanceId===instance.instanceId||item.vmId===instance.vmId))reject();
       await options.retireRegistration({configuration,operation,instance});
     });},

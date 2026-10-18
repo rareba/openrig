@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createAzureElasticFleetIO, azureWorkerId, validateAzurePoolConfiguration, type AzureFleetOptions, type AzureInstance, type AzureNativeObservation, type AzureRemovalSeal } from '../src/adapters/azure-elastic-fleet.js';
+import { planFleet } from '../src/domain/elastic-fleet-policy.js';
 import type { FleetMutation } from '../src/domain/elastic-fleet.js';
 const subscription = '11111111-1111-4111-8111-111111111111';
 const resourceId = `/subscriptions/${subscription}/resourceGroups/rg/providers/Microsoft.Compute/virtualMachineScaleSets/fleet`;
@@ -34,11 +35,11 @@ describe('Azure dedicated VMSS boundary',()=>{
  it.each([{id:resourceId+'/wrong'},{tags:{}},{orchestrationMode:'Flexible'},{upgradePolicy:{mode:'Automatic'}},{automaticRepairsPolicy:{enabled:true}},{upgradePolicy:{mode:'Manual',automaticOSUpgradePolicy:{enableAutomaticOSUpgrade:true}}},{overprovision:true},{sku:{capacity:2}},{virtualMachineProfile:{storageProfile:{imageReference:{id:'/wrong'}}}}])('fails closed for unsafe model %j',async modelPatch=>{const f=fixture();f.set({modelPatch});expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);});
  it('rejects enabled autoscale from any resource group',async()=>{const f=fixture();f.set({autoscale:[{enabled:true,targetResourceUri:resourceId.toUpperCase()}]});expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);});
  it.each(['partial','missing-vmid','wrong-id','duplicate','bad-image'])('rejects %s inventories',async kind=>{const f=fixture();const instance=f.cloudInstance();let instances:unknown[]=[];if(kind==='missing-vmid')instances=[{...instance,vmId:undefined}];if(kind==='wrong-id')instances=[{...instance,id:'/wrong'}];if(kind==='duplicate')instances=[instance,instance];if(kind==='bad-image')instances=[{...instance,storageProfile:{}}];f.set({instances});expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);});
- it('keeps unregistered instances provisioning and changes identity on reincarnation',async()=>{const f=fixture();f.set({enrolled:false});const snapshot=await f.io.observe(policy,configuration);expect(snapshot.workers[0]?.state).toBe('provisioning');expect(azureWorkerId(resourceId,'44444444-4444-4444-8444-444444444444')).not.toBe(id);});
+ it('rejects unobserved instances and changes identity on reincarnation',async()=>{const f=fixture();f.set({enrolled:false});const snapshot=await f.io.observe(policy,configuration);expect(snapshot.providerAvailable).toBe(false);expect(snapshot.workers).toEqual([]);expect(azureWorkerId(resourceId,'44444444-4444-4444-8444-444444444444')).not.toBe(id);});
  it('fails closed on unavailable provider/native data without raw errors',async()=>{const f=fixture();f.set({failCommand:'vmss show'});expect(await f.io.observe(policy,configuration)).toEqual({observedAt:10000,now:10000,demands:[],workers:[],providerAvailable:false});f.set({failCommand:'unused',nativePatch:{permanentWorkers:undefined}});expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);});
  it('scales to persisted absolute target then protects before bootstrap and awaits readiness',async()=>{const f=fixture();await f.io.provision(f.operation());expect(f.events).toEqual(['scale','protect','bootstrap']);expect(f.commands.find(args=>args[1]==='scale')).toContain('2');});
  it('refuses lowering, ceiling violations and absent bootstrap before mutation',async()=>{for(const targetCapacity of [0,4]){const f=fixture();await expect(f.io.provision({...f.operation(),targetCapacity})).rejects.toThrow('azure_operation_failed');expect(f.events).toEqual([]);}const f=fixture();const io=createAzureElasticFleetIO({...f.options,bootstrap:undefined});await expect(io.provision(f.operation())).rejects.toThrow('azure_operation_failed');expect(f.events).toEqual([]);});
- it('leaves ambiguous scale and failed native enrollment unresolved without replay',async()=>{const f=fixture();f.set({scaleWorks:false});await expect(f.io.provision(f.operation())).rejects.toThrow('azure_operation_failed');expect(f.events).toEqual(['scale']);expect(await f.io.inspectOperation(f.operation(),configuration)).toBe('pending');expect(f.events).toEqual(['scale']);const g=fixture();g.set({enrolled:false,bootstrapWorks:false});await expect(g.io.provision(g.operation())).rejects.toThrow('azure_operation_failed');expect(await g.io.inspectOperation(g.operation(),configuration)).toBe('pending');});
+ it('leaves ambiguous scale and failed native enrollment unresolved without replay',async()=>{const f=fixture();f.set({scaleWorks:false});await expect(f.io.provision(f.operation())).rejects.toThrow('azure_operation_failed');expect(f.events).toEqual(['scale']);expect(await f.io.inspectOperation(f.operation(),configuration)).toBe('pending');expect(f.events).toEqual(['scale']);const g=fixture();g.set({bootstrapWorks:false});const original=g.options.observeNative;const io=createAzureElasticFleetIO({...g.options,observeNative:async context=>{const observed=await original(context);return {...observed,managedWorkers:observed.managedWorkers.map(worker=>worker.id===id?worker:{...worker,state:'quarantined' as const,slots:null,active:null,clean:null,pendingHumanReturns:null})};}});await expect(io.provision(g.operation())).rejects.toThrow('azure_operation_failed');expect(g.events).toEqual(['scale','protect','bootstrap']);expect(await io.inspectOperation(g.operation(),configuration)).toBe('pending');});
  it('drains only exact owned incarnations',async()=>{const f=fixture();await f.io.beginDrain(f.operation('beginDrain'));expect(f.events).toEqual(['drain']);await expect(f.io.beginDrain({...f.operation('beginDrain'),workerId:'manual-host'})).rejects.toThrow('azure_operation_failed');});
  it('retains protection through exact deletion and retires only after confirmed absence',async()=>{const f=fixture();await f.io.remove(f.operation('remove'));expect(f.events).toEqual(['delete','retire']);const command=f.commands.find(args=>args[1]==='delete-instances')!;expect(command[command.indexOf('--instance-ids')+1]).toBe('0');expect(command.join(' ')).not.toMatch(/force|protect.*false/);});
  it.each([{clean:false},{active:1},{pendingHumanReturns:true},{fenced:false},{beginDrainConfirmed:false},{observedAt:8000},{drainConfirmedAt:10000},{vmId:'wrong'},{operationId:'wrong'},{drainGeneration:''},{claims:1},{processes:1},{pendingTransfers:true},{pendingActivationIntents:true},{coordinatorCheckpointAcknowledged:false}])('blocks deletion for unsafe seal %j',async sealPatch=>{const f=fixture();f.set({sealPatch});await expect(f.io.remove(f.operation('remove'))).rejects.toThrow('azure_operation_failed');expect(f.events).toEqual([]);});
@@ -52,5 +53,54 @@ describe('Azure dedicated VMSS boundary',()=>{
  it('refuses bootstrap if Azure never confirms protection',async()=>{const f=fixture();const original=f.options.run!;const io=createAzureElasticFleetIO({...f.options,run:async(args,bounds)=>{const result=await original(args,bounds);if(args[1]==='list-instances'){const rows=JSON.parse(result);for(const row of rows)if(row.instanceId==='1')row.protectionPolicy=null;return JSON.stringify(rows);}return result;}});await expect(io.provision(f.operation())).rejects.toThrow('azure_operation_failed');expect(f.events).toEqual(['scale','protect']);});
  it('preserves permanent workers and strips native diagnostics from snapshots',async()=>{const f=fixture();f.set({nativePatch:{permanentWorkers:[{id:'permanent',managed:false,permanent:true,state:'ready',capabilities:['code'],slots:1,active:0,observedAt:10000,idleSince:0,clean:true,pendingHumanReturns:false,diagnostic:'Bearer secret'} as never]}});const snapshot=await f.io.observe(policy,configuration);expect(snapshot.workers).toHaveLength(2);expect(JSON.stringify(snapshot)).not.toContain('Bearer');await expect(f.io.remove({...f.operation('remove'),workerId:'permanent'})).rejects.toThrow('azure_operation_failed');expect(f.events).toEqual([]);});
  it('keeps read-only observation and inspection free of creation, protection, bootstrap and deletion',async()=>{const f=fixture();await f.io.observe(policy,configuration);await f.io.inspectOperation(f.operation(),configuration);await f.io.inspectOperation(f.operation('beginDrain'),configuration);expect(f.events).toEqual([]);expect(f.commands.every(args=>['show','list-instances','autoscale'].includes(args[1]!))).toBe(true);});
+
+ it('retires registration after a successful bodyless delete and confirmed ARM absence',async()=>{
+  const f=fixture();const original=f.options.run!;
+  const io=createAzureElasticFleetIO({...f.options,run:async(args,bounds)=>{const result=await original(args,bounds);return args[1]==='delete-instances'?'':result;}});
+  await io.remove(f.operation('remove'));
+  expect(f.events).toEqual(['delete','retire']);
+  const deletedAt=f.commands.findIndex(args=>args[1]==='delete-instances');
+  expect(f.commands.slice(deletedAt+1).some(args=>args[1]==='list-instances')).toBe(true);
+ });
+ it('does not retire on bodyless delete unless disappearance is confirmed',async()=>{
+  const f=fixture();f.set({deleteWorks:false});const original=f.options.run!;
+  const io=createAzureElasticFleetIO({...f.options,run:async(args,bounds)=>{const result=await original(args,bounds);return args[1]==='delete-instances'?'':result;}});
+  await expect(io.remove(f.operation('remove'))).rejects.toThrow('azure_operation_failed');expect(f.events).toEqual(['delete']);
+  const deletedAt=f.commands.findIndex(args=>args[1]==='delete-instances');expect(f.commands.slice(deletedAt+1).some(args=>args[1]==='list-instances')).toBe(true);
+ });
+ it.each(['show','list-instances','autoscale'])('rejects bodyless %s inventory responses',async command=>{
+  const f=fixture();const original=f.options.run!;
+  const io=createAzureElasticFleetIO({...f.options,run:async(args,bounds)=>{const result=await original(args,bounds);return args[1]===command?'':result;}});
+  expect((await io.observe(policy,configuration)).providerAvailable).toBe(false);
+ });
+ it('does not invent free capacity or drain the known ready host when an incumbent is omitted',async()=>{
+  const f=fixture();f.set({now:1_000_000,capacity:2,instances:[f.cloudInstance(),f.cloudInstance('1','33333333-3333-4333-8333-333333333333')]});
+  const original=f.options.observeNative;
+  const io=createAzureElasticFleetIO({...f.options,observeNative:async context=>{const observed=await original(context);return {...observed,demands:[{id:'issue',capability:'code'}],managedWorkers:observed.managedWorkers.slice(0,1)};}});
+  const observed=await io.observe(policy,configuration);const plan=planFleet(policy,observed);
+  expect(plan.drainIds).toEqual([]);expect(plan.freeSlots).toBe(0);expect(observed.providerAvailable).toBe(false);
+ });
+ it('requires exact durable attempt attestation for explicitly provisioning workers',async()=>{
+  const f=fixture();const original=f.options.observeNative;
+  const io=createAzureElasticFleetIO({...f.options,observeNative:async context=>{const observed=await original(context);return {...observed,managedWorkers:observed.managedWorkers.map(worker=>({...worker,state:'provisioning' as const}))};}});
+  expect((await io.observe(policy,configuration)).providerAvailable).toBe(false);
+ });
+ it.each(['workerId','vmId','operationId'])('rejects invalid provisioning attempt %s',async field=>{
+  const f=fixture();const original=f.options.observeNative;
+  const io=createAzureElasticFleetIO({...f.options,observeNative:async context=>{const observed=await original(context);return {...observed,managedWorkers:observed.managedWorkers.map(worker=>({...worker,state:'provisioning' as const})),provisioningAttempts:[{workerId:id,vmId,operationId:'attempt',...{[field]:field==='operationId'?'':'wrong'}}]};}});
+  expect((await io.observe(policy,configuration)).providerAvailable).toBe(false);
+ });
+ it('retains explicitly attested provisioning capacity in the ceiling',async()=>{
+  const f=fixture();const original=f.options.observeNative;
+  const io=createAzureElasticFleetIO({...f.options,observeNative:async context=>{const observed=await original(context);return {...observed,demands:[{id:'one',capability:'code'},{id:'two',capability:'code'}],managedWorkers:observed.managedWorkers.map(worker=>({...worker,state:'provisioning' as const})),provisioningAttempts:[{workerId:id,vmId,operationId:'durable-attempt'}]};}});
+  const observed=await io.observe(policy,configuration);expect(observed.providerAvailable).toBe(true);expect(observed.workers[0]?.state).toBe('provisioning');
+  expect(planFleet({...policy,maxWorkers:1},observed)).toMatchObject({add:0,drainIds:[],reasons:['maximum_reached']});
+ });
+ it('preserves explicit quarantined unknown telemetry and blocks actions',async()=>{
+  const f=fixture();const original=f.options.observeNative;
+  const io=createAzureElasticFleetIO({...f.options,observeNative:async context=>{const observed=await original(context);return {...observed,managedWorkers:observed.managedWorkers.map(worker=>({...worker,state:'quarantined' as const,slots:null,active:null,clean:null,pendingHumanReturns:null}))};}});
+  const observed=await io.observe(policy,configuration);expect(observed.providerAvailable).toBe(true);expect(observed.workers[0]?.slots).toBe(null);
+  expect(planFleet(policy,observed)).toMatchObject({add:0,drainIds:[],reasons:['unknown_worker_telemetry']});
+ });
 
 });
