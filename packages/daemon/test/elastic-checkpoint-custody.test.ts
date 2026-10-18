@@ -19,6 +19,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { deflateSync } from "node:zlib";
+import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
+import { migrate } from "../src/db/migrate.js";
 import { gitObjectBudget } from "../src/adapters/elastic-checkpoint-git-objects.js";
 import { CheckpointPrivateStore } from "../src/adapters/elastic-checkpoint-private-store.js";
 import { Readable } from "node:stream";
@@ -72,7 +74,8 @@ async function fixture(git = true, packed = false, linked: boolean | number = fa
     const binding = { workerId, vmId, manifestDigest, fleetEpoch: enrollment.fleetEpoch, drainGeneration: 1, removalOperationId: "remove-1" };
     const db = new Database(raw.linux.database);
     db.pragma("journal_mode=WAL");
-    db.exec("CREATE TABLE elastic_worker_control(id INTEGER PRIMARY KEY,worker_id TEXT,vm_id TEXT,manifest_digest TEXT,phase TEXT,generation INTEGER DEFAULT 0,drain_operation_id TEXT,drain_started_at INTEGER);CREATE TABLE elastic_worker_custody(qitem_id TEXT,generation INTEGER);CREATE TABLE queue_items(qitem_id TEXT,state TEXT);CREATE TABLE outbox_entries(outbox_id TEXT,delivery_state TEXT);CREATE TABLE arbitrary_shutdown(v);INSERT INTO arbitrary_shutdown VALUES(CAST(x'80' AS TEXT)),(9007199254740993),(1.5),(x'00FF'),(NULL)");
+    migrate(db, ALL_MIGRATIONS);
+    db.exec("CREATE TABLE arbitrary_shutdown(v);INSERT INTO arbitrary_shutdown VALUES(CAST(x'80' AS TEXT)),(9007199254740993),(1.5),(x'00FF'),(NULL)");
     const native = new ElasticWorkerControl(db);
     native.enroll(binding);
     native.beginDrain(binding, binding.removalOperationId);
@@ -277,7 +280,7 @@ describe.runIf(process.platform === "linux")("concrete durable checkpoint custod
             expect(f.custody.receipt(f.cp.checkpointId)).toBeNull();
         }
     });
-    it("reads native sealed identity and unresolved custody from SQLite instead of trusting an archive clean boolean", async () => { const f0 = await fixture(false); const f = mutateArchive(f0, d => { const file = d.files.find(x => x.path === "sqlite/0.sqlite")!; const p = join(f0.control, "edit.sqlite"); writeFileSync(p, file.bytes); const db = new Database(p); db.exec("INSERT INTO queue_items VALUES('still-owned','blocked')"); db.close(); file.bytes = readFileSync(p); }); await upload(f); expect(() => f.custody.verify(f.cp.checkpointId)).toThrow(); });
+    it("reads native sealed identity and unresolved custody from SQLite instead of trusting an archive clean boolean", async () => { const f0 = await fixture(false); const f = mutateArchive(f0, d => { const file = d.files.find(x => x.path === "sqlite/0.sqlite")!; const p = join(f0.control, "edit.sqlite"); writeFileSync(p, file.bytes); const db = new Database(p); db.exec("INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,body) VALUES('still-owned','t','t','a@r','b@r','blocked','x')"); db.close(); file.bytes = readFileSync(p); }); await upload(f); expect(() => f.custody.verify(f.cp.checkpointId)).toThrow(); });
     it("rejects extra roots, duplicate entries and traversal in correctly encrypted archives", async () => {
         for (const path of ["roots/9/escape", "roots/0/../escape", "audit/control.json"]) {
             const f0 = await fixture(false), f = mutateArchive(f0, d => { d.files.push({ path, mode: 0o600, bytes: Buffer.from("bad") }); });
@@ -312,7 +315,7 @@ describe("bounded private TLS checkpoint receiver", () => {
         } = {}) => new Promise<{
             status: number;
             body: string;
-        }>((resolve, reject) => { const headers: Record<string, string> | string[] = change.duplicate ? ["authorization", `Bearer ${f.cap.token}`, "authorization", `Bearer ${f.cap.token}`, "content-type", "application/octet-stream", "content-length", String(f.ciphertext.length), "x-openrig-checkpoint", Buffer.from(JSON.stringify(checkpointDescriptorSchema.parse(f.descriptor))).toString("base64")] : { authorization: `Bearer ${change.auth ?? f.cap.token}`, "content-type": "application/octet-stream", "content-length": String(f.ciphertext.length), "x-openrig-checkpoint": Buffer.from(JSON.stringify(checkpointDescriptorSchema.parse(f.descriptor))).toString("base64"), ...change.extra }; const req = request({ host: "127.0.0.1", port: address.port, method: change.method ?? "PUT", path: change.path ?? `/api/elastic-checkpoints/${f.cp.checkpointId}`, ca: tlsCert, minVersion: "TLSv1.3", headers }, res => { let body = ""; res.on("data", b => body += b); res.on("end", () => resolve({ status: res.statusCode!, body })); }); req.on("error", reject); req.end(f.ciphertext); });
+        }>((resolve, reject) => { const headers: Record<string, string> | string[] = change.duplicate ? ["authorization", `Bearer ${f.cap.token}`, "authorization", `Bearer ${f.cap.token}`, "content-type", "application/octet-stream", "content-length", String(f.ciphertext.length), "x-openrig-checkpoint", Buffer.from(JSON.stringify(checkpointDescriptorSchema.parse(f.descriptor))).toString("base64")] : { authorization: `Bearer ${change.auth ?? f.cap.token}`, "content-type": "application/octet-stream", "content-length": String(f.ciphertext.length), "x-openrig-checkpoint": Buffer.from(JSON.stringify(checkpointDescriptorSchema.parse(f.descriptor))).toString("base64"), ...change.extra }; const req = request({ host: "127.0.0.1", port: address.port, method: change.method ?? "PUT", path: change.path ?? `/api/elastic-checkpoints/${f.cp.checkpointId}`, ca: tlsCert, minVersion: "TLSv1.3", headers }, res => { let body = ""; res.on("data", b => body += b); res.on("end", () => resolve({ status: res.statusCode!, body })); }); req.on("error", e => ["EPIPE", "ECONNRESET"].includes((e as NodeJS.ErrnoException).code ?? "") ? resolve({ status: 400, body: "" }) : reject(e)); req.end(f.ciphertext); });
         try {
             for (const change of [{ auth: "x".repeat(43) }, { method: "POST" }, { path: "/api/operator" }, { extra: { "content-encoding": "gzip" } }, { duplicate: true }])
                 expect((await send(change)).status).toBe(400);
