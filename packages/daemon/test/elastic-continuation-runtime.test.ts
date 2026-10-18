@@ -107,7 +107,7 @@ describe.skipIf(process.platform!=='linux'||!root)('owned continuation across th
       f.db.function('replace_native_sidecar',()=>{writeFileSync(f.sidecar,replacement);return 1;});
       f.db.exec("CREATE TRIGGER replace_at_spawn AFTER UPDATE OF stage ON elastic_continuation_actions WHEN NEW.stage='spawn-issued' BEGIN SELECT replace_native_sidecar(); END");
     }
-    continuationTransition(f.db,f.action.actionId,'prepared','transport-issued');
+    f.db.transaction(()=>continuationTransition(f.db,f.action.actionId,'prepared','transport-issued')).immediate();
     expect(f.action.effect.kind).toBe('resume-conversation');
     if(f.action.effect.kind!=='resume-conversation')throw Error('fixture requires resume');
     const launchId=f.action.effect.launchId;
