@@ -39,6 +39,8 @@ On each participating OpenRig origin, provide an operator-managed `~/.openrig/hu
 
 These are placeholders, not example credentials or an inferred phone number. Use identities observed from the actual authorized native WhatsApp event. The initial binding is the existing local `human@kernel`; this does not register an external human or relax Slack's registry rules. Missing configuration is inert. Configure only the intended origin hosts.
 
+WhatsApp may report the same person as a phone JID or a LID. Replies can match an existing binding through Hermes' native identity helper only when its saved mapping resolves exactly that two-identifier pair; unknown or conflicting mappings fail closed. Profile and channel must still match, and the quoted message must identify one question within the authorized chat/sender tuple. Slack and Teams keep exact identity matching. OpenRig receives the original bound tuple; any different observed WhatsApp tuple is retained only in the private reply audit.
+
 In the existing Hermes plugin settings, set:
 
 ```yaml
