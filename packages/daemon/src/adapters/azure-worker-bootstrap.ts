@@ -116,6 +116,8 @@ export class AzureWorkerBootstrap {
   enroll(binding: EnrollmentBinding, materialEnvelope: string): string {
     return this.guarded(() => {
       const prepared = this.prepared(binding); const identity = this.identity(binding);
+      // Native denial outranks an uncertain private enrollment completion marker.
+      if (this.control.read() && this.requireState(identity).phase !== 'ready') reject();
       const plaintext = openWorkerMaterial(materialEnvelope, binding, createPrivateKey(prepared.privateKeyPem));
       try {
         const material: unknown = JSON.parse(plaintext.toString());
@@ -126,8 +128,10 @@ export class AzureWorkerBootstrap {
         if (!prepared.enrolled) {
           // Persist input identity before side effects: a lost reply resumes this exact bearer/config.
           prepared.materialDigest = digest; this.persist('enrollment.json', prepared);
+          if (this.control.read() && this.requireState(identity).phase !== 'ready') reject();
           this.os.configureWorker(material as unknown as WorkerRuntimeMaterial, prepared.bearer);
-          this.control.enroll(identity); this.os.startUnit(); prepared.enrolled = true; this.persist('enrollment.json', prepared);
+          if (this.control.enroll(identity).phase !== 'ready') reject();
+          this.os.startUnit(); prepared.enrolled = true; this.persist('enrollment.json', prepared);
         } else if (this.requireState(identity).phase !== 'ready') reject();
         return sealEnrollment(Buffer.from(prepared.bearer), binding, createPublicKey(prepared.controllerPublicKeyPem));
       } finally { plaintext.fill(0); }

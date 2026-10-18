@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { generateKeyPairSync, createPublicKey, randomBytes } from 'node:crypto';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import Database from 'better-sqlite3';
@@ -40,6 +40,23 @@ describe('trusted worker bootstrap protocol',()=>{
   const f=fixture();writeFileSync(f.manifest.materialFiles.piAuthFile,JSON.stringify({auth:'secret'}));writeFileSync(f.manifest.materialFiles.piSettingsFile,JSON.stringify({model:'test'}));writeFileSync(f.manifest.materialFiles.piModelsFile,JSON.stringify({providers:{test:{apiKey:'private-provider-key'}}}));
   expect(JSON.parse(readWorkerRuntimeMaterial(f.manifest.materialFiles).toString())).toEqual({version:1,piAuth:{auth:'secret'},piSettings:{model:'test'},piModels:{providers:{test:{apiKey:'private-provider-key'}}}});
   writeFileSync(f.manifest.materialFiles.piModelsFile,'x'.repeat(64*1024));expect(()=>readWorkerRuntimeMaterial(f.manifest.materialFiles)).toThrow('worker_bootstrap_rejected');
+ });
+
+ it.each(['draining','sealed'])('rejects uncertain initial enrollment retries before side effects after native state becomes %s',(phase)=>{
+  const f=fixture();const prepared=f.helper.prepare(f.binding,controller.publicKey.export({type:'spki',format:'pem'}).toString());
+  const material=sealWorkerMaterial(Buffer.from(JSON.stringify({version:1,piAuth:{},piSettings:{},piModels:{}})),f.binding,createPublicKey(prepared.publicKeyPem));
+  const phases:string[]=[];let fail=true;f.os.startUnit=()=>{phases.push(f.helper.control.read()!.phase);if(fail)throw Error('uncertain-start');};
+  expect(()=>f.helper.enroll(f.binding,material)).toThrow('worker_bootstrap_rejected');
+  const identity=f.helper.control.read()!;f.helper.beginDrain(identity,'drain-a');
+  if(phase==='sealed'){f.helper.acknowledgeCheckpoint(identity,1,f.helper.checkpoint(identity,1));expect(f.helper.seal(identity,1,'remove-a').clean).toBe(true);}
+  const configured=f.calls.filter(call=>call==='configure').length;fail=false;
+  expect(()=>f.helper.enroll(f.binding,material)).toThrow('worker_bootstrap_rejected');expect(phases).toEqual(['ready']);expect(f.calls.filter(call=>call==='configure')).toHaveLength(configured);expect(f.helper.control.read()?.phase).toBe(phase);
+ });
+ it('resumes an uncertain enrollment with the same bearer while native phase remains ready',()=>{
+  const f=fixture();const prepared=f.helper.prepare(f.binding,controller.publicKey.export({type:'spki',format:'pem'}).toString());const material=sealWorkerMaterial(Buffer.from(JSON.stringify({version:1,piAuth:{},piSettings:{},piModels:{}})),f.binding,createPublicKey(prepared.publicKeyPem));
+  const bearer=JSON.parse(readFileSync(join(f.manifest.controlDirectory,'enrollment.json'),'utf8')).bearer;
+  f.os.startUnit=()=>{throw Error('uncertain-start');};expect(()=>f.helper.enroll(f.binding,material)).toThrow('worker_bootstrap_rejected');f.os.startUnit=()=>{};
+  expect(openEnrollment(f.helper.enroll(f.binding,material),f.binding,controller.privateKey).toString()).toBe(bearer);
  });
 
 });

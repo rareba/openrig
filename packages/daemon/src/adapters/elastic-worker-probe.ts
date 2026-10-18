@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import type { ElasticWorkerControl, ElasticWorkerLedger, ElasticWorkerState } from '../domain/elastic-worker-control.js';
 import { workerDigest } from '../domain/elastic-worker-control.js';
@@ -17,8 +17,9 @@ export interface ElasticWorkerProbe {
 function inside(path: string, root: string): boolean { return path === root || path.startsWith(root + sep); }
 function git(cwd: string, args: string[]): string {
   const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
-  return execFileSync('/usr/bin/git', ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', `safe.directory=${cwd}`, ...args], { cwd, encoding: 'utf8', timeout: 10_000, maxBuffer: 8 * 1024 * 1024,
-    env: { ...inherited, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } });
+  return execFileSync('/usr/bin/git', ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', `safe.directory=${cwd}`, '-c', 'protocol.allow=never',
+    '-c', 'core.sshCommand=/usr/bin/false', '-c', 'core.gitProxy=/usr/bin/false', '-c', 'credential.helper=', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000, maxBuffer: 8 * 1024 * 1024,
+    env: { ...inherited, GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: '', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } });
 }
 /** Owned roots are a trusted enrollment inventory, not worker-provided deletion exemptions. */
 export function inspectWorkerFilesystem(ownedRoots: readonly string[], declaredCwds: readonly string[]): WorkerFilesystemProof {
@@ -31,6 +32,30 @@ export function inspectWorkerFilesystem(ownedRoots: readonly string[], declaredC
       roots.push(root);
     }
     const contained = (path: string) => roots.some(root => inside(path, root));
+    const metadataVisited = new Set<string>();
+    const metadataPath = (path: string) => {
+      if (!contained(path) || realpathSync(path) !== path || lstatSync(path).isSymbolicLink()) throw Error();
+      return path;
+    };
+    const metadataTree = (path: string) => {
+      metadataPath(path);
+      if (metadataVisited.has(path)) return;
+      metadataVisited.add(path);
+      if (metadataVisited.size + visited.size > 100_000) throw Error();
+      const stat = lstatSync(path);
+      if (stat.isDirectory()) {
+        for (const name of readdirSync(path)) metadataTree(join(path, name));
+      } else if (!stat.isFile() || path.endsWith('/objects/info/alternates')
+        || path.endsWith('/objects/info/http-alternates') || path.endsWith('.promisor')) throw Error();
+    };
+    const metadataPointer = (path: string): string => {
+      metadataPath(path); const stat = lstatSync(path);
+      if (!stat.isFile() || stat.size > 4096) throw Error();
+      const value = readFileSync(path, 'utf8').replace(/\r?\n$/, '');
+      if (!value || /[\r\n\0]/.test(value)) throw Error();
+      return value;
+    };
+
     const walk = (path: string) => {
       if (visited.has(path)) return; visited.add(path);
       if (visited.size > 100_000) throw Error();
@@ -52,13 +77,23 @@ export function inspectWorkerFilesystem(ownedRoots: readonly string[], declaredC
     for (const root of roots) walk(root);
     for (const cwd of declaredCwds) if (!isAbsolute(cwd) || realpathSync(cwd) !== cwd || !contained(cwd) || !lstatSync(cwd).isDirectory()) throw Error();
     for (const repo of repositories) {
-      if (lstatSync(join(repo, '.git')).isSymbolicLink() || realpathSync(git(repo, ['rev-parse', '--show-toplevel']).trim()) !== repo) throw Error();
-      const gitDir = realpathSync(git(repo, ['rev-parse', '--absolute-git-dir']).trim());
-      const commonDir = realpathSync(git(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim());
-      if (!contained(gitDir) || !contained(commonDir)) throw Error();
+      // Audit actual metadata/object custody before Git is allowed to read any objects.
+      const marker = metadataPath(join(repo, '.git'));
+      let gitDir = marker;
+      if (lstatSync(marker).isFile()) {
+        const pointer = metadataPointer(marker);
+        if (!pointer.startsWith('gitdir: ')) throw Error();
+        gitDir = metadataPath(resolve(repo, pointer.slice(8)));
+      }
+      const commonPointer = join(gitDir, 'commondir');
+      const commonDir = existsSync(commonPointer) ? metadataPath(resolve(gitDir, metadataPointer(commonPointer))) : gitDir;
+      metadataTree(commonDir); metadataTree(gitDir);
+      if (realpathSync(git(repo, ['rev-parse', '--show-toplevel']).trim()) !== repo
+        || realpathSync(git(repo, ['rev-parse', '--absolute-git-dir']).trim()) !== gitDir
+        || realpathSync(git(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim()) !== commonDir) throw Error();
       const configuration = git(repo, ['config', '--includes', '--null', '--list']).split('\0');
       // A clean/process filter can execute during status. Unknown converters retain the VM.
-      if (configuration.some(entry => /^filter\./i.test(entry.split('\n')[0] ?? ''))) throw Error();
+      if (configuration.some(entry => /^(filter\.|extensions\.partialclone$|remote\..*\.(promisor|partialclonefilter)$)/i.test(entry.split('\n')[0] ?? ''))) throw Error();
       if (git(repo, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=all']).length) blockers.add('git_dirty');
       const worktrees = git(repo, ['worktree', 'list', '--porcelain', '-z']).split('\0').filter(line => line.startsWith('worktree ')).map(line => line.slice(9));
       for (const worktree of worktrees) {

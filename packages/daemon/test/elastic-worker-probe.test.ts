@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync, chmodSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync, chmodSync, existsSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -27,6 +27,22 @@ describe('independent elastic filesystem custody',()=>{
   const f=fixture();const marker=join(f.root,'executed');const hook=join(f.root,'included.sh');writeFileSync(hook,`#!/bin/sh\ntouch '${marker}'\n`);chmodSync(hook,0o700);
   const include=join(f.root,'config');writeFileSync(include,`[filter "evil"]\n clean = ${hook}\n`);f.git('config','include.path',include);writeFileSync(join(f.repo,'.gitattributes'),'*.txt filter=evil\n');
   expect(inspectWorkerFilesystem([f.root],[f.repo]).complete).toBe(false);expect(existsSync(marker)).toBe(false);
+ });
+
+ it('never invokes a repository SSH helper through partial-clone lazy fetch of a missing tree',()=>{
+  const f=fixture();const marker=join(f.root,'lazy-fetch-executed');const helper=join(f.root,'ssh-helper.sh');
+  writeFileSync(helper,`#!/bin/sh\ntouch '${marker}'\nexit 1\n`);chmodSync(helper,0o700);
+  const tree=f.git('rev-parse','HEAD^{tree}');rmSync(join(f.repo,'.git/objects',tree.slice(0,2),tree.slice(2)));
+  f.git('config','extensions.partialClone','origin');f.git('config','remote.origin.promisor','true');f.git('config','remote.origin.url','ssh://example.invalid/repo');f.git('config','core.sshCommand',helper);
+  writeFileSync(join(f.repo,'work.txt'),'changed');const proof=inspectWorkerFilesystem([f.root],[f.repo]);
+  expect(existsSync(marker)).toBe(false);expect(proof.complete).toBe(false);expect(verifyWorkerCheckpoint(proof,proof)).toBe(false);
+ });
+ it.each(['symlink','alternates','http-alternates'])('rejects escaped object custody through %s before declaring completeness',(kind)=>{
+  const f=fixture();const external=realpathSync(mkdtempSync(join(tmpdir(),'elastic-objects-')));dirs.push(external);const objects=join(external,'objects');
+  renameSync(join(f.repo,'.git/objects'),objects);
+  if(kind==='symlink')symlinkSync(objects,join(f.repo,'.git/objects'));
+  else{mkdirSync(join(f.repo,'.git/objects/info'),{recursive:true});writeFileSync(join(f.repo,'.git/objects/info',kind),objects+'\n');}
+  const proof=inspectWorkerFilesystem([f.root],[f.repo]);expect(proof.complete).toBe(false);expect(verifyWorkerCheckpoint(proof,proof)).toBe(false);
  });
 
 });
