@@ -1,3 +1,4 @@
+import { assertElasticEffectAllowed, assertElasticSeatAllowed } from "./elastic-worker-guard.js";
 import { ulid } from "ulid";
 import { seatEnvLaunchVars, type SeatEnv } from "./seat-env.js";
 import { SEAT_PROJECT_DIR_ENV } from "./claude-core-plugin-env.js";
@@ -236,6 +237,7 @@ export class SuccessorSessionLauncher {
     // <old-token>`), which is exactly how the 2026-08-22 wave's "fresh" successors booted 14-day-old
     // contexts. An explicit shell also resets the pane's respawn default, self-healing the pane.
     const blankShell = (await this.tmuxAdapter.getDefaultShell()) ?? "/bin/sh";
+    assertElasticSeatAllowed(departingSession, input.node.runtime);
     const respawned = await this.tmuxAdapter.respawnPane(pane.id, blankShell, { cwd, env });
     if (!respawned.ok) {
       return {
@@ -272,6 +274,7 @@ export class SuccessorSessionLauncher {
     //    on ANY launch/readiness failure we do NOT killSession the preserved seat — that would destroy
     //    the retiree's recoverable state. We return the structured failure and leave the re-wakeable
     //    shell in the pane; commit never runs, so the binding is not repointed.
+    assertElasticEffectAllowed();
     const started = await this.startAgent(input.node, departingSession, pane.id, cwd, input.forkSource, input.occupantGeneration);
     if (!started.ok) {
       return { ok: false, code: started.code, step: "start_agent", message: started.message, replacementStarted: true };
@@ -358,6 +361,7 @@ export class SuccessorSessionLauncher {
 
     let launch: Awaited<ReturnType<RuntimeAdapter["launchHarness"]>>;
     try {
+      assertElasticEffectAllowed();
       launch = await adapter.launchHarness(binding, { name: tmuxSession, ...(forkSource ? { forkSource } : {}) });
     } catch (err) {
       return { ok: false, code: "successor_launch_failed", message: `Successor harness launch threw: ${err instanceof Error ? err.message : String(err)}` };

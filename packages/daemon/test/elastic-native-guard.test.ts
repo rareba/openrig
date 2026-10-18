@@ -1,0 +1,12 @@
+import {afterEach,describe,expect,it,vi} from 'vitest';
+import {mkdtempSync,realpathSync,writeFileSync,rmSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+import Database from 'better-sqlite3';
+import {assertElasticEffectAllowed} from '../src/domain/elastic-worker-guard.js';
+import {ElasticWorkerControl} from '../src/domain/elastic-worker-control.js';
+import {migrate} from '../src/db/migrate.js';
+import {ALL_MIGRATIONS} from '../src/db/all-migrations.js';
+vi.mock('node:fs',async original=>{const fs=await original<typeof import('node:fs')>();return {...fs,lstatSync:(path:any,...args:any[])=>{const stat=(fs.lstatSync as any)(path,...args);return String(path).endsWith('/root-owned-marker')?new Proxy(stat,{get:(target,key)=>key==='uid'?0:Reflect.get(target,key)}):stat;}};});
+const dirs:string[]=[];afterEach(()=>{delete process.env.OPENRIG_ELASTIC_GUARD;for(const d of dirs.splice(0))rmSync(d,{recursive:true,force:true});});
+describe('native database authority at last effect',()=>{it('allows ready, denies unattributed draining input and all sealed input, while drain probe can read',()=>{const root=realpathSync(mkdtempSync(join(tmpdir(),'elastic-guard-')));dirs.push(root);const marker=join(root,'root-owned-marker');process.env.OPENRIG_ELASTIC_GUARD=marker;const identity={workerId:'worker',vmId:'11111111-1111-4111-8111-111111111111',manifestDigest:'a'.repeat(64)};writeFileSync(marker,JSON.stringify({version:1,phase:'ready',...identity}),{mode:0o644});const db=new Database(':memory:');migrate(db,ALL_MIGRATIONS);const control=new ElasticWorkerControl(db);control.enroll(identity);expect(()=>assertElasticEffectAllowed(db)).not.toThrow();control.beginDrain(identity,'drain');expect(()=>assertElasticEffectAllowed(db)).toThrow('elastic_worker_effect_denied');expect(()=>assertElasticEffectAllowed(db,{allowDraining:true})).not.toThrow();control.sealAdmission(identity,1);expect(()=>assertElasticEffectAllowed(db,{allowDraining:true})).toThrow();db.close();});});

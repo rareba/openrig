@@ -1,3 +1,4 @@
+import { assertElasticEffectAllowed } from "./elastic-worker-guard.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type Database from "better-sqlite3";
 
@@ -116,6 +117,7 @@ export class SeatDeliveryGuard {
   /** fn must include lifecycle preflight, effects and last write. Retention callbacks
    * execute under this same lease, before any pane capture/paste/submit branch. */
   async operation<T>(name: string, fn: () => Promise<T>, held?: (target: GuardTarget) => Promise<T>): Promise<T> {
+    assertElasticEffectAllowed(this.db);
     const bound = this.target(name);
     const inherited = this.scope.getStore()?.get(bound.nodeId);
     if (inherited?.active && inherited.target.nodeId === bound.nodeId) {
@@ -198,6 +200,7 @@ export class SeatDeliveryGuard {
   /** Multi-seat restore takes leases in stable order before any rig mutation.
    * Nested per-seat launch joins these leases; it must not reacquire them. */
   async lifecycle<T>(nodeIds: string[], fn: () => Promise<T>): Promise<T> {
+    assertElasticEffectAllowed(this.db);
     const ids = [...new Set(nodeIds)].sort();
     const acquire = async (index: number): Promise<T> => {
       const id = ids[index]; if (!id) return fn();
@@ -227,6 +230,7 @@ export class SeatDeliveryGuard {
 
   /** Synchronous final-effect check: no await between this and issuing the write. */
   checkInput(name: string): void {
+    assertElasticEffectAllowed(this.db);
     const target = this.target(name);
     const lease = this.scope.getStore()?.get(target.nodeId);
     if (!lease) throw new DeliveryGuardError("guard_lease_required", "Input requires an active operation lease.");
@@ -262,6 +266,7 @@ export class SeatDeliveryGuard {
 
   /** Internal broker path only; never an option accepted by the send HTTP route. */
   async humanInput<T>(name: string, fn: () => Promise<T>): Promise<T> {
+    assertElasticEffectAllowed(this.db);
     const target = this.target(name);
     const inherited = this.scope.getStore()?.get(target.nodeId);
     const lease: Lease = { target, active: true, serialOwner: inherited?.active ? inherited.serialOwner : undefined, origin: "human" };

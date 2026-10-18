@@ -1,3 +1,4 @@
+import { assertElasticEffectAllowed, assertElasticSeatAllowed } from "./elastic-worker-guard.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
@@ -166,6 +167,7 @@ export class NodeLauncher {
       OPENRIG_OCCUPANT_GENERATION: occupantGeneration ?? undefined,
     });
     const openRigEnv = launchEnv(opts?.env);
+    assertElasticSeatAllowed(sessionName, node.runtime);
     const tmuxResult = await this.tmuxAdapter.createSession(sessionName, sessionCwd, openRigEnv);
     if (!tmuxResult.ok) {
       return { ok: false, code: tmuxResult.code, message: tmuxResult.message };

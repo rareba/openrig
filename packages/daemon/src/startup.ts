@@ -1,3 +1,5 @@
+import { assertElasticEffectAllowed } from "./domain/elastic-worker-guard.js";
+import { loadForegroundManifest } from "./adapters/elastic-worker-foreground.js";
 import { fileURLToPath } from "node:url";
 import { discoverTailscaleSelfNames } from "./middleware/browser-boundary.js";
 import { configureShadowCapture } from "./domain/shadow-capture.js";
@@ -306,6 +308,8 @@ export function collectAllowlistedProviderAuthEnv(
 
 /** Assemble the daemon services and runtime adapters using the selected installation assets. */
 export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> {
+  const elasticWorkerMode = process.env.OPENRIG_ELASTIC_GUARD !== undefined;
+  if (elasticWorkerMode) { loadForegroundManifest(); assertElasticEffectAllowed(undefined, { allowDraining: true }); }
   const daemonHome = os.homedir();
   const configuredCodexHome = process.env.CODEX_HOME || undefined;
   if (configuredCodexHome && !nodePath.isAbsolute(configuredCodexHome)) {
@@ -604,6 +608,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // reports activity exactly like a launched seat.
   const launchSessionEnv: Record<string, string | undefined> = {
     PATH: process.env.PATH,
+    OPENRIG_ELASTIC_GUARD: process.env.OPENRIG_ELASTIC_GUARD,
+    OPENRIG_ELASTIC_MANIFEST: process.env.OPENRIG_ELASTIC_MANIFEST,
+    OPENRIG_ELASTIC_MANIFEST_DIGEST: process.env.OPENRIG_ELASTIC_MANIFEST_DIGEST,
+    OPENRIG_ELASTIC_PI: process.env.OPENRIG_ELASTIC_PI,
     OPENRIG_HOME,
     OPENRIG_PORT: openRigPort,
     OPENRIG_HOST: openRigHost,
@@ -859,7 +867,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // user-owned Claude compaction extra-instructions placeholder.
   // Operator can disable Codex hooks via OPENRIG_RUNTIME_CODEX_HOOKS_ENABLED
   // or rig config set runtime.codex.hooks_enabled false.
-  try {
+  if (!elasticWorkerMode) try {
     const { ensureDefaultClaudeCompactionFiles } = await import("./domain/user-settings/settings-store.js");
     ensureDefaultClaudeCompactionFiles(OPENRIG_HOME);
     // The Codex config is the user's file: write it at boot only when this daemon already
@@ -920,7 +928,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       httpClient,
       logger: (...args) => console.log("[openrig]", ...args),
     });
-    await vendorService.ensureLatest("openrig-core");
+    if (elasticWorkerMode) await vendorService.ensureVendored("openrig-core");
+    else await vendorService.ensureLatest("openrig-core");
     for (const skill of ["openrig-skills", "refocusing"]) {
       try {
         vendorService.ensureSkillGlobally("openrig-core", skill, [
@@ -1089,7 +1098,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // auto-boots; other rigs require explicit operator-initiated
   // `rig up` / `rig restore` per amended IMPL-PRD §16.2.
   let kernelBootTracker: import("./domain/kernel-boot-tracker.js").KernelBootTracker | undefined;
-  try {
+  if (!elasticWorkerMode) try {
     const { bootKernelIfNeeded } = await import("./domain/kernel-boot.js");
     const degradedRaw = readOpenRigEnv("OPENRIG_KERNEL_DEGRADED_MS");
     const degradedTimeoutMs = degradedRaw && /^\d+$/.test(degradedRaw)

@@ -1,3 +1,4 @@
+import { assertElasticEffectAllowed, assertElasticSeatAllowed } from "../domain/elastic-worker-guard.js";
 // OPR.0.4.6.PI1 — the pane-hosted pi-runner (compiled entry in the daemon dist).
 //
 // The runner is what makes a Pi seat behave like a normal OpenRig tmux seat
@@ -293,6 +294,7 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
 // ── The runner core (injected effects; owns protocol state) ─────────────────
 
 export interface RunnerIo {
+  processIdentity?(): { runnerPid: number; childPid: number; runnerStartTime: string; childStartTime: string };
   /** Write one JSONL command to pi stdin. */
   sendRpc(cmd: Record<string, unknown>): void;
   /** Print a full line to the pane. */
@@ -424,6 +426,15 @@ export class RunnerCore {
   /** #1275: OMP protocol v2. The limit offered while negotiating, then the decoder once OMP accepts. */
   private v2Limit: number | null = null;
   private frameDecoder: OmpFrameDecoder | null = null;
+  private idleSequence = 0;
+  private idleRequest: string | null = null;
+  private idleProof: PiRunnerState["idleProof"];
+  pollIdle(): void {
+    if (this.runtime !== "pi" || !this.identity.launchId) return;
+    this.idleProof = undefined;
+    this.idleRequest = `elastic-idle:${++this.idleSequence}`;
+    this.io.sendRpc({ type: "get_state", id: this.idleRequest });
+  }
 
   constructor(
     private io: RunnerIo,
@@ -512,6 +523,8 @@ export class RunnerCore {
       this.handleResponse(record);
       return;
     }
+    this.idleProof = undefined;
+    this.writeSidecar({});
     this.handleEvent(record);
   }
 
@@ -524,6 +537,9 @@ export class RunnerCore {
 
   /** One aggregated paste block from pane stdin. */
   handleUserBlock(block: string): void {
+    try { assertElasticEffectAllowed(); } catch { this.io.mirrorLine("[pi-runner] input denied by worker drain/seal"); return; }
+    this.idleProof = undefined;
+    this.writeSidecar({});
     if (block === "/abort") {
       this.io.sendRpc({ type: "abort" });
       this.io.mirrorLine("[pi-runner] abort sent");
@@ -556,6 +572,13 @@ export class RunnerCore {
   }
 
   private handleResponse(record: Record<string, unknown>): void {
+    if (this.idleRequest && record.id === this.idleRequest) {
+      this.idleRequest = null;
+      const data = record.data as Record<string, unknown> | undefined;
+      const ids = this.io.processIdentity?.();
+      this.idleProof = ids && this.identity.launchId ? { at: Date.parse(this.io.now()), ...ids, launchId: this.identity.launchId, idle: this.ready && typeof data?.sessionId === "string" && typeof data?.sessionFile === "string" && record.success === true && data?.sessionId === this.sessionId && data?.sessionFile === this.sessionFile && data?.isStreaming === false && data?.isCompacting === false && data?.pendingMessageCount === 0 && !this.streaming } : undefined;
+      this.writeSidecar({}); return;
+    }
     if (record.id === NEGOTIATE_ID && this.v2Limit !== null) {
       if (record.success === true) {
         this.frameDecoder = new OmpFrameDecoder(this.v2Limit);
@@ -828,6 +851,7 @@ export class RunnerCore {
       sessionId: this.sessionId,
       lastEntryId: this.lastEntryId,
       updatedAt: this.io.now(),
+      idleProof: this.idleProof,
       ...patch,
     });
   }
@@ -1126,7 +1150,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // (or was added after it, and is then seen by the next one).
   const launchCredentialEvidence = args.openRouterCharge === true && runtime === "pi" ? credentialEvidence() : undefined;
 
-  const child = spawn(command, childArgs, {
+  assertElasticSeatAllowed(args.sessionName, runtime, args.stateRoot);
+  const elasticPi = process.env.OPENRIG_ELASTIC_GUARD ? process.env.OPENRIG_ELASTIC_PI : undefined;
+  if (process.env.OPENRIG_ELASTIC_GUARD && !elasticPi) throw Error("elastic_worker_profile_denied");
+  const child = spawn(elasticPi ? process.execPath : command, elasticPi ? [elasticPi, "--no-extensions", ...childArgs] : childArgs, {
     cwd: args.cwd,
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
@@ -1157,6 +1184,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   });
 
   const io: RunnerIo = {
+    processIdentity: () => {
+      const startTime = (pid: number) => { const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]!; };
+      return { runnerPid: process.pid, childPid: child.pid ?? -1, runnerStartTime: startTime(process.pid), childStartTime: startTime(child.pid ?? -1) };
+    },
     sendRpc: (cmd) => {
       try { child.stdin.write(`${JSON.stringify(cmd)}\n`); } catch { /* exit handler reports */ }
     },
@@ -1248,6 +1279,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // Re-deliver OMP identity until the daemon confirms the resume token.
   const identityRetry = runtime === "omp" ? setInterval(() => core.retrySessionIdentity(), IDENTITY_RETRY_MS) : undefined;
   identityRetry?.unref();
+  const elasticIdleTimer = process.env.OPENRIG_ELASTIC_GUARD ? setInterval(() => core.pollIdle(), 1000) : undefined;
+  elasticIdleTimer?.unref();
   // The last few stderr lines, so an OMP that exits during startup is
   // reported with its own words in the error, not only above it.
   const stderrTail: string[] = [];

@@ -1,3 +1,4 @@
+import { assertElasticTmuxEffectAllowed } from "../domain/elastic-worker-guard.js";
 import { DeliveryGuardError, type SeatDeliveryGuard } from "../domain/seat-delivery-guard.js";
 import { writeFile as fsWriteFile, unlink as fsUnlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -468,6 +469,7 @@ export class TmuxAdapter {
    * preserve an exact legacy string, never to smuggle new semantics.
    */
   private async run(argv: string[], legacy?: string): Promise<string> {
+    assertElasticTmuxEffectAllowed(argv);
     if (this.argvExec) return this.argvExec(argv);
     return this.exec(legacy ?? posixJoinArgv(argv));
   }

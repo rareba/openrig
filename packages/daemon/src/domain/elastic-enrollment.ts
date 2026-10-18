@@ -34,9 +34,9 @@ function keySize(key: KeyObject, type: 'public' | 'private'): number {
   return Math.ceil(bits / 8);
 }
 /** Hybrid encryption only; origin authentication must come from the exact Azure operation. */
-function seal(plaintext: Buffer, binding: EnrollmentBinding, publicKey: KeyObject, material: boolean): string {
+function seal(plaintext: Buffer, binding: EnrollmentBinding, publicKey: KeyObject, material: boolean, domain = 'openrig-worker-material-v1\0'): string {
   try {
-    keySize(publicKey, 'public'); const associated = material ? Buffer.concat([Buffer.from('openrig-worker-material-v1\0'), aad(binding)]) : aad(binding);
+    keySize(publicKey, 'public'); const associated = material ? Buffer.concat([Buffer.from(domain), aad(binding)]) : aad(binding);
     if (!Buffer.isBuffer(plaintext) || plaintext.length < 1 || plaintext.length > (material ? 64 * 1024 : 1024)) fail();
     const key = randomBytes(32); const iv = randomBytes(12);
     try {
@@ -49,9 +49,9 @@ function seal(plaintext: Buffer, binding: EnrollmentBinding, publicKey: KeyObjec
   } catch { return fail(); }
 }
 /** Accept exactly one complete bounded JSON envelope, bound to the persisted attempt. */
-function open(envelope: string, expected: EnrollmentBinding, privateKey: KeyObject, material: boolean): Buffer {
+function open(envelope: string, expected: EnrollmentBinding, privateKey: KeyObject, material: boolean, domain = 'openrig-worker-material-v1\0'): Buffer {
   try {
-    const size = keySize(privateKey, 'private'); const expectedAad = aad(expected); const associated = material ? Buffer.concat([Buffer.from('openrig-worker-material-v1\0'), expectedAad]) : expectedAad;
+    const size = keySize(privateKey, 'private'); const expectedAad = aad(expected); const associated = material ? Buffer.concat([Buffer.from(domain), expectedAad]) : expectedAad;
     if (typeof envelope !== 'string' || Buffer.byteLength(envelope) > (material ? 96 * 1024 : 4096)) fail();
     const parsed: unknown = JSON.parse(envelope);
     if (!object(parsed) || Object.keys(parsed).sort().join(',') !== 'binding,ciphertext,iv,tag,wrappedKey' || !aad(parsed.binding).equals(expectedAad)) fail();
@@ -72,3 +72,15 @@ export function openEnrollment(envelope: string, expected: EnrollmentBinding, pr
 /** Separate AAD domain and 64 KiB plaintext limit for protected Run Command configuration input. */
 export function sealWorkerMaterial(plaintext: Buffer, binding: EnrollmentBinding, publicKey: KeyObject): string { return seal(plaintext, binding, publicKey, true); }
 export function openWorkerMaterial(envelope: string, expected: EnrollmentBinding, privateKey: KeyObject): Buffer { return open(envelope, expected, privateKey, true); }
+
+/** Scoped transfer authorization is never interchangeable with runtime material or the fleet bearer. */
+export function sealCheckpointCapability(plaintext: Buffer, binding: EnrollmentBinding, publicKey: KeyObject): string {
+  if (plaintext.length > 8192) fail();
+  return seal(plaintext, binding, publicKey, true, 'openrig-worker-checkpoint-capability-v1\0');
+}
+export function openCheckpointCapability(envelope: string, binding: EnrollmentBinding, privateKey: KeyObject): Buffer {
+  if (Buffer.byteLength(envelope) > 16384) fail();
+  const result = open(envelope, binding, privateKey, true, 'openrig-worker-checkpoint-capability-v1\0');
+  if (result.length > 8192) { result.fill(0); fail(); }
+  return result;
+}

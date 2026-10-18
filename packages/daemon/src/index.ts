@@ -1,3 +1,5 @@
+import { createElasticForegroundProbe } from "./adapters/elastic-worker-foreground.js";
+import { assertElasticEffectAllowed } from "./domain/elastic-worker-guard.js";
 import { serve, type ServerType } from "@hono/node-server";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -244,6 +246,7 @@ async function isTrustedLocalOrTailnetBind(host: string): Promise<boolean> {
 }
 
 export async function startServer(port?: number) {
+  assertElasticEffectAllowed(undefined, { allowDraining: true });
   const p = port ?? parseInt(readOpenRigEnv("OPENRIG_PORT", "RIGGED_PORT") ?? "7433", 10);
   // D15 — anchor the default db under OPENRIG_HOME, never a bare CWD-relative
   // filename (which could open the shared fleet db). Explicit OPENRIG_DB wins.
@@ -309,6 +312,7 @@ export async function startServer(port?: number) {
   const disarmStartupSignals = endProbeGroupsOnStartupSignal();
   const { app, contextMonitor, deps, eventLoopMonitor, injectWebSocket } = await createDaemon({
     dbPath,
+    elasticWorkerProbe: createElasticForegroundProbe(dbPath),
     bearerToken,
     terminalBearerToken,
     // S20 — the effective bind plan rides the health surface so adoption gates verify

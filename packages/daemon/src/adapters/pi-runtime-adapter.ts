@@ -1,3 +1,4 @@
+import { assertElasticEffectAllowed, assertElasticSeatAllowed } from "../domain/elastic-worker-guard.js";
 // OPR.0.4.6.PI1 — the Pi runtime adapter (RPC-first, runner-in-a-pane).
 //
 // The adapter launches the OpenRig-owned pi-runner inside the seat's normal
@@ -247,6 +248,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     }
 
     const sessionName = binding.tmuxSession;
+    assertElasticSeatAllowed(sessionName, this.runtime, this.stateRoot);
     const paths = piSeatPaths(this.stateRoot, sessionName);
     this.fs.mkdirp(paths.agentDir);
     this.fs.mkdirp(paths.sessionsDir);
@@ -290,6 +292,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       ? await this.seatLaunchEnvironment.command(sessionName, cmd, { nodeId: binding.nodeId, generation: binding.launchGeneration, runtime: this.runtime })
       : cmd;
     // Stage long commands without leaving a shell above the live runner.
+    assertElasticEffectAllowed();
     let textResult = await this.tmux.sendShellCommand(sessionName, command, undefined, { stageIfLong: true, execInScript: true });
     // This refusal precedes any input: retain the bare-command fallback when routing cannot fit.
     if (!textResult.ok && textResult.code === "launch_path_too_long" && command !== cmd) {

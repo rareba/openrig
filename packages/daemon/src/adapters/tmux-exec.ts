@@ -1,3 +1,4 @@
+import { assertElasticTmuxEffectAllowed } from "../domain/elastic-worker-guard.js";
 import { exec, execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
@@ -86,7 +87,7 @@ export const execArgvCommand: ArgvExecFn = async (argv: string[]): Promise<strin
   // Nothing ran when no file was found: a shell also finds tmux through an entry the lookup skips, such as a literal
   // `~/bin`, and reports a missing one as the shell transport does.
   const opts = { windowsHide: true, maxBuffer: TMUX_MAX_BUFFER };
-  const run = (file: string | null) => file ? execFileAsync(file, args, opts) : execFileAsync("/bin/sh", ["-c", 'exec "$0" "$@"', bin, ...args], opts);
+  const run = (file: string | null) => { assertElasticTmuxEffectAllowed(argv); return file ? execFileAsync(file, args, opts) : execFileAsync("/bin/sh", ["-c", 'exec "$0" "$@"', bin, ...args], opts); };
   try {
     if (process.platform === "win32") return (await execFileAsync(bin, args, opts)).stdout;
     const file = resolvedOnPath(bin);
@@ -112,6 +113,7 @@ export const execArgvCommand: ArgvExecFn = async (argv: string[]): Promise<strin
 export async function spawnTmuxClient(args: string[]): Promise<ChildProcessWithoutNullStreams> {
   const opts = { stdio: "pipe" as const, windowsHide: true };
   const started = (file: string | null) => new Promise<ChildProcessWithoutNullStreams>((resolve, reject) => {
+    assertElasticTmuxEffectAllowed(args);
     const child = file ? spawn(file, args, opts) : spawn("/bin/sh", ["-c", 'exec "$0" "$@"', "tmux", ...args], opts);
     child.once("error", reject);
     child.once("spawn", () => {

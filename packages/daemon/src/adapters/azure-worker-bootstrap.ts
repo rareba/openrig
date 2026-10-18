@@ -169,25 +169,8 @@ export class AzureWorkerBootstrap {
       if (!probe.checkpointAcknowledged) reject(); this.persist('checkpoint.json', { identity, generation, checkpoint });
     });
   }
-  seal(identity: ElasticWorkerIdentity, generation: number, operationId: string): AzureRemovalSeal {
-    return this.guarded(() => {
-      const state = this.requireState(identity, generation); if (state.phase === 'ready' || !state.drainStartedAt || !operationId || operationId.length > 512) reject();
-      const saved = JSON.parse(readFileSync(this.path('checkpoint.json'), 'utf8')) as { identity: ElasticWorkerIdentity; generation: number; checkpoint: WorkerCheckpoint };
-      if (workerDigest(saved.identity) !== workerDigest(identity) || saved.generation !== generation) reject();
-      const before = this.probe(saved.checkpoint);
-      const scope = (proof: WorkerProcessProof) => proof.uid === this.manifest.uid && proof.cgroup === `/system.slice/${this.manifest.unit}`;
-      if (!before.clean || !scope(before.process)) reject();
-      this.control.sealAdmission(identity, generation); this.os.installSealMarker(); this.os.stopUnit();
-      const after = this.probe(saved.checkpoint); const stable = this.probe(saved.checkpoint);
-      if (!after.clean || !stable.clean || !scope(after.process) || !scope(stable.process)
-        || after.process.processes !== 0 || stable.process.processes !== 0
-        || after.ledger.digest !== before.ledger.digest || stable.ledger.digest !== after.ledger.digest
-        || after.filesystem.digest !== before.filesystem.digest || stable.filesystem.digest !== after.filesystem.digest) reject();
-      const receipt: AzureRemovalSeal = { workerId: identity.workerId, vmId: identity.vmId, operationId,
-        observedAt: stable.observedAt, drainConfirmedAt: state.drainStartedAt, drainGeneration: String(generation),
-        beginDrainConfirmed: true, fenced: true, active: 0, claims: 0, processes: 0, pendingTransfers: false,
-        pendingActivationIntents: false, coordinatorCheckpointAcknowledged: true, clean: true, pendingHumanReturns: false };
-      this.persist('seal.json', receipt); return receipt;
-    });
+  /** Pre-stop manifest acknowledgement cannot establish final custody. Use LinuxWorkerLifecycle. */
+  seal(_identity: ElasticWorkerIdentity, _generation: number, _operationId: string): AzureRemovalSeal {
+    return reject();
   }
 }

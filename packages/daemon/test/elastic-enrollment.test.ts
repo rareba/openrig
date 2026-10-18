@@ -1,6 +1,6 @@
 import { generateKeyPairSync } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { sealEnrollment, openEnrollment } from '../src/domain/elastic-enrollment.js';
+import { sealEnrollment, openEnrollment, sealCheckpointCapability, openCheckpointCapability, openWorkerMaterial } from '../src/domain/elastic-enrollment.js';
 const keys = generateKeyPairSync('rsa', { modulusLength: 3072 });
 const other = generateKeyPairSync('rsa', { modulusLength: 3072 });
 const binding = { version: 1 as const, resourceId: '/subscriptions/a/resourceGroups/b/providers/Microsoft.Compute/virtualMachineScaleSets/c', vmId: '11111111-1111-4111-8111-111111111111', nonce: Buffer.alloc(32, 7).toString('base64'), manifestDigest: 'a'.repeat(64), operationId: 'operation-1', fleetEpoch: 'epoch-1' };
@@ -38,4 +38,8 @@ describe('sealed Azure enrollment', () => {
   expect(()=>openEnrollment(envelope,{...binding,version:2} as never,keys.privateKey)).toThrow('invalid_enrollment');
  });
 
+});
+
+describe('scoped checkpoint capability codec',()=>{
+ it('binds encrypted capability to the original prepared key/attempt in a separate domain',()=>{const bytes=Buffer.from(JSON.stringify({checkpointId:'a'.repeat(64),token:'private-scoped-capability'}));const envelope=sealCheckpointCapability(bytes,binding,keys.publicKey);expect(envelope).not.toContain('private-scoped-capability');expect(openCheckpointCapability(envelope,binding,keys.privateKey)).toEqual(bytes);expect(()=>openWorkerMaterial(envelope,binding,keys.privateKey)).toThrow();expect(()=>openEnrollment(envelope,binding,keys.privateKey)).toThrow();expect(()=>openCheckpointCapability(envelope,{...binding,fleetEpoch:'wrong'},keys.privateKey)).toThrow();expect(()=>sealCheckpointCapability(Buffer.alloc(8193),binding,keys.publicKey)).toThrow();});
 });

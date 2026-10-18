@@ -12,7 +12,7 @@ export interface WorkerCheckpoint { digest: string; files: WorkerFileProof[]; re
 export interface WorkerProcessProof { observedAt: number; complete: boolean; idle: boolean; processes: number; uid: number; cgroup: string }
 export interface ElasticWorkerProbe {
   version: 1; observedAt: number; state: ElasticWorkerState; ledger: ElasticWorkerLedger;
-  filesystem: WorkerFilesystemProof; process: WorkerProcessProof; checkpointAcknowledged: boolean; clean: boolean;
+  filesystem: WorkerFilesystemProof; process: WorkerProcessProof; checkpointAcknowledged: boolean; drainEligible?: boolean | null; clean: boolean;
 }
 function inside(path: string, root: string): boolean { return path === root || path.startsWith(root + sep); }
 function git(cwd: string, args: string[]): string {
@@ -22,7 +22,7 @@ function git(cwd: string, args: string[]): string {
     env: { ...inherited, GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: '', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } });
 }
 /** Owned roots are a trusted enrollment inventory, not worker-provided deletion exemptions. */
-export function inspectWorkerFilesystem(ownedRoots: readonly string[], declaredCwds: readonly string[]): WorkerFilesystemProof {
+export function inspectWorkerFilesystem(ownedRoots: readonly string[], declaredCwds: readonly string[], excludedSqlitePaths: readonly string[] = []): WorkerFilesystemProof {
   const blockers = new Set<string>(); const files: WorkerFileProof[] = []; const refs: WorkerRefProof[] = [];
   const roots: string[] = []; const repositories = new Set<string>(); const visited = new Set<string>(); let bytes = 0;
   try {
@@ -57,6 +57,7 @@ export function inspectWorkerFilesystem(ownedRoots: readonly string[], declaredC
     };
 
     const walk = (path: string) => {
+      if (excludedSqlitePaths.some(p => path === p || path === `${p}-wal` || path === `${p}-shm`)) return;
       if (visited.has(path)) return; visited.add(path);
       if (visited.size > 100_000) throw Error();
       const stat = lstatSync(path); if (stat.isSymbolicLink()) throw Error();
@@ -119,14 +120,15 @@ export function verifyWorkerCheckpoint(proof: WorkerFilesystemProof, checkpoint:
     && workerDigest({ files: checkpoint.files, refs: checkpoint.refs }) === proof.digest;
 }
 export function inspectElasticWorker(options: { control: ElasticWorkerControl; ownedRoots: string[]; declaredCwds: string[];
-  processes: WorkerProcessProof; checkpoint?: WorkerCheckpoint | null; now?: number }): ElasticWorkerProbe {
+  processes: WorkerProcessProof; checkpoint?: WorkerCheckpoint | null; now?: number; sqlitePaths?: string[] }): ElasticWorkerProbe {
   const state = options.control.read(); if (!state) throw Error('elastic_worker_unavailable');
   const observedAt = options.now ?? Date.now(); const ledger = options.control.ledger();
-  const filesystem = inspectWorkerFilesystem(options.ownedRoots, options.declaredCwds);
+  const filesystem = inspectWorkerFilesystem(options.ownedRoots, options.declaredCwds, options.sqlitePaths);
   const checkpointAcknowledged = verifyWorkerCheckpoint(filesystem, options.checkpoint ?? null);
   const process = options.processes;
   const processFresh = process.complete && process.observedAt <= observedAt && observedAt - process.observedAt <= 5_000
     && process.uid > 0 && process.cgroup.length > 0 && Number.isSafeInteger(process.processes) && process.processes >= 0;
   return { version: 1, observedAt, state, ledger, filesystem, process, checkpointAcknowledged,
-    clean: ledger.clean && filesystem.complete && filesystem.blockers.length === 0 && checkpointAcknowledged && processFresh && process.idle };
+    drainEligible: ledger.complete && filesystem.complete && processFresh ? ledger.clean && filesystem.blockers.length === 0 && process.idle && state.phase !== 'sealed' : null,
+    clean: state.phase === 'sealed' && process.processes === 0 && ledger.clean && filesystem.complete && filesystem.blockers.length === 0 && checkpointAcknowledged && processFresh && process.idle };
 }

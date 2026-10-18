@@ -1,3 +1,4 @@
+import { assertElasticTmuxEffectAllowed } from "../domain/elastic-worker-guard.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { spawnTmuxClient, TMUX_MAX_BUFFER } from "./tmux-exec.js";
@@ -489,6 +490,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
         reject(NOT_WRITTEN);
         return;
       }
+      assertElasticTmuxEffectAllowed(args);
       if (target.replies.waiting === 0) target.headSince = now();
       target.replies.expect({ resolve, reject });
       target.child.stdin.write(`${args.map(quote).join(" ")}\n`);

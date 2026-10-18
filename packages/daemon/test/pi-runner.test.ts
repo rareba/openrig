@@ -731,3 +731,26 @@ describe("cursor refresh via get_entries (QA RED, qitem-20260707020922)", () => 
     expect(f.sidecars.at(-1)!.lastEntryId).toBe("e5");
   });
 });
+
+describe('elastic launch-scoped native idle evidence', () => {
+  it('requires an actual fresh get_state reply, rejects busy/unknown fields and invalidates on input/events', () => {
+    const f = fakeIo();
+    f.io.processIdentity = () => ({runnerPid: 123, childPid: 456, runnerStartTime:"1", childStartTime:"2"});
+    const core = new RunnerCore(f.io, {sessionName: SESSION, launchId: 'exact-launch'});
+    core.start();
+    core.handlePiLine(JSON.stringify({type:'response', id:'pi-runner-get-state', success:true, data:{sessionId:'id',sessionFile:SESSION_FILE}}));
+    core.pollIdle();
+    const reply = (data: Record<string, unknown>) => core.handlePiLine(JSON.stringify({type:'response', id:f.rpc.at(-1)!.id, success:true, data:{sessionId:"id", sessionFile:SESSION_FILE, ...data}}));
+    reply({isStreaming:false,isCompacting:false,pendingMessageCount:0});
+    expect(f.sidecars.at(-1)?.idleProof).toMatchObject({idle:true,launchId:'exact-launch',runnerPid:123,childPid:456});
+    core.handleUserBlock('next input');
+    expect(f.sidecars.at(-1)?.idleProof).toBeUndefined();
+    core.pollIdle();reply({isStreaming:false,isCompacting:true,pendingMessageCount:0});
+    expect(f.sidecars.at(-1)?.idleProof?.idle).toBe(false);
+    core.pollIdle();reply({isStreaming:false,isCompacting:false});
+    expect(f.sidecars.at(-1)?.idleProof?.idle).toBe(false);
+    core.pollIdle();reply({isStreaming:false,isCompacting:false,pendingMessageCount:0});
+    core.handlePiLine(JSON.stringify({type:'tool_execution_start',toolName:'bash'}));
+    expect(f.sidecars.at(-1)?.idleProof).toBeUndefined();
+  });
+});
