@@ -135,3 +135,17 @@ python3 -m unittest discover -s integrations/hermes-openrig/tests
 ```
 
 These are hermetic SQLite/API and fake-adapter tests. They do not contact WhatsApp, create credentials or prove a real phone delivery. A live test requires the verified binding and a clearly synthetic question; preserve the distinction between synthetic interface proof and a genuine human decision.
+
+### OpenRig sender configuration
+
+Keep recipient identity in `human-relay.json` version 1 `bindings`. Add a separate optional `webhooks` array; transport settings never enter legacy WhatsApp delivery or response hashes:
+
+```json
+{"version":1,"bindings":[{"connectorId":"hermes","humanSession":"human@kernel","profile":"default","chatId":"VERIFIED_CHAT","senderId":"VERIFIED_SENDER"}],"webhooks":[{"connectorId":"hermes","profile":"default","channel":"whatsapp","mode":"pull-bridge","endpointUrl":"http://127.0.0.1:8644/hooks/openrig-human-relay"}]}
+```
+
+`pull-bridge` is for an outbound-only Hermes installation with an existing loopback listener. It excludes the target from OpenRig's HTTP push scheduler. The authenticated `webhook-pull` route leases the same immutable native outbox event; the local bridge passes it through the real HMAC-authenticated Hermes webhook and confirms its exact durable acknowledgment through `webhook-accepted`. The platform receipt remains separate. This proves a polling bridge into a local webhook, not remote inbound reachability.
+
+For directly reachable trusted receivers use `mode: "push"` (default) and a `secretFile` readable by that OpenRig daemon, containing the configured plain route secret. The deterministic scheduler claims at most two events per target/pass, signs Standard Webhooks headers, disables redirects, and accepts only the matching `openrig.human-relay.v1` acceptance receipt. Endpoint or mode changes hold outstanding webhook attempts and prevent an already accepted offline receiver from sending. Uncertain HTTP retries keep the original attempt and fingerprint; uncertain platform sends require reconciliation.
+
+All relay operations require the existing mission-control bearer. Remote origins resolve only through OpenRig's server-side host registry. Payloads cannot nominate callback URLs or a human actor. `/validate` confirms the current recipient, attempt, transport, pending state and request revision without inventing a platform message receipt. `/respond` continues to use the native human-response writer.

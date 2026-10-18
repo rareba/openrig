@@ -14,7 +14,7 @@ export function humanRelayRoutes(opts: {
 }): Hono {
     const app = new Hono();
     const native = humanResponsesRoutes(opts);
-    for (const operation of ["pull", "receipt", "context", "respond"] as const) {
+    for (const operation of ["pull", "webhook-pull", "webhook-accepted", "receipt", "validate", "context", "respond"] as const) {
         app.post(`/human-relay/${operation}`, authBearerTokenMiddleware({ expectedToken: opts.bearerToken ?? null }), async (c) => {
             let body: Record<string, unknown>;
             try {
@@ -48,8 +48,14 @@ export function humanRelayRoutes(opts: {
             try {
                 if (operation === "pull")
                     return c.json(opts.service.pull(body));
+                if (operation === "webhook-pull")
+                    return c.json(opts.service.webhookPull(body));
+                if (operation === "webhook-accepted")
+                    return c.json(opts.service.webhookAccepted(body));
                 if (operation === "receipt")
                     return c.json(opts.service.receipt(body));
+                if (operation === "validate")
+                    return c.json(opts.service.validate(body));
                 if (operation === "context")
                     return c.json(opts.service.context(body));
                 const input = opts.service.responseInput(body);

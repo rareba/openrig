@@ -216,6 +216,7 @@ export interface AppDeps {
   githubIntakeService?: import("./domain/github-intake.js").GithubIntakeService;
   githubIntakeScheduler?: import("./domain/github-poll-scheduler.js").PollScheduler;
   humanRelayService?: import("./domain/human-relay.js").HumanRelayService;
+  humanRelayScheduler?: import("./domain/github-poll-scheduler.js").PollScheduler;
   humanResponseScheduler?: import("./domain/github-poll-scheduler.js").PollScheduler;
   /** S02 — the standing stuck sweep's observable heartbeat (ADDITIVE on healthz;
    *  absent = legacy body). Set by the index.ts scheduler when the loop starts. */

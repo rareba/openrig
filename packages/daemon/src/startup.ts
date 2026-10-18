@@ -19,6 +19,7 @@ import { migrate } from "./db/migrate.js";
 import { ALL_MIGRATIONS } from "./db/all-migrations.js";
 import { GithubIntakeService } from "./domain/github-intake.js";
 import { HumanRelayService, loadHumanRelayBindings } from "./domain/human-relay.js";
+import { HumanRelayWebhookDispatcher, loadHumanRelayWebhooks } from "./domain/human-relay-webhook.js";
 import { recoverHumanResponseReturns } from "./domain/human-response-recovery.js";
 import { PollScheduler } from "./domain/github-poll-scheduler.js";
 import { createGithubIntakeIO } from "./adapters/github-intake.js";
@@ -2581,8 +2582,9 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // /api browser boundary: this machine's exact Tailscale MagicDNS name, looked up on demand.
   deps.selfNameDiscovery = () => discoverTailscaleSelfNames({ timeoutMs: 1500 });
   deps.humanRelayService = new HumanRelayService(db, queueRepoInstance, {
-    bindings: () => loadHumanRelayBindings(OPENRIG_HOME), hostId: getSelfHostId,
+    bindings: () => loadHumanRelayBindings(OPENRIG_HOME), webhooks: () => loadHumanRelayWebhooks(OPENRIG_HOME), hostId: getSelfHostId,
   });
+  deps.humanRelayScheduler = new PollScheduler(new HumanRelayWebhookDispatcher(deps.humanRelayService, { targets: () => loadHumanRelayWebhooks(OPENRIG_HOME) }), message => console.error(`[human-relay] ${message}`));
   deps.githubIntakeService = new GithubIntakeService(db, queueRepoInstance, createGithubIntakeIO({
     queue: queueRepoInstance,
     localNodes: async () => {

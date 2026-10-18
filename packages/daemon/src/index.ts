@@ -339,6 +339,7 @@ export async function startServer(port?: number) {
         deps.watchdogScheduler?.start();
         deps.githubIntakeScheduler?.start();
         deps.humanResponseScheduler?.start();
+        deps.humanRelayScheduler?.start();
         // S10 — start the gateway subsystem's NETWORK services (replay, outbound poll,
         // Socket Mode inbound) post-bind, contextMonitor pattern: the composed wire is
         // already active; only its dial-out half waits for the supervision tree.
@@ -398,6 +399,7 @@ export async function startServer(port?: number) {
       ["health-diagnosis", () => deps.healthDiagnosis?.stop()],
       ["github-intake", () => deps.githubIntakeScheduler?.stop()],
       ["human-response", () => deps.humanResponseScheduler?.stop()],
+      ["human-relay", () => deps.humanRelayScheduler?.stop()],
       ["watchdog", () => deps.watchdogScheduler?.stop()],
       ["seat-activity", () => deps.seatActivityService?.stop()],
       ["seat-structural-activity", () => deps.seatStructuralActivityService?.stop()],
