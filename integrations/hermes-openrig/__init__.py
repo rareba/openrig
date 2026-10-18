@@ -618,18 +618,22 @@ class RelayPlugin:
         try:
             argument = text[len(command):].strip()
             if command == '/choose':
+                failure_code = 'choice_integer'
                 numbers = [int(part) for part in argument.split()]
                 if len(numbers) == 1 and len(d['questions']) == 1:
                     numbers = [1, numbers[0]]
+                failure_code = 'choice_arity' if len(numbers) != 2 else 'choice_range'
                 if len(numbers) != 2 or any(n < 1 for n in numbers):
                     raise ValueError('Choose a question and option number.')
                 question = d['questions'][numbers[0] - 1]
                 option = question['options'][numbers[1] - 1]
                 response = {'kind': 'choice', 'questionId': question['id'], 'optionId': option['id']}
             else:
+                failure_code = 'answer_empty'
                 if not argument:
                     raise ValueError('An explicit answer or clarification is required.')
                 response = {'kind': 'custom' if command == '/answer' else 'clarification', 'text': argument}
+            failure_code = 'native_identity_missing'
             if not event.message_id:
                 raise ValueError('Native inbound message identity is required.')
         except (ValueError, IndexError):
@@ -648,7 +652,16 @@ class RelayPlugin:
                 [channel, d['profile'], d['chatId'], d['senderId'], quoted_id, event.message_id],
                 separators=(',', ':')).encode()).hexdigest()
             self.schedule_notice(notice_id, validation=(d['chatId'], event.message_id, channel, guidance))
-            return {'action': 'skip', 'reason': 'Malformed OpenRig reply; no answer was queued. question_ref=' + question_ref}
+            raw = getattr(event, 'raw_message', None)
+            raw_id_matches = isinstance(raw, dict) and raw.get('messageId') == event.message_id
+            text_matches = raw['body'].strip() == event.text.strip() if isinstance(raw, dict) and isinstance(raw.get('body'), str) else None
+            diagnostic = (f'code={failure_code} question_ref={question_ref} '
+                          f'question_count={min(len(d["questions"]), 256)} '
+                          f'argument_token_count={min(len(argument.split()), 256)} '
+                          f'line_count={min(len(text.splitlines()), 256)} native_id_present={bool(event.message_id)} '
+                          f'native_id_matches_raw={raw_id_matches} text_matches_native_body={text_matches} '
+                          f'native_text_batch_marker={hasattr(event, "_last_chunk_len")}')
+            return {'action': 'skip', 'reason': 'Malformed OpenRig reply; no answer was queued. ' + diagnostic}
         payload = {**base, 'messageId': event.message_id, 'qitemId': d['qitemId'],
                    'requestRevision': d['requestRevision'], 'response': response}
         identity = hashlib.sha256(json.dumps([channel, d['profile'], d['chatId'], d['senderId'], event.message_id], separators=(',', ':')).encode()).hexdigest()

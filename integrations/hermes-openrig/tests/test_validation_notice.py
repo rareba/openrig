@@ -47,3 +47,26 @@ class ValidationNoticeTests(unittest.IsolatedAsyncioTestCase):
   self.adapter.ambiguous=True
   result=await self.plugin.handle_event(event('/choose'));await asyncio.sleep(0)
   self.assertEqual(result['action'],'skip');self.assertEqual(self.ctx.state.get('inbound',{}),{});self.assertEqual(self.transport.calls,[])
+
+ async def test_failure_codes_distinguish_causes_without_message_content(self):
+  cases=[('/choose secret-invalid-token','native-id','choice_integer',1,1),
+         ('/choose','native-id','choice_arity',0,1),
+         ('/choose 99','native-id','choice_range',1,1),
+         ('/choose 0','native-id','choice_range',1,1),
+         ('/answer','native-id','answer_empty',0,1),
+         ('/choose 1',None,'native_identity_missing',1,1),
+         ('/choose 1\n/choose 1','native-id','choice_integer',3,2)]
+  for text,message_id,code,tokens,lines in cases:
+   with self.subTest(code=code,tokens=tokens,lines=lines):
+    e=event(text);e.message_id=message_id
+    e.raw_message={'body':'/choose 1' if lines>1 else text,'messageId':message_id}
+    if lines>1:e._last_chunk_len=9
+    reason=(await self.plugin.handle_event(e))['reason'];await asyncio.sleep(0)
+    self.assertIn('code='+code,reason);self.assertIn('question_count=1',reason)
+    self.assertIn('argument_token_count='+str(tokens),reason);self.assertIn('line_count='+str(lines),reason)
+    self.assertIn('native_id_present='+str(bool(message_id)),reason)
+    self.assertIn('native_id_matches_raw=True',reason)
+    self.assertIn('text_matches_native_body='+str(lines==1),reason)
+    self.assertIn('native_text_batch_marker='+str(lines>1),reason)
+    self.assertNotIn('secret-invalid-token',reason);self.assertNotIn('native-id',reason)
+  self.assertEqual(self.ctx.state.get('inbound',{}),{});self.assertEqual(self.transport.calls,[])
