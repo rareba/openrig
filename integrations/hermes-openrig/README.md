@@ -85,7 +85,7 @@ In the existing Hermes plugin settings:
 
 ```yaml
 delivery_mode: webhook-bridge
-bridge_url: http://127.0.0.1:8644/hooks/openrig-human-relay
+bridge_url: http://127.0.0.1:8644/webhooks/openrig-human-relay
 bridge_secret_file: /EXISTING/LOCAL/HERMES-ROUTE-SECRET
 bridge_channels: [whatsapp]
 origin_hosts: [local, azure, azure2, azure3]
@@ -141,7 +141,7 @@ These are hermetic SQLite/API and fake-adapter tests. They do not contact WhatsA
 Keep recipient identity in `human-relay.json` version 1 `bindings`. Add a separate optional `webhooks` array; transport settings never enter legacy WhatsApp delivery or response hashes:
 
 ```json
-{"version":1,"bindings":[{"connectorId":"hermes","humanSession":"human@kernel","profile":"default","chatId":"VERIFIED_CHAT","senderId":"VERIFIED_SENDER"}],"webhooks":[{"connectorId":"hermes","profile":"default","channel":"whatsapp","mode":"pull-bridge","endpointUrl":"http://127.0.0.1:8644/hooks/openrig-human-relay"}]}
+{"version":1,"bindings":[{"connectorId":"hermes","humanSession":"human@kernel","profile":"default","chatId":"VERIFIED_CHAT","senderId":"VERIFIED_SENDER"}],"webhooks":[{"connectorId":"hermes","profile":"default","channel":"whatsapp","mode":"pull-bridge","endpointUrl":"http://127.0.0.1:8644/webhooks/openrig-human-relay"}]}
 ```
 
 `pull-bridge` is for an outbound-only Hermes installation with an existing loopback listener. It excludes the target from OpenRig's HTTP push scheduler. The authenticated `webhook-pull` route leases the same immutable native outbox event; the local bridge passes it through the real HMAC-authenticated Hermes webhook and confirms its exact durable acknowledgment through `webhook-accepted`. The platform receipt remains separate. This proves a polling bridge into a local webhook, not remote inbound reachability.

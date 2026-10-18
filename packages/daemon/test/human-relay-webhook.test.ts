@@ -11,7 +11,7 @@ import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { HumanRelayService, type HumanRelayBinding } from "../src/domain/human-relay.js";
 import { HumanRelayWebhookDispatcher, type HumanRelayWebhookTarget } from "../src/domain/human-relay-webhook.js";
 const binding: HumanRelayBinding = { connectorId: "hermes", humanSession: "human@kernel", profile: "default", chatId: "chat", senderId: "person" };
-const target: HumanRelayWebhookTarget = { connectorId: "hermes", profile: "default", channel: "whatsapp", endpointUrl: "http://127.0.0.1:8644/hooks/openrig-human-relay", secretFile: "/configured/secret" };
+const target: HumanRelayWebhookTarget = { connectorId: "hermes", profile: "default", channel: "whatsapp", endpointUrl: "http://127.0.0.1:8644/webhooks/openrig-human-relay", secretFile: "/configured/secret" };
 describe("durable human webhook delivery", () => {
   let db: Database.Database, queue: QueueRepository, service: HumanRelayService, now: number;
   beforeEach(() => { db = createDb(); migrate(db, ALL_MIGRATIONS); queue = new QueueRepository(db, new EventBus(db), { validateRig: () => true }); now = 100000; service = make(); });
