@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { parseLinuxManifest } from '../src/adapters/linux-privileged-worker-boundary.js';
 import { preparationPlanSchema } from '../src/adapters/elastic-worker-prepare.js';
 import { createDaemon } from '../src/startup.js';
+import { assertElasticUnitStartAllowed } from '../src/domain/elastic-worker-guard.js';
 
 const fixture = vi.hoisted(() => ({
   preparationPath: '/etc/openrig-elastic/preparation.json',
@@ -16,6 +17,7 @@ vi.mock('../src/domain/kernel-boot.js', () => ({ bootKernelIfNeeded: fixture.boo
 vi.mock('../src/domain/elastic-worker-guard.js', async original => ({
   ...await original<typeof import('../src/domain/elastic-worker-guard.js')>(),
   assertElasticEffectAllowed: vi.fn(),
+  assertElasticUnitStartAllowed: vi.fn(),
 }));
 vi.mock('../src/adapters/elastic-worker-foreground.js', async original => ({
   ...await original<typeof import('../src/adapters/elastic-worker-foreground.js')>(),
@@ -70,6 +72,7 @@ it('composes an opted-in finite Pi worker without default kernel rows or unrelat
     expect(fixture.noFollowRead).toHaveBeenCalledExactlyOnceWith(fixture.preparationPath, 65536);
     expect(fixture.loadForegroundManifest).toHaveBeenCalledTimes(2);
     expect(fixture.boot).not.toHaveBeenCalled();
+    expect(assertElasticUnitStartAllowed).toHaveBeenCalledOnce();
     expect(daemon.db.prepare('SELECT * FROM nodes').all()).toEqual([]);
     expect(commands.some(command => /codex|claude|omp/.test(command))).toBe(false);
     expect(daemon.deps.kernelBootTracker).toBeUndefined();
