@@ -47,6 +47,12 @@ export class ElasticFleetProjection implements GithubIntakeAdmission {
             }
         }).immediate();
     }
+    retire(attempt: ElasticWorkerAttempt): void {
+        this.db.transaction(() => {
+            this.db.prepare('DELETE FROM elastic_target_projection WHERE worker_id=?').run(attempt.workerId);
+            this.db.prepare('DELETE FROM elastic_idle_windows WHERE worker_id=?').run(attempt.workerId);
+        }).immediate();
+    }
     private rows() { return (this.db.prepare('SELECT revision,projection FROM elastic_target_projection ORDER BY host,session').all() as {
         revision: string;
         projection: string;

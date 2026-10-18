@@ -98,3 +98,9 @@ it('requires a sealed capability for the fixed upload command without accepting 
  expect(parseHelperPayload('final-checkpoint-upload',{binding,capabilityEnvelope:'sealed'})).toEqual({binding,capabilityEnvelope:'sealed'});
  for(const value of [{binding},{binding,capabilityEnvelope:''},{binding,capabilityEnvelope:'sealed',verified:true},{binding:{...binding,drainGeneration:0},capabilityEnvelope:'sealed'}])expect(()=>parseHelperPayload('final-checkpoint-upload',value)).toThrow();
 });
+
+it('requires an exact positive final status round and nonce in the root helper DTO',()=>{
+ const binding={workerId:'worker',vmId:'11111111-1111-4111-8111-111111111111',manifestDigest:'a'.repeat(64),fleetEpoch:'epoch',drainGeneration:1,removalOperationId:'original-drain'};
+ expect(parseHelperPayload('seal-status',{binding,round:1,nonce:'a'.repeat(64)})).toEqual({binding,round:1,nonce:'a'.repeat(64)});
+ for(const value of [{binding},{binding,round:0,nonce:'a'.repeat(64)},{binding,round:1,nonce:'short'},{binding,round:1,nonce:'a'.repeat(64),clean:true}]) expect(()=>parseHelperPayload('seal-status',value)).toThrow();
+});

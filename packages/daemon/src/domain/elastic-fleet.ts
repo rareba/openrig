@@ -27,7 +27,7 @@ export interface FleetIO {
   /** Advance a confirmed pending operation. Unknown operations are only inspected. */
   advanceOperation?(operation: FleetMutation): Promise<FleetOperationResult>;
   validateConfiguration?(configuration: ElasticFleetConfiguration): void;
-  observe(policy: FleetPolicy, configuration: ElasticFleetConfiguration): Promise<FleetSnapshot>;
+  observe(policy: FleetPolicy, configuration: ElasticFleetConfiguration, purpose?: 'plan' | 'reconcile'): Promise<FleetSnapshot>;
   provision(operation: FleetMutation): Promise<void>;
   beginDrain(operation: FleetMutation): Promise<void>;
   remove(operation: FleetMutation): Promise<void>;
@@ -140,7 +140,7 @@ export class ElasticFleetService {
   async plan(): Promise<FleetPlan | null> {
     const state = this.status(); if (!state.config) return null;
     let observed: FleetSnapshot;
-    try { const copy = configuration(state.config); observed = await this.io.observe(copy.policy, copy); }
+    try { const copy = configuration(state.config); observed = await this.io.observe(copy.policy, copy, 'plan'); }
     catch { throw Error("observation_failed"); }
     return planFleet(state.config.policy, this.overlay(observed), state.history);
   }
@@ -215,7 +215,7 @@ export class ElasticFleetService {
     const state = this.status(); const config = state.config;
     if (!config || state.paused || !config.policy.enabled) return this.status();
     let observed: FleetSnapshot;
-    try { const copy = configuration(config); observed = await this.io.observe(copy.policy, copy); }
+    try { const copy = configuration(config); observed = await this.io.observe(copy.policy, copy, 'reconcile'); }
     catch { this.error("observation_failed"); return this.status(); }
     const snapshot = this.overlay(observed);
     const plan = planFleet(config.policy, snapshot, state.history);

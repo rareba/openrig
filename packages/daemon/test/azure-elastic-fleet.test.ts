@@ -246,3 +246,17 @@ describe('Azure dedicated VMSS boundary',()=>{
   for(const deploymentProfileRef of ['relative.json','/tmp/bad\0file',42,null])expect(()=>validateAzurePoolConfiguration({...provider,deploymentProfileRef},'pool')).toThrow('invalid_azure_configuration');
   expect(()=>validateAzurePoolConfiguration({...provider,deploymentProfile:{secret:'fixture'}},'pool')).toThrow('invalid_azure_configuration');
  });
+
+it('rechecks freshness after a slow final ARM read and does not delete', async () => {
+ const f=fixture();const original=f.options.run!;let afterSeal=false;
+ const io=createAzureElasticFleetIO({...f.options,sealForRemoval:async context=>{const seal=await f.options.sealForRemoval!(context);afterSeal=true;return seal;},run:async(args,bounds)=>{
+  const result=await original(args,bounds);if(afterSeal&&args[1]==='list-instances')f.set({now:16001});return result;
+ }});
+ await expect(io.remove(f.operation('remove'))).rejects.toThrow('azure_operation_failed');expect(f.events).toEqual([]);
+});
+it('adopts only the original scale outcome and never repeats scale during pending advancement', async () => {
+ const f=fixture();f.set({capacity:2,instances:[f.cloudInstance(),f.cloudInstance('1','33333333-3333-4333-8333-333333333333')]});
+ expect(await f.io.advanceOperation!(f.operation())).toBe('pending');expect(f.events).toEqual(['bootstrap']);
+ expect(f.commands.some(args=>args[1]==='scale')).toBe(false);
+ const absent=fixture();expect(await absent.io.advanceOperation!(absent.operation())).toBe('unknown');expect(absent.events).toEqual([]);
+});

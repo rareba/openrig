@@ -16,7 +16,7 @@ export const elasticDeploymentProfileSchema = z.object({
     coordinatorManager: label, coordinatorHuman: label, originHuman: label,
     manifestPath: path, preparationPlanPath: path, packageRecipePath: path, registryPath: path,
     attemptDirectory: path, commandDirectory: path,
-    azure: z.object({ executable: path, configDirectory: path }).strict(),
+    azure: z.object({ executable: path, sha256: digest, configDirectory: path }).strict(),
     stageScript: pin, helperScript: pin,
     artifact: z.object({ path, archiveSha256: digest, archiveBytes: z.number().int().positive().max(MAX_RUNTIME_ARTIFACT_BYTES) }).strict(),
     tls: z.object({ bindIPv4: z.string(), port: z.number().int(), certificatePath: path, keyPath: path, caPath: path, certificateSha256: digest }).strict(),

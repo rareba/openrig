@@ -95,6 +95,7 @@ export interface ElasticEnrollmentOptions {
     registryPath: string;
     fetchImpl?: typeof fetch;
     now?: () => number;
+    assertMutation?: (context: AzureMutationContext) => void;
 }
 type EnrollmentContext = Pick<AzureMutationContext, 'configuration' | 'instance'> & {
     operation: Pick<FleetOperation, 'operationId' | 'type'>;
@@ -136,6 +137,7 @@ export class ElasticWorkerEnrollment {
     private check(a: ElasticWorkerAttempt, context: EnrollmentContext): void { if (enrollmentDigest(a.identity) !== enrollmentDigest(this.identity(context)))
         reject(); }
     private checkAttempt(a: ElasticWorkerAttempt): void {
+        if (this.options.store.readPrivateInput(a.id, 'registration-retirement-intent')) reject();
         if (a.identity.configurationDigest !== this.configurationDigest || a.identity.fleetEpoch !== this.options.fleetEpoch || a.binding.manifestDigest !== this.manifestDigest
             || a.identity.resourceId !== this.manifest.resourceId || a.identity.specDigest !== this.plan.specDigest || a.identity.checkoutDigest !== enrollmentDigest(this.plan.seats)) reject();
     }
@@ -156,12 +158,13 @@ export class ElasticWorkerEnrollment {
     }
     private async submit(a: ElasticWorkerAttempt, context: AzureMutationContext, operation: ManagedWorkerOperation, payload: unknown): Promise<EnrollmentResult> {
         const endpoint = await this.trusted(a, context.configuration);
+        this.options.assertMutation?.(context);
         this.options.store.savePrivateInput(a.id, 'trusted-endpoint', endpoint);
         const script = operation === 'stage' ? this.options.stageScript : this.options.helperScript;
         const identity = this.options.commands.commandIdentity(a, operation, payload, script);
         const pending = this.options.store.advance(a.id, a.revision, { command: { name: identity.name, operation, requestDigest: identity.requestDigest, state: 'intent' }, phase: operation === 'stage' ? 'staging' : a.phase, publicReason: 'managed_command_pending' });
         // Persisted intent is never replayed after an uncertain create, including a missing subsequent GET.
-        const state = await this.options.commands.submitManagedCommand(pending, operation, { configuration: context.configuration, endpoint, script, payload });
+        const state = await this.options.commands.submitManagedCommand(pending, operation, { configuration: context.configuration, endpoint, script, payload, assertDispatch: () => this.options.assertMutation?.(context) });
         this.options.store.advance(a.id, pending.revision, { command: { ...pending.command!, state }, publicReason: state === 'unknown' ? 'managed_command_unknown' : 'managed_command_pending' });
         return { state: state === 'unknown' ? 'unknown' : 'pending', publicReason: state === 'unknown' ? 'managed_command_unknown' : 'managed_command_pending' };
     }
@@ -187,7 +190,7 @@ export class ElasticWorkerEnrollment {
         if (command.operation === 'enroll') {
             const key = this.options.store.privateKey(a.id);
             try {
-                const bytes = openEnrollment(output, a.binding, createPrivateKey(key));
+                const bytes = openEnrollment(output.trimEnd(), a.binding, createPrivateKey(key));
                 try {
                     this.options.store.saveBearer(a.id, bytes.toString());
                 }
@@ -263,6 +266,7 @@ export class ElasticWorkerEnrollment {
                     if (a.phase !== 'preparing-native')
                         a = this.options.store.advance(a.id, a.revision, { phase: 'preparing-native', publicReason: 'native_preparation_pending' });
                     // Worker stores its own launch intent; repeated POST is a read/reconciliation of the same plan.
+                    this.options.assertMutation?.(context);
                     await this.rpc(a, endpoint, 'POST', '/api/elastic-worker/prepare', { operationId: this.plan.operationId, planDigest: enrollmentDigest(this.plan) });
                     return { state: 'pending', publicReason: 'native_tool_proof_pending' };
                 }
@@ -387,6 +391,7 @@ export class ElasticWorkerEnrollment {
     /** Native CLI/daemon writers serialize; external whole-file editor drift remains fail-closed. */
     async ensureElasticRegistration(attempt: ElasticWorkerAttempt, configuration: AzureMutationContext['configuration'], suppliedProbe?: ManagedWorkerProbe): Promise<ElasticWorkerAttempt> {
         const a = this.options.store.read(attempt.id);
+        this.checkAttempt(a);
         const endpoint = await this.trusted(a, configuration);
         const probe = suppliedProbe ?? parseManagedWorkerProbe(await this.rpc(a, endpoint, 'GET', '/api/elastic-worker/probe'), a, this.options.workerBuildCommit, (this.options.now ?? Date.now)());
         this.checkProbePlan(probe);

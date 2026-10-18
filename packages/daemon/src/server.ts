@@ -220,6 +220,7 @@ export interface AppDeps {
   slowOpRecorder?: SlowOperationInstrumentation;
   requestPhaseObserver?: import("./domain/request-phase-observer.js").RequestPhaseObserver;
   queueRepo?: QueueRepository;
+  elasticRuntime?: import("./adapters/elastic-runtime.js").ElasticRuntime;
   elasticFleetService?: import("./domain/elastic-fleet.js").ElasticFleetService;
   githubIntakeService?: import("./domain/github-intake.js").GithubIntakeService;
   githubIntakeScheduler?: import("./domain/github-poll-scheduler.js").PollScheduler;

@@ -1,0 +1,30 @@
+import { mkdtempSync, realpathSync, chmodSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { createHash, X509Certificate } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+export function elasticProfileFixture() {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'elastic-profile-')));
+    chmodSync(root, 0o700);
+
+    const put = (name: string, value: unknown) => { const path = join(root, name); writeFileSync(path, typeof value === 'string' ? value : JSON.stringify(value), { mode: 0o600 }); return path; };
+    const hash = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
+    execFileSync('/usr/bin/openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', join(root, 'tls.key'), '-out', join(root, 'tls.cert'), '-days', '1', '-subj', '/CN=fixture', '-addext', 'subjectAltName=IP:10.0.0.1', '-addext', 'basicConstraints=critical,CA:TRUE'], { stdio: 'pipe' });
+    chmodSync(join(root, 'tls.cert'), 0o600);
+    chmodSync(join(root, 'tls.key'), 0o600);
+    const cert = readFileSync(join(root, 'tls.cert'));
+    const manifest = JSON.parse(readFileSync(resolve(import.meta.dirname, '../../../../integrations/azure-elastic/manifest.example.json'), 'utf8'));
+    manifest.resourceId = '/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/fixture/providers/Microsoft.Compute/virtualMachineScaleSets/fixture';
+    manifest.linux.imageReference = 'Canonical:ubuntu:24:1.2.3';
+    manifest.pins = manifest.pins.map((p: object) => ({ ...p, sha256: 'a'.repeat(64) }));
+    const manifestRaw = JSON.stringify(manifest);
+    const manifestPath = put('manifest.json', manifestRaw);
+    const preparationPlanPath = put('plan.json', { version: 1, operationId: 'fixture', manifestDigest: hash(manifestRaw), specDigest: 'a'.repeat(64), model: 'fixture/model', approvedActionKeys: [], repositoryAccess: { mode: 'public-readonly' }, seats: ['worker-a@elastic', 'worker-b@elastic'].map(sessionName => ({ sessionName, repository: { id: 1, name: 'fixture/repo', baseRef: 'refs/heads/main', sha: 'a'.repeat(40) } })), owner: null });
+    const packageRecipePath = put('recipe.json', { distribution: 'ubuntu', release: '24.04', architecture: 'amd64', basePackages: { libc6: ['1'] }, packages: [{ file: 'fixture.deb', package: 'fixture', version: '1', architecture: 'amd64', sha256: 'a'.repeat(64), bytes: 1 }], finalTools: Array.from({ length: 6 }, (_, i) => ({ path: '/usr/bin/tool' + i, sha256: 'a'.repeat(64) })), signedMetadata: { keyringFile: 'keyring.gpg', keyringSha256: 'a'.repeat(64), releases: [{ file: 'InRelease', sha256: 'a'.repeat(64), indexes: [{ file: 'Packages', sha256: 'a'.repeat(64), releasePath: 'main/binary-amd64/Packages' }] }] } });
+    const scriptPath = put('script.py', 'print("fixed")');
+    const script = { path: scriptPath, sha256: hash('print("fixed")') };
+    const directories = ['attempts', 'commands', 'custody'].map(name => { const path = join(root, name); mkdirSync(path, { mode: 0o700 }); return path; });
+    const profile = { version: 1, fleetEpoch: 'fixture', workerBuildCommit: 'a'.repeat(40), coordinatorManager: 'manager@fixture', coordinatorHuman: 'human@kernel', originHuman: 'human@kernel', manifestPath, preparationPlanPath, packageRecipePath, registryPath: join(root, 'hosts.yaml'), attemptDirectory: directories[0], commandDirectory: directories[1], azure: { executable: '/usr/bin/az', sha256: 'a'.repeat(64), configDirectory: root }, stageScript: script, helperScript: script, artifact: { path: join(root, 'artifact.tar'), archiveSha256: 'a'.repeat(64), archiveBytes: 1024 }, tls: { bindIPv4: '10.0.0.1', port: 8443, certificatePath: join(root, 'tls.cert'), keyPath: join(root, 'tls.key'), caPath: join(root, 'tls.cert'), certificateSha256: new X509Certificate(cert).fingerprint256.replaceAll(':', '').toLowerCase() }, custody: { directory: directories[2], durableStoreId: 'fixture', maxBytes: 1024, maxReservedBytes: 1024, maxStoredBytes: 1024 * 1024, retentionPolicyId: 'fixture', maxCheckpoints: 2 } };
+    const profilePath = put('profile.json', profile);
+    return { root, profilePath, profile, manifest, put };
+}

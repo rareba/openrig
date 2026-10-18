@@ -1,3 +1,4 @@
+import { finalStatusRequestSchema, finalStatusReceiptSchema } from './elastic-lifecycle-contract.js';
 import { inspectManagedTmuxIpc, retireStoppedTmuxIpc, type ManagedTmuxIpc } from "./managed-tmux-ipc.js";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -57,6 +58,7 @@ export class LinuxWorkerLifecycle {
       state.vmId !== binding.vmId ||
       state.manifestDigest !== binding.manifestDigest ||
       state.generation !== binding.drainGeneration ||
+      state.drainOperationId !== binding.removalOperationId ||
       binding.workerId !== azureWorkerId(m.resourceId, instance.vmId) ||
       binding.fleetEpoch !== instance.fleetEpoch ||
       binding.manifestDigest !== this.os.manifestDigest ||
@@ -261,6 +263,13 @@ export class LinuxWorkerLifecycle {
     };
     this.save("seal.json", seal);
     return seal;
+  }
+  finalStatus(input: unknown) {
+    const request = finalStatusRequestSchema.parse(input);
+    const seal = this.status(request.binding);
+    if (!seal) fail();
+    return finalStatusReceiptSchema.parse({ ...request, seal,
+      checkpointReceiptDigest: workerDigest(this.read("final-custody-receipt.json")) });
   }
   status(binding: FinalBinding): AzureRemovalSeal | null {
     this.stopped(binding);

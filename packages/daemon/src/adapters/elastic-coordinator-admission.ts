@@ -29,6 +29,7 @@ export function bindCoordinatorReadinessPlan(input: {
 }
 /** Concrete directory over original attempts and enrollment's trusted ARM/native/registry readback. */
 export class ElasticEnrolledWorkerDirectory {
+    private observations = new Map<string, Promise<import('./elastic-worker-enrollment.js').ManagedWorkerObservation>>();
     private current = new Map<string, EnrolledHumanOrigin>();
     private managers = new Map<string, Set<string>>();
     constructor(readonly options: {
@@ -97,13 +98,28 @@ export class ElasticEnrolledWorkerDirectory {
     }
     /** Publish full observed capacity; null/busy/drain evidence also resets the idle window. */
     async refresh(maximumGapMs: number): Promise<FleetWorkerObservation[]> {
-        const workers: FleetWorkerObservation[] = [];
-        for (const a of this.options.store.list()) {
-            const observation = await this.options.enrollment.observeManagedWorker(a, this.options.configuration());
+        const attempts = this.options.store.list().filter(a => !this.options.store.readPrivateInput(a.id, 'registration-retirement-intent'));
+        if (attempts.length > 7) throw Error('elastic_pool_bound_exceeded');
+        const workers = await Promise.all(attempts.map(async a => {
+            let pending = this.observations.get(a.id);
+            if (!pending) {
+                pending = this.options.enrollment.observeManagedWorker(a, this.options.configuration());
+                this.observations.set(a.id, pending);
+                void pending.finally(() => this.observations.delete(a.id)).catch(() => {});
+            }
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const unavailable = { worker: { id: a.workerId, managed: true, permanent: false, state: 'quarantined' as const,
+                capabilities: [], slots: null, active: null, observedAt: Date.now(), idleSince: null, clean: null, pendingHumanReturns: null },
+                probe: null, drainEligible: null, publicReason: 'native_observation_unavailable' };
+            let observation;
+            try { observation = await Promise.race([pending, new Promise<typeof unavailable>(resolve => { timer = setTimeout(() => resolve(unavailable), 4500); })]); }
+            catch { observation = unavailable; }
+            finally { if (timer) clearTimeout(timer); }
+            if (Date.now() - observation.worker.observedAt > 5000 || observation.worker.observedAt > Date.now()) observation = unavailable;
             this.options.projection.publish(a, observation);
             const idleSince = this.options.projection.idleSince(a, observation, maximumGapMs);
-            workers.push({ ...observation.worker, idleSince });
-        }
+            return { ...observation.worker, idleSince };
+        }));
         await this.all();
         return workers;
     }

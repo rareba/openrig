@@ -341,6 +341,7 @@ export async function startServer(port?: number) {
         // tree post-bind so the HTTP surface is ready before the first
         // tick (matches contextMonitor pattern).
         deps.watchdogScheduler?.start();
+        deps.elasticRuntime?.start();
         deps.githubIntakeScheduler?.start();
         deps.humanResponseScheduler?.start();
         deps.humanRelayScheduler?.start();
@@ -402,6 +403,7 @@ export async function startServer(port?: number) {
       ["proof-source-watch", () => deps.proofSourceWatch?.close()],
       ["health-diagnosis", () => deps.healthDiagnosis?.stop()],
       ["github-intake", () => deps.githubIntakeScheduler?.stop()],
+      ["elastic-fleet", () => deps.elasticRuntime?.close()],
       ["human-response", () => deps.humanResponseScheduler?.stop()],
       ["human-relay", () => deps.humanRelayScheduler?.stop()],
       ["watchdog", () => deps.watchdogScheduler?.stop()],

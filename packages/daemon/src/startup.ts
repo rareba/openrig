@@ -1,3 +1,4 @@
+import { createElasticRuntime } from './adapters/elastic-runtime.js';
 import { assertElasticEffectAllowed } from "./domain/elastic-worker-guard.js";
 import { loadForegroundManifest } from "./adapters/elastic-worker-foreground.js";
 import { fileURLToPath } from "node:url";
@@ -354,6 +355,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const rigRepo = new RigRepository(db);
   const sessionRegistry = new SessionRegistry(db);
   const eventBus = new EventBus(db);
+  const elasticRuntime = createElasticRuntime({ db, databasePath: dbPath, sessions: sessionRegistry, hostId: selfHost.hostId,
+    profilePath: process.env.OPENRIG_ELASTIC_PROFILE, report: message => console.error(`[elastic-fleet] ${message}`) });
   const streamStore = new StreamStore(db, eventBus);
   // Explicit source opt-in only. No sink I/O until a separate drain request.
   const shadow = configureShadowCapture(process.env.OPENRIG_SHADOW_CAPTURE);
@@ -453,6 +456,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // Transport is wired after SessionTransport instantiation below via
   // attachTransport().
   const queueRepoInstance = new QueueRepository(db, eventBus, {
+    elasticHumanProxyAuthority: elasticRuntime?.directory.authority(),
     validateRig: topologyValidateRig,
     destinationAdvisory: topologyDestinationAdvisory,
     // OPR.0.4.6.WF3 FR-6 — the frontier close-path guard's predicate,
@@ -2611,7 +2615,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     bindings: () => loadHumanRelayBindings(OPENRIG_HOME), webhooks: () => loadHumanRelayWebhooks(OPENRIG_HOME), hostId: getSelfHostId,
   });
   deps.humanRelayScheduler = new PollScheduler(new HumanRelayWebhookDispatcher(deps.humanRelayService, { targets: () => loadHumanRelayWebhooks(OPENRIG_HOME) }), message => console.error(`[human-relay] ${message}`));
-  deps.githubIntakeService = new GithubIntakeService(db, queueRepoInstance, createGithubIntakeIO({
+  const githubIntakeIO = createGithubIntakeIO({
     queue: queueRepoInstance,
     localNodes: async () => {
       const active = new Set((db.prepare("SELECT id FROM rigs WHERE archived_at IS NULL").all() as { id: string }[]).map(r => r.id));
@@ -2621,7 +2625,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       return attachTerminalActivityAndWork(activity, { db, seatActivity: seatActivityService }).map(node => ({ ...node, archived: archived.get(node.nodeId) }));
     },
     onError: message => console.error(`[github-intake] ${message}`),
-  }));
+  });
+  deps.elasticRuntime = elasticRuntime;
+  deps.elasticFleetService = elasticRuntime?.service;
+  deps.githubIntakeService = elasticRuntime?.attach(queueRepoInstance, githubIntakeIO)
+    ?? new GithubIntakeService(db, queueRepoInstance, githubIntakeIO);
   deps.githubIntakeScheduler = new PollScheduler(deps.githubIntakeService, message => console.error(`[github-intake] ${message}`));
   deps.humanResponseScheduler = new PollScheduler({
     status: () => ({ config: { pollIntervalSeconds: 60 } }),

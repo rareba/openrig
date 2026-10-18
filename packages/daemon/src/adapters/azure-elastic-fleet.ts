@@ -1,3 +1,4 @@
+import type { ElasticManagedLifecycle } from './elastic-managed-lifecycle.js';
 import { performance } from 'node:perf_hooks';
 import { execFile } from 'node:child_process';
 import type { ElasticFleetConfiguration, FleetIO, FleetMutation, FleetOperation } from '../domain/elastic-fleet.js';
@@ -53,8 +54,10 @@ export interface AzureRemovalSeal {
 }
 export interface AzureNativeContext { configuration: AzurePoolConfiguration; instances: AzureInstance[] }
 export interface AzureMutationContext { configuration: AzurePoolConfiguration; operation: FleetMutation; instance: AzureInstance }
-export type AzureArgvRunner = (args: readonly string[], limits: { timeout: number; maxBuffer: number }) => Promise<string>;
+export type AzureArgvRunner = (args: readonly string[], limits: { timeout: number; maxBuffer: number; beforeDispatch?: () => void }) => Promise<string>;
 export interface AzureFleetOptions {
+  lifecycle?: ElasticManagedLifecycle;
+  assertMutation?: (operation: FleetMutation) => void;
   run?: AzureArgvRunner;
   now?: () => number;
   observeNative: (context: AzureNativeContext) => Promise<AzureNativeObservation>;
@@ -125,6 +128,7 @@ function nativeWorker(value: unknown, now: number, interval: number): FleetWorke
     slots:value.slots,active:value.active,observedAt:value.observedAt,idleSince:value.idleSince,clean:value.clean,pendingHumanReturns:value.pendingHumanReturns};
 }
 const defaultRun: AzureArgvRunner = (args, bounds) => new Promise((resolve, rejectPromise) => {
+  bounds.beforeDispatch?.();
   execFile('az', [...args], {encoding:'utf8',timeout:bounds.timeout,maxBuffer:bounds.maxBuffer,windowsHide:true}, (error, stdout) => {
     if (error) rejectPromise(Error('azure_cli_failed')); else resolve(stdout);
   });
@@ -253,6 +257,7 @@ export function createAzureElasticFleetIO(options: AzureFleetOptions): FleetIO {
     if (!operation.policy.enabled || operation.policy.mode!=='active' || !integer(operation.targetCapacity) || operation.targetCapacity>operation.policy.maxWorkers) reject();
     return config(operation.configuration);
   }
+  const assertMutation = (operation: FleetMutation) => options.assertMutation?.(operation);
   async function guarded(action:()=>Promise<void>): Promise<void> {try {await action();} catch {throw Error('azure_operation_failed');}}
   async function target(operation: FleetMutation, configuration: AzurePoolConfiguration): Promise<AzureInstance> {
     const current = await inventory(configuration); const instance=current.instances.find(item=>item.workerId===operation.workerId);
@@ -270,15 +275,16 @@ export function createAzureElasticFleetIO(options: AzureFleetOptions): FleetIO {
       catch {const current=now();return {observedAt:current,now:current,demands:[],workers:[],providerAvailable:false};}
     },
     async provision(operation) {return guarded(async()=>{
-      const configuration=active(operation);if(!options.bootstrap)reject();const before=await inventory(configuration);
+      const configuration=active(operation);assertMutation(operation);if(!options.bootstrap)reject();const before=await inventory(configuration);
       if (operation.type!=='provision' || operation.targetCapacity<=before.capacity || operation.targetCapacity!==before.capacity+operation.count || !integer(operation.count) || operation.count<1
         || before.instances.length!==operation.snapshot.workers.filter(worker=>worker.managed&&!worker.permanent).length
         || before.instances.some(instance=>!operation.snapshot.workers.some(worker=>worker.id===instance.workerId&&worker.managed&&!worker.permanent))) reject();
       await native(configuration,before.instances,operation.policy);
+      assertMutation(operation);
       await command(configuration,['vmss','scale',...scope(configuration),'--new-capacity',String(operation.targetCapacity)]);
       const after=await inventory(configuration);if(after.capacity!==operation.targetCapacity || before.instances.some(instance=>!after.instances.some(next=>next.workerId===instance.workerId)))reject();
       const added=after.instances.filter(instance=>!before.instances.some(old=>old.workerId===instance.workerId));if(added.length!==operation.count)reject();
-      for(const instance of added) await command(configuration,['vmss','update',...scope(configuration),'--instance-id',instance.instanceId,'--protect-from-scale-in','true','--protect-from-scale-set-actions','true']);
+      for(const instance of added) { assertMutation(operation); await command(configuration,['vmss','update',...scope(configuration),'--instance-id',instance.instanceId,'--protect-from-scale-in','true','--protect-from-scale-set-actions','true']); }
       const protectedInventory=await inventory(configuration);
       for(const instance of added) {
         const fresh=protectedInventory.instances.find(item=>item.workerId===instance.workerId);if(!fresh?.protected || fresh.provisioningState!=='Succeeded')reject();
@@ -288,21 +294,54 @@ export function createAzureElasticFleetIO(options: AzureFleetOptions): FleetIO {
       if(complete.capacity!==operation.targetCapacity || added.some(instance=>!observed.workers.some(worker=>worker.id===instance.workerId&&worker.state==='ready')))reject();
     });},
     async beginDrain(operation) {return guarded(async()=>{
-      const configuration=active(operation);if(operation.type!=='beginDrain'||!options.beginDrain)reject();const instance=await target(operation,configuration);
+      const configuration=active(operation);if(operation.type!=='beginDrain'||!options.beginDrain)reject();const instance=await target(operation,configuration);assertMutation(operation);
       await options.beginDrain({configuration,operation,instance});
     });},
     async remove(operation) {return guarded(async()=>{
       const configuration=active(operation);if(operation.type!=='remove'||!options.sealForRemoval||!options.retireRegistration)reject();
-      const instance=await target(operation,configuration);const started=now();const seal=await options.sealForRemoval({configuration,operation,instance});const checked=now();
+      const instance=await target(operation,configuration);const started=now();const monoStarted=performance.now();assertMutation(operation);const seal=await options.sealForRemoval({configuration,operation,instance});const checked=now();
       if(!object(seal)||seal.workerId!==instance.workerId||seal.vmId!==instance.vmId||seal.operationId!==operation.operationId||seal.beginDrainConfirmed!==true||seal.fenced!==true
         ||!text(seal.drainGeneration)||seal.active!==0||seal.claims!==0||seal.processes!==0||seal.pendingTransfers!==false||seal.pendingActivationIntents!==false
         ||seal.coordinatorCheckpointAcknowledged!==true||seal.clean!==true||seal.pendingHumanReturns!==false||!integer(seal.observedAt)||seal.observedAt<started||seal.observedAt>checked
         ||!integer(seal.drainConfirmedAt)||seal.observedAt<=seal.drainConfirmedAt)reject();
       const fresh=await target(operation,configuration);if(fresh.vmId!==instance.vmId||fresh.instanceId!==instance.instanceId)reject();
-      await command(configuration,['vmss','delete-instances',...scope(configuration),'--instance-ids',instance.instanceId],'bodyless-delete');
+      assertMutation(operation);
+      const argv = ['vmss','delete-instances',...scope(configuration),'--instance-ids',instance.instanceId,'--subscription',configuration.subscription,'--only-show-errors','--output','json'];
+      if (options.lifecycle) await options.lifecycle.dispatchDelete({ configuration, operation, instance: fresh },seal,argv,limits,run);
+      else {
+        const at=now();
+        if(at<started || seal.observedAt>at || at-seal.observedAt>5000 || performance.now()-monoStarted>5000)reject();
+        await run(argv,limits);
+      }
       const after=await inventory(configuration);if(after.instances.some(item=>item.instanceId===instance.instanceId||item.vmId===instance.vmId))reject();
       await options.retireRegistration({configuration,operation,instance});
     });},
+    async advanceOperation(operation) {
+      try {
+        const configured=active(operation); assertMutation(operation);
+        const current=await inventory(configured); assertMutation(operation);
+        if(operation.type==='provision') {
+          const old=new Set(operation.snapshot.workers.filter(w=>w.managed&&!w.permanent).map(w=>w.id));
+          const added=current.instances.filter(i=>!old.has(i.workerId));
+          if(!options.bootstrap || current.capacity!==operation.targetCapacity || added.length!==operation.count
+            || [...old].some(id=>!current.instances.some(i=>i.workerId===id)))return 'unknown';
+          // Adoption belongs to the original reserved scale operation. Never repeat scale.
+          for(const instance of added) {
+            if(!instance.protected) { assertMutation(operation); await command(configured,['vmss','update',...scope(configured),'--instance-id',instance.instanceId,'--protect-from-scale-in','true','--protect-from-scale-set-actions','true']); }
+          }
+          const fresh=await inventory(configured);
+          for(const addedInstance of added) {
+            const instance=fresh.instances.find(i=>i.workerId===addedInstance.workerId);
+            if(!instance?.protected || instance.provisioningState!=='Succeeded')return 'pending';
+            assertMutation(operation); await options.bootstrap({configuration:configured,operation,instance});
+          }
+          return options.inspectNative ? options.inspectNative({configuration:configured,instances:fresh.instances,operation}) : 'pending';
+        }
+        if(operation.type==='remove' && options.lifecycle && await options.lifecycle.retireAbsent(operation,configured,current.instances))return 'succeeded';
+        await this[operation.type](operation);
+        return 'succeeded';
+      } catch { return 'pending'; }
+    },
     async inspectOperation(operation, configuration) {
       try {
         const configured=config(configuration);const current=await inventory(configured);
@@ -313,6 +352,7 @@ export function createAzureElasticFleetIO(options: AzureFleetOptions): FleetIO {
           if(added.length!==operation.count||[...old].some(id=>!current.instances.some(instance=>instance.workerId===id)))return 'unknown';
           return added.every(instance=>observed.workers.some(worker=>worker.id===instance.workerId&&worker.state==='ready'))?'succeeded':'pending';
         }
+        if(operation.type==='remove'&&options.lifecycle)return options.lifecycle.inspectNative({configuration:configured,instances:current.instances,operation});
         if(operation.type==='remove'&&current.instances.some(instance=>instance.workerId===operation.workerId))return 'pending';
         // Deletion absence alone cannot attest credential retirement or distinguish external loss.
         return options.inspectNative ? await options.inspectNative({configuration:configured,instances:current.instances,operation}) : 'unknown';

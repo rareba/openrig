@@ -1,3 +1,4 @@
+import { finalStatusRequestSchema } from './elastic-lifecycle-contract.js';
 import { GithubCredentialStore, githubMaterialSchema } from './elastic-worker-github.js';
 import { createPrivateKey } from "node:crypto";
 import { openCheckpointCapability, openGithubMaterial, type EnrollmentBinding } from "../domain/elastic-enrollment.js";
@@ -89,7 +90,7 @@ const payloads = {
     .strict(),
   "final-checkpoint-upload": z.object({ binding: finalBinding, capabilityEnvelope: z.string().min(1).max(16384) }).strict(),
   "final-checkpoint-ack": z.object({ binding: finalBinding, receipt }).strict(),
-  "seal-status": z.object({ binding: finalBinding }).strict(),
+  "seal-status": finalStatusRequestSchema,
 };
 export function parseHelperPayload(operation: string, value: unknown): unknown {
   if (!Object.hasOwn(payloads, operation))
@@ -184,8 +185,10 @@ export async function runWorkerHelper(argv: string[]): Promise<unknown> {
         const p = payloads["final-checkpoint-ack"].parse(input);
         return lifecycle.acknowledge(p.binding, p.receipt);
       }
-      case "seal-status":
-        return lifecycle.status(payloads["seal-status"].parse(input).binding);
+      case "seal-status": {
+        const p = payloads["seal-status"].parse(input);
+        return lifecycle.finalStatus(p);
+      }
       default:
         throw Error();
     }

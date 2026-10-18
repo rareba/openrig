@@ -38,6 +38,8 @@ export interface ManagedWorkerInput {
     endpoint: TrustedWorkerEndpoint;
     script: PinnedWorkerScript;
     payload: unknown;
+    /** Native production owner/configuration recheck after asynchronous ARM preparation. */
+    assertDispatch?: () => void;
 }
 export type ManagedCommandObservation = {
     state: 'pending' | 'unknown' | 'failed';
@@ -51,11 +53,12 @@ export class AzureWorkerCommandClient {
         if (![options.executable, options.azureConfigDirectory, options.privateDirectory].every(p => isAbsolute(p) && !p.includes('\0')))
             reject();
     }
-    async run(args: readonly string[]): Promise<unknown> {
+    async run(args: readonly string[], beforeDispatch?: () => void): Promise<unknown> {
         try {
-            const limits = { timeout: 30000, maxBuffer: 1024 * 1024 };
+            const limits = { timeout: 30000, maxBuffer: 1024 * 1024, ...(beforeDispatch ? { beforeDispatch } : {}) };
             const argv = [...args, '--only-show-errors', '--output', 'json'];
             const output = this.options.run ? await this.options.run(argv, limits) : await new Promise<string>((resolve, rejectPromise) => {
+                beforeDispatch?.();
                 execFile(this.options.executable, argv, { timeout: limits.timeout, maxBuffer: limits.maxBuffer, encoding: 'utf8', shell: false,
                     env: { PATH: '/usr/bin:/bin', HOME: this.options.azureConfigDirectory, AZURE_CONFIG_DIR: this.options.azureConfigDirectory, AZURE_CORE_COLLECT_TELEMETRY: '0', AZURE_EXTENSION_USE_DYNAMIC_INSTALL: 'no' } }, (error, stdout) => error ? rejectPromise(Error('azure_worker_command_unknown')) : resolve(stdout));
             });
@@ -144,7 +147,8 @@ export class AzureWorkerCommandClient {
         // This is the same managed CreateOrUpdate API, with the entire body kept private.
         const url = `https://management.azure.com${attempt.identity.childResourceId}/runCommands/${identity.name}?api-version=2024-11-01`;
         try {
-            await this.run(['rest', '--method', 'put', '--url', url, '--body', `@${path}`]);
+            input.assertDispatch?.();
+            await this.run(['rest', '--method', 'put', '--url', url, '--body', `@${path}`], input.assertDispatch);
             return 'submitted';
         }
         catch {
@@ -164,7 +168,7 @@ export class AzureWorkerCommandClient {
                 return { state: 'pending' };
             if (view.executionState !== 'Succeeded' || view.exitCode !== 0)
                 return { state: 'failed' };
-            return { state: 'succeeded', output: assertManagedCommandSuccess(view).trimEnd() };
+            return { state: 'succeeded', output: assertManagedCommandSuccess(view) };
         }
         catch {
             return { state: 'unknown' };

@@ -1,5 +1,5 @@
 import { accountWorkerCapacity, type CapacitySeat } from '../src/adapters/elastic-worker-capacity.js';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { parseManagedWorkerProbe, managedHostId } from '../src/adapters/elastic-worker-enrollment.js';
 const attempt = { workerId: 'fixture-worker', binding: { vmId: '11111111-1111-4111-8111-111111111111', manifestDigest: 'a'.repeat(64) } };
 describe('managed native observation', () => {
@@ -219,4 +219,37 @@ it('delivers two stable real-owner native readiness tasks only after exact regis
   for(const task of plan.owner!.tasks){const actual=queue.getById(task.qitemId)!;expect(actual.sourceSession).toBe('manager@coordinator@coordinator');expect(actual.destinationSession).toBe(task.sessionName);expect(actual.body).toBe(readinessTaskBody({qitemId:task.qitemId,nonce:task.nonce,sourceSession:'manager@coordinator',originHostId:'coordinator'},task.sessionName,enrollment.workerWorkspace(task.sessionName),plan.manifestDigest));expect(actual.chainOfRecord).toContain(task.qitemId);}
   expect((await enrollment.inspectEnrollment(f.context)).state).toBe('pending');
  } finally {db.close();}
+});
+
+it('publishes real busy-A/free-B capacity despite another slow origin and does not publish its late result', async () => {
+  const f = fixture(), enrollment = new ElasticWorkerEnrollment(f.options);
+  for (let i = 0; i < 4; i++) await enrollment.advanceEnrollment(f.context);
+  const fast = f.store.list()[0]!;
+  const slow = f.store.createOrRead({ ...fast.identity, vmId: '22222222-2222-4222-8222-222222222222', childResourceId: fast.identity.resourceId + '/virtualMachines/1', instanceId: '1' });
+  const db = createDb(); migrate(db, ALL_MIGRATIONS);
+  db.prepare('UPDATE elastic_fleet_config SET config=?,revision=1').run(JSON.stringify({ policy: f.context.operation.policy }));
+  f.setBusy();
+  const realObserve = enrollment.observeManagedWorker.bind(enrollment);
+  let finish!: (value: Awaited<ReturnType<typeof realObserve>>) => void;
+  const delayed = new Promise<Awaited<ReturnType<typeof realObserve>>>(resolve => { finish = resolve; });
+  const observe = vi.spyOn(enrollment, 'observeManagedWorker').mockImplementation((a, c) => a.id === slow.id ? delayed : realObserve(a, c));
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(10000);
+  const projection = new ElasticFleetProjection(db, () => 10000);
+  const directory = new ElasticEnrolledWorkerDirectory({ store: f.store, enrollment, configuration: () => f.context.configuration, sessions: new SessionRegistry(db), coordinatorManager: 'manager@coordinator', coordinatorHuman: 'human@kernel', originHuman: 'human@kernel', projection });
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const pending = directory.refresh(65000);
+    await vi.advanceTimersByTimeAsync(4501);
+    const workers = await pending;
+    expect(workers.find(w => w.id === fast.workerId)).toMatchObject({ state: 'ready', active: 1, slots: 2, idleSince: null });
+    expect(workers.find(w => w.id === slow.workerId)).toMatchObject({ state: 'quarantined', active: null });
+    expect(projection.observations()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ session: 'worker-a@elastic', available: true, active: 1 }),
+      expect.objectContaining({ session: 'worker-b@elastic', available: true, active: 0 }),
+    ]));
+    const rows = db.prepare('SELECT * FROM elastic_target_projection').all();
+    finish(await realObserve(fast, f.context.configuration)); await Promise.resolve();
+    expect(db.prepare('SELECT * FROM elastic_target_projection').all()).toEqual(rows);
+    expect(observe.mock.calls.filter(([a]) => a.id === slow.id)).toHaveLength(1);
+  } finally { vi.useRealTimers(); clock.mockRestore(); observe.mockRestore(); db.close(); }
 });

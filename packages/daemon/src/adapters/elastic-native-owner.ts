@@ -59,6 +59,10 @@ export class ElasticNativeOwner {
         if (!owner || row?.owner !== owner)
             throw Error('native_owner_required');
     }
+    claimIdentity(scope: string): { identity: NativeOwnerIdentity; claim: string } {
+        this.assertHeld(scope);
+        return { identity: this.identity, claim: this.held.get(scope)! };
+    }
     async run<T>(scope: string, operation: () => Promise<T>): Promise<T> {
         const owner = randomUUID();
         this.db.transaction(() => {
