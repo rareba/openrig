@@ -2,9 +2,30 @@ import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { TmuxAdapter, type TmuxFileOps } from "../src/adapters/tmux.js";
 import type { SeatDeliveryGuard } from "../src/domain/seat-delivery-guard.js";
+
+// Admission and process/manifest checks need a uid-0 manifest and live processes; the argv path under test does not.
+// withElasticContinuationTransport stays real so the recorded stack frame is tmux.ts:699.
+vi.mock("../src/domain/elastic-worker-guard.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/domain/elastic-worker-guard.js")>()),
+  assertElasticTmuxEffectAllowed: () => {},
+  assertElasticContinuationAllowed: (_id: string, db: { prepare: (s: string) => { get: (...a: unknown[]) => unknown } }) => ({
+    action: { target: TARGET, effect: { kind: "resume-conversation" }, actionId: "act-1" },
+    stage: "prepared",
+    db,
+  }),
+}));
+vi.mock("../src/adapters/elastic-owned-continuation.js", () => ({
+  continuationManifest: () => ({ uid: 0, linux: { node: "/n", helper: "/h/x", database: "/d" } }),
+  verifyContinuationProcess: () => {},
+  continuationTransportPlan: () => "pi-runner-argv",
+}));
+vi.mock("../src/domain/elastic-continuation.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/domain/elastic-continuation.js")>()),
+  continuationTransition: () => {},
+}));
 
 // The daemon runs every `run(argv, legacy)` call as argv on POSIX. A legacy string that a shell would split
 // differently from its argv means the shell path and the argv path hand tmux different arguments. A real
@@ -143,6 +164,14 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   // A failed paste deletes the loaded buffer; the guarded kill reads the session id first.
   await recordingAdapter(calls, { failing: ["paste-buffer"] }).sendText(SESSION, "hello");
   await recordingAdapter(calls, { guard: true }).killSession(SESSION);
+  // The owned-continuation drain issues tmux.ts:699 through the guarded transport scope.
+  const owned = recordingAdapter(calls);
+  owned.deliveryGuard = {
+    continuationOperation: (_id: string, fn: () => Promise<unknown>) => fn(),
+    checkInput: () => {},
+    db: { transaction: (fn: () => void) => ({ immediate: () => fn() }) },
+  } as unknown as SeatDeliveryGuard;
+  await owned.sendOwnedContinuation("act-1");
   return calls;
 }
 
