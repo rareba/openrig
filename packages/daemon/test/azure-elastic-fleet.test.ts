@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { performance } from 'node:perf_hooks';
 import { createAzureElasticFleetIO, azureWorkerId, validateAzurePoolConfiguration, type AzureFleetOptions, type AzureInstance, type AzureNativeObservation, type AzureRemovalSeal } from '../src/adapters/azure-elastic-fleet.js';
 import { planFleet } from '../src/domain/elastic-fleet-policy.js';
 import type { FleetMutation } from '../src/domain/elastic-fleet.js';
@@ -16,7 +17,8 @@ function fixture() {
  const native = async ({instances: current}: {instances: AzureInstance[]}): Promise<AzureNativeObservation> => ({observedAt:now,demands:[],permanentWorkers:[],managedWorkers:enrolled?current.map(instance=>({id:instance.workerId,managed:true,permanent:false,state:'ready' as const,capabilities:['code'],slots:1,active:0,observedAt:now,idleSince:0,clean:true,pendingHumanReturns:false})):[],...nativePatch});
  const options: AzureFleetOptions = {now:()=>now,run:async args=>{
   commands.push([...args]); const command=args.slice(0,3).join(' '); if(command.includes(failCommand)&&failCommand)throw Error('Bearer super-secret');
-  if(args[0]==='monitor')return JSON.stringify(autoscale);
+  if(args[0]==='monitor')throw Error('the following arguments are required: --resource-group/-g');
+  if(args[0]==='rest')return JSON.stringify({value:autoscale});
   if(args[1]==='show')return JSON.stringify({id:resourceId,tags:{'openrig-pool':'pool'},orchestrationMode:'Uniform',sku:{capacity},provisioningState:'Succeeded',overprovision:false,upgradePolicy:{mode:'Manual',automaticOSUpgradePolicy:{enableAutomaticOSUpgrade:false}},automaticRepairsPolicy:{enabled:false},virtualMachineProfile:{storageProfile:{imageReference:{id:provider.image.id}}},...modelPatch});
   if(args[1]==='list-instances')return JSON.stringify(instances);
   if(args[1]==='scale'){events.push('scale');if(scaleWorks){capacity=Number(args[args.indexOf('--new-capacity')+1]);instances=Array.from({length:capacity},(_,i)=>cloudInstance(String(i),i===0?vmId:`33333333-3333-4333-8333-${String(i).padStart(12,'0')}`));}return '{}';}
@@ -28,12 +30,24 @@ function fixture() {
  const operation=(type: FleetMutation['type']='provision'):FleetMutation=>({operationId:'op-1',type,state:'pending',workerId:type==='provision'?null:id,count:1,targetCapacity:type==='provision'?2:type==='remove'?0:1,revision:1,snapshot:{observedAt:9000,now:9000,demands:[],workers:[{id,managed:true,permanent:false,state:'draining',capabilities:['code'],slots:1,active:0,observedAt:9000,idleSince:0,clean:true,pendingHumanReturns:false}],providerAvailable:true},error:null,createdAt:9000,updatedAt:9000,policy,configuration});
  return {io,options,commands,events,operation,set:(patch:{capacity?:number;instances?:unknown[];modelPatch?:Record<string,unknown>;autoscale?:unknown[];enrolled?:boolean;nativePatch?:Partial<AzureNativeObservation>;sealPatch?:Partial<AzureRemovalSeal>;failCommand?:string;deleteWorks?:boolean;scaleWorks?:boolean;bootstrapWorks?:boolean;now?:number})=>{if(patch.capacity!==undefined)capacity=patch.capacity;if(patch.instances)instances=patch.instances;if(patch.modelPatch)modelPatch=patch.modelPatch;if(patch.autoscale)autoscale=patch.autoscale;if(patch.enrolled!==undefined)enrolled=patch.enrolled;if(patch.nativePatch)nativePatch=patch.nativePatch;if(patch.sealPatch)sealPatch=patch.sealPatch;if(patch.failCommand)failCommand=patch.failCommand;if(patch.deleteWorks!==undefined)deleteWorks=patch.deleteWorks;if(patch.scaleWorks!==undefined)scaleWorks=patch.scaleWorks;if(patch.bootstrapWorks!==undefined)bootstrapWorks=patch.bootstrapWorks;if(patch.now!==undefined)now=patch.now;},cloudInstance};
 }
+
+const autoscaleUrl = `https://management.azure.com/subscriptions/${subscription}/providers/Microsoft.Insights/autoscalesettings?api-version=2022-10-01`;
+const autoscaleRule = (group='other-rg',enabled=false,targetResourceUri=resourceId) => ({id:`/subscriptions/${subscription}/resourceGroups/${group}/providers/Microsoft.Insights/autoscalesettings/rule`,properties:{enabled,targetResourceUri}});
+function restFixture(pages: unknown[]) {
+ const f=fixture();const original=f.options.run!;let page=0;
+ const io=createAzureElasticFleetIO({...f.options,run:async(args,bounds)=>{
+  if(args[0]!=='rest')return original(args,bounds);
+  f.commands.push([...args]);expect(bounds.timeout).toBeGreaterThan(0);expect(bounds.timeout).toBeLessThanOrEqual(30_000);expect(bounds.maxBuffer).toBe(1024*1024);
+  const value=pages[page++];if(value instanceof Error)throw value;return typeof value==='string'?value:JSON.stringify(value);
+ }});
+ return {...f,io};
+}
 describe('Azure dedicated VMSS boundary',()=>{
  it('validates exact config without provider calls',()=>{const f=fixture();f.io.validateConfiguration!(configuration);expect(f.commands).toEqual([]);expect(validateAzurePoolConfiguration(provider,'pool').resourceId).toBe(resourceId);});
  it.each([{subscription:'wrong'},{resourceId:resourceId+'/other'},{poolId:'other'},{ownershipTag:{key:'openrig',value:'other'}},{image:{kind:'marketplace',publisher:'a',offer:'b',sku:'c',version:'latest'}},{bootstrap:{path:'/opt/bootstrap',digest:'wrong'}},{unexpected:'secret'},{bootstrap:{path:'https://bad',digest:'a'.repeat(64)}}])('rejects invalid config %j',patch=>expect(()=>validateAzurePoolConfiguration({...provider,...patch},'pool')).toThrow('invalid_azure_configuration'));
- it('observes managed and permanent workers without exposing raw provider output',async()=>{const f=fixture();const snapshot=await f.io.observe(policy,configuration);expect(snapshot.providerAvailable).toBe(true);expect(snapshot.workers[0]?.id).toBe(id);expect(JSON.stringify(snapshot)).not.toContain('imageReference');expect(f.commands.every(args=>args.includes('--subscription')&&args.includes(subscription))).toBe(true);expect(f.commands.find(args=>args[0]==='monitor')).not.toContain('--resource-group');});
+ it('observes managed and permanent workers without exposing raw provider output',async()=>{const f=fixture();const snapshot=await f.io.observe(policy,configuration);expect(snapshot.providerAvailable).toBe(true);expect(snapshot.workers[0]?.id).toBe(id);expect(JSON.stringify(snapshot)).not.toContain('imageReference');expect(f.commands.every(args=>args.includes('--subscription')&&args.includes(subscription))).toBe(true);expect(f.commands.find(args=>args[0]==='rest')).toEqual(['rest','--method','get','--url',autoscaleUrl,'--subscription',subscription,'--only-show-errors','--output','json']);});
  it.each([{id:resourceId+'/wrong'},{tags:{}},{orchestrationMode:'Flexible'},{upgradePolicy:{mode:'Automatic'}},{automaticRepairsPolicy:{enabled:true}},{upgradePolicy:{mode:'Manual',automaticOSUpgradePolicy:{enableAutomaticOSUpgrade:true}}},{overprovision:true},{sku:{capacity:2}},{virtualMachineProfile:{storageProfile:{imageReference:{id:'/wrong'}}}}])('fails closed for unsafe model %j',async modelPatch=>{const f=fixture();f.set({modelPatch});expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);});
- it('rejects enabled autoscale from any resource group',async()=>{const f=fixture();f.set({autoscale:[{enabled:true,targetResourceUri:resourceId.toUpperCase()}]});expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);});
+ it('rejects enabled autoscale from any resource group',async()=>{const f=fixture();f.set({autoscale:[autoscaleRule('other-rg',true,resourceId.toUpperCase())]});expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);});
  it.each(['partial','missing-vmid','wrong-id','duplicate','bad-image'])('rejects %s inventories',async kind=>{const f=fixture();const instance=f.cloudInstance();let instances:unknown[]=[];if(kind==='missing-vmid')instances=[{...instance,vmId:undefined}];if(kind==='wrong-id')instances=[{...instance,id:'/wrong'}];if(kind==='duplicate')instances=[instance,instance];if(kind==='bad-image')instances=[{...instance,storageProfile:{}}];f.set({instances});expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);});
  it('rejects unobserved instances and changes identity on reincarnation',async()=>{const f=fixture();f.set({enrolled:false});const snapshot=await f.io.observe(policy,configuration);expect(snapshot.providerAvailable).toBe(false);expect(snapshot.workers).toEqual([]);expect(azureWorkerId(resourceId,'44444444-4444-4444-8444-444444444444')).not.toBe(id);});
  it('fails closed on unavailable provider/native data without raw errors',async()=>{const f=fixture();f.set({failCommand:'vmss show'});expect(await f.io.observe(policy,configuration)).toEqual({observedAt:10000,now:10000,demands:[],workers:[],providerAvailable:false});f.set({failCommand:'unused',nativePatch:{permanentWorkers:undefined}});expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);});
@@ -52,7 +66,7 @@ describe('Azure dedicated VMSS boundary',()=>{
 
  it('refuses bootstrap if Azure never confirms protection',async()=>{const f=fixture();const original=f.options.run!;const io=createAzureElasticFleetIO({...f.options,run:async(args,bounds)=>{const result=await original(args,bounds);if(args[1]==='list-instances'){const rows=JSON.parse(result);for(const row of rows)if(row.instanceId==='1')row.protectionPolicy=null;return JSON.stringify(rows);}return result;}});await expect(io.provision(f.operation())).rejects.toThrow('azure_operation_failed');expect(f.events).toEqual(['scale','protect']);});
  it('preserves permanent workers and strips native diagnostics from snapshots',async()=>{const f=fixture();f.set({nativePatch:{permanentWorkers:[{id:'permanent',managed:false,permanent:true,state:'ready',capabilities:['code'],slots:1,active:0,observedAt:10000,idleSince:0,clean:true,pendingHumanReturns:false,diagnostic:'Bearer secret'} as never]}});const snapshot=await f.io.observe(policy,configuration);expect(snapshot.workers).toHaveLength(2);expect(JSON.stringify(snapshot)).not.toContain('Bearer');await expect(f.io.remove({...f.operation('remove'),workerId:'permanent'})).rejects.toThrow('azure_operation_failed');expect(f.events).toEqual([]);});
- it('keeps read-only observation and inspection free of creation, protection, bootstrap and deletion',async()=>{const f=fixture();await f.io.observe(policy,configuration);await f.io.inspectOperation(f.operation(),configuration);await f.io.inspectOperation(f.operation('beginDrain'),configuration);expect(f.events).toEqual([]);expect(f.commands.every(args=>['show','list-instances','autoscale'].includes(args[1]!))).toBe(true);});
+ it('keeps read-only observation and inspection free of creation, protection, bootstrap and deletion',async()=>{const f=fixture();await f.io.observe(policy,configuration);await f.io.inspectOperation(f.operation(),configuration);await f.io.inspectOperation(f.operation('beginDrain'),configuration);expect(f.events).toEqual([]);expect(f.commands.every(args=>(args[0]==='rest'||['show','list-instances'].includes(args[1]!)))).toBe(true);});
 
  it('retires registration after a successful bodyless delete and confirmed ARM absence',async()=>{
   const f=fixture();const original=f.options.run!;
@@ -68,7 +82,7 @@ describe('Azure dedicated VMSS boundary',()=>{
   await expect(io.remove(f.operation('remove'))).rejects.toThrow('azure_operation_failed');expect(f.events).toEqual(['delete']);
   const deletedAt=f.commands.findIndex(args=>args[1]==='delete-instances');expect(f.commands.slice(deletedAt+1).some(args=>args[1]==='list-instances')).toBe(true);
  });
- it.each(['show','list-instances','autoscale'])('rejects bodyless %s inventory responses',async command=>{
+ it.each(['show','list-instances','--method'])('rejects bodyless %s inventory responses',async command=>{
   const f=fixture();const original=f.options.run!;
   const io=createAzureElasticFleetIO({...f.options,run:async(args,bounds)=>{const result=await original(args,bounds);return args[1]===command?'':result;}});
   expect((await io.observe(policy,configuration)).providerAvailable).toBe(false);
@@ -101,6 +115,93 @@ describe('Azure dedicated VMSS boundary',()=>{
   const io=createAzureElasticFleetIO({...f.options,observeNative:async context=>{const observed=await original(context);return {...observed,managedWorkers:observed.managedWorkers.map(worker=>({...worker,state:'quarantined' as const,slots:null,active:null,clean:null,pendingHumanReturns:null}))};}});
   const observed=await io.observe(policy,configuration);expect(observed.providerAvailable).toBe(true);expect(observed.workers[0]?.slots).toBe(null);
   expect(planFleet(policy,observed)).toMatchObject({add:0,drainIds:[],reasons:['unknown_worker_telemetry']});
+ });
+
+ it('reads every REST page before accepting inventory, including another resource group',async()=>{
+  const nextLink=autoscaleUrl+'&%24skiptoken=next%2Fpage';
+  const f=restFixture([{value:[autoscaleRule()],nextLink},{value:[autoscaleRule('unrelated',true,resourceId.replace('/fleet','/another'))],nextLink:null}]);
+  expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(true);
+  expect(f.commands.filter(args=>args[0]==='rest').map(args=>args[args.indexOf('--url')+1])).toEqual([autoscaleUrl,autoscaleUrl+'&%24skiptoken=next%2Fpage']);
+  const unsafe=restFixture([{value:[],nextLink},{value:[autoscaleRule('other-rg',true)]}]);
+  expect((await unsafe.io.observe(policy,configuration)).providerAvailable).toBe(false);
+  expect(unsafe.commands.some(args=>args[1]==='list-instances')).toBe(false);
+ });
+ it.each([
+  'https://evil.example/subscriptions/x',autoscaleUrl.replace(subscription,'22222222-2222-4222-8222-222222222222'),
+  autoscaleUrl.replace('autoscalesettings','other'),autoscaleUrl.replace('2022-10-01','2021-01-01'),
+  autoscaleUrl.replace('management.azure.com','management%2eazure.com'),autoscaleUrl.replace('azure.com/','azure.com:443/'),
+  autoscaleUrl.replace('/providers/','/%70roviders/'),autoscaleUrl+'&%24skiptoken=%wrong',autoscaleUrl+'&%24skiptoken=',
+  autoscaleUrl+'&evil=value',autoscaleUrl+'&api-version=2022-10-01',autoscaleUrl+'#fragment',
+  autoscaleUrl.replace('https://','https://user@'),autoscaleUrl.replace('https://','http://'),
+  autoscaleUrl.replace('/providers/','/anything/../providers/'),autoscaleUrl+'&%24skiptoken=a&%24skiptoken=b',autoscaleUrl+'&%24skiptoken='+ 'a'.repeat(8192),'',42,
+ ])('never executes an untrusted REST nextLink %j',async nextLink=>{
+  const f=restFixture([{value:[],nextLink}]);expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);
+  expect(f.commands.filter(args=>args[0]==='rest')).toHaveLength(1);
+ });
+ it.each([
+  {},[],{value:{}},{value:[],error:{code:'partial'}},{value:[{enabled:false,targetResourceUri:resourceId}]},
+  {value:[{properties:{enabled:false,targetResourceUri:resourceId}}]},
+  {value:[{...autoscaleRule(),properties:{targetResourceUri:resourceId}}]},
+  {value:[{...autoscaleRule(),properties:{enabled:false}}]},
+  {value:[autoscaleRule('other',true,'garbage')]},{value:[autoscaleRule('other',false,'garbage')]},
+  {value:[{...autoscaleRule(),id:autoscaleRule().id.replace(subscription,'22222222-2222-4222-8222-222222222222')}]},
+  {value:[autoscaleRule(),autoscaleRule()]},'{broken',new Error('Bearer secret'), ' '.repeat(1024*1024+1),
+ ])('fails closed on malformed, duplicate, unavailable or oversized REST page %#',async page=>{
+  const f=restFixture([page]);expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);
+ });
+ it('rejects failed later pages, duplicate records and pagination cycles',async()=>{
+  const nextLink=autoscaleUrl+'&%24skiptoken=next';
+  for(const second of [new Error('failed'),{value:[autoscaleRule()]},{value:[],nextLink}]){
+   const f=restFixture([{value:[autoscaleRule()],nextLink},second]);expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);
+   expect(f.commands.filter(args=>args[0]==='rest')).toHaveLength(2);
+  }
+ });
+ it('bounds REST pagination page count and total response bytes',async()=>{
+  const pages=Array.from({length:33},(_,i)=>({value:[],nextLink:autoscaleUrl+'&%24skiptoken='+i}));
+  const f=restFixture(pages);expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);expect(f.commands.filter(args=>args[0]==='rest')).toHaveLength(32);
+  const largePages=Array.from({length:8},(_,i)=>({value:[],padding:'x'.repeat(800_000),nextLink:autoscaleUrl+'&%24skiptoken='+i}));
+  const g=restFixture(largePages);expect((await g.io.observe(policy,configuration)).providerAvailable).toBe(false);expect(g.commands.filter(args=>args[0]==='rest')).toHaveLength(6);
+ });
+ it('accepts native completion timestamps after an awaited callback advances the clock',async()=>{
+  const f=fixture();const original=f.options.observeNative;
+  const io=createAzureElasticFleetIO({...f.options,observeNative:async context=>{await Promise.resolve();f.set({now:10_500});return original(context);}});
+  expect(await io.observe(policy,configuration)).toMatchObject({providerAvailable:true,observedAt:10_500,now:10_500});
+ });
+ it.each([10_501,0])('still rejects genuinely future or stale native timestamps %i',async observedAt=>{
+  const f=fixture();const original=f.options.observeNative;
+  const io=createAzureElasticFleetIO({...f.options,observeNative:async context=>{await Promise.resolve();f.set({now:40_500});const observation=await original(context);return {...observation,observedAt:observedAt===0?0:40_501};}});
+  expect((await io.observe(policy,configuration)).providerAvailable).toBe(false);
+ });
+
+ it('pins API version when the documented lowercase nextLink omits it',async()=>{
+  const nextLink=`https://management.azure.com/subscriptions/${subscription}/providers/microsoft.insights/autoscalesettings?$skiptoken=opaqueSkipToken`;
+  const f=restFixture([{value:[],nextLink},{value:[]}]);
+  expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(true);
+  expect(f.commands.filter(args=>args[0]==='rest')[1]).toContain(autoscaleUrl+'&%24skiptoken=opaqueSkipToken');
+ });
+ it('detects pagination cycles across equivalent URL spellings',async()=>{
+  const nextLink=autoscaleUrl+'&%24skiptoken=same';
+  const f=restFixture([{value:[],nextLink},{value:[],nextLink:nextLink.replace('Microsoft.Insights','microsoft.insights').replace('%24skiptoken','$skiptoken')}]);
+  expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);
+  expect(f.commands.filter(args=>args[0]==='rest')).toHaveLength(2);
+ });
+ it('fails closed at the shared pagination deadline before requesting another page',async()=>{
+  let clock=0;const timer=vi.spyOn(performance,'now').mockImplementation(()=>clock);
+  try {
+   const f=fixture();const original=f.options.run!;
+   const io=createAzureElasticFleetIO({...f.options,run:async(args,bounds)=>{
+    if(args[0]!=='rest')return original(args,bounds);
+    f.commands.push([...args]);expect(bounds.timeout).toBe(30_000);clock=30_001;
+    return JSON.stringify({value:[],nextLink:autoscaleUrl+'&%24skiptoken=next'});
+   }});
+   expect((await io.observe(policy,configuration)).providerAvailable).toBe(false);
+   expect(f.commands.filter(args=>args[0]==='rest')).toHaveLength(1);
+  } finally {timer.mockRestore();}
+ });
+ it('refuses more than ten thousand settings even when pages and bytes fit',async()=>{
+  const pages=Array.from({length:11},(_,page)=>({value:Array.from({length:page===10?1:1000},(_,i)=>autoscaleRule(`rg${page*1000+i}`)),nextLink:autoscaleUrl+'&%24skiptoken='+page}));
+  const f=restFixture(pages);expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);
+  expect(f.commands.filter(args=>args[0]==='rest')).toHaveLength(11);
  });
 
 });

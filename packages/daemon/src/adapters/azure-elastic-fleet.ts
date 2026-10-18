@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import { execFile } from 'node:child_process';
 import type { ElasticFleetConfiguration, FleetIO, FleetMutation, FleetOperation } from '../domain/elastic-fleet.js';
 import type { FleetDemand, FleetPolicy, FleetSnapshot, FleetWorkerObservation } from '../domain/elastic-fleet-policy.js';
@@ -137,6 +138,53 @@ export function createAzureElasticFleetIO(options: AzureFleetOptions): FleetIO {
     if (response === 'bodyless-delete' && stdout.trim() === '') return undefined;
     return JSON.parse(stdout);
   }
+  async function assertNoAutoscale(configuration: AzurePoolConfiguration): Promise<void> {
+    const route = `/subscriptions/${configuration.subscription}/providers/Microsoft.Insights/autoscalesettings`;
+    const base = `https://management.azure.com${route}?api-version=2022-10-01`;
+    // Only carry the opaque paging token; never execute a provider-supplied URL.
+    function pageUrl(value: unknown): string {
+      if (typeof value !== 'string' || value.length > 8192 || /[\\\s\u0000-\u001f]/.test(value) || /%(?![0-9a-f]{2})/i.test(value)) reject();
+      const parsed = new URL(value);
+      const rawPath = value.match(/^https:\/\/management\.azure\.com(\/[^?#]*)/i)?.[1];
+      if (parsed.origin !== 'https://management.azure.com' || parsed.username || parsed.password || parsed.hash
+        || rawPath?.toLowerCase() !== route.toLowerCase() || parsed.pathname.toLowerCase() !== route.toLowerCase()
+        || [...parsed.searchParams.keys()].some(key => key !== 'api-version' && key !== '$skiptoken')
+        || parsed.searchParams.getAll('api-version').length > 1
+        || (parsed.searchParams.has('api-version') && parsed.searchParams.get('api-version') !== '2022-10-01')
+        || parsed.searchParams.getAll('$skiptoken').length !== 1) reject();
+      const token = parsed.searchParams.get('$skiptoken');
+      if (!token || /[\u0000-\u001f\u007f]/.test(token)) reject();
+      return `${base}&${new URLSearchParams({'$skiptoken':token})}`;
+    }
+    let url = base; let bytes = 0; let count = 0;
+    const seenPages = new Set<string>(); const seenRules = new Set<string>();
+    const deadline = performance.now() + limits.timeout;
+    for (let page = 0; page < 32; page++) {
+      const timeout = Math.floor(deadline-performance.now());
+      if (timeout <= 0 || seenPages.has(url)) reject();
+      seenPages.add(url);
+      const stdout = await run(['rest','--method','get','--url',url,'--subscription',configuration.subscription,'--only-show-errors','--output','json'],{...limits,timeout});
+      if (performance.now() > deadline || typeof stdout !== 'string' || Buffer.byteLength(stdout) > limits.maxBuffer) reject();
+      bytes += Buffer.byteLength(stdout); if (bytes > 4*1024*1024) reject();
+      const body: unknown = JSON.parse(stdout);
+      if (!object(body) || !Array.isArray(body.value) || 'error' in body) reject();
+      for (const rule of body.value) {
+        if (++count > 10_000 || !object(rule) || !text(rule.id) || !object(rule.properties)
+          || typeof rule.properties.enabled !== 'boolean' || !text(rule.properties.targetResourceUri)
+          || !/^\/subscriptions\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/resourceGroups\/[A-Za-z0-9_.-]+\/providers\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)+$/i.test(rule.properties.targetResourceUri)) reject();
+        const parts = rule.id.split('/');
+        if (parts.length !== 9 || parts[0] !== '' || parts[1]?.toLowerCase() !== 'subscriptions' || !sameId(parts[2],configuration.subscription)
+          || parts[3]?.toLowerCase() !== 'resourcegroups' || !name.test(parts[4] ?? '') || parts[5]?.toLowerCase() !== 'providers'
+          || parts[6]?.toLowerCase() !== 'microsoft.insights' || parts[7]?.toLowerCase() !== 'autoscalesettings'
+          || !name.test(parts[8] ?? '') || seenRules.has(rule.id.toLowerCase())) reject();
+        seenRules.add(rule.id.toLowerCase());
+        if (rule.properties.enabled && sameId(rule.properties.targetResourceUri,configuration.resourceId)) reject();
+      }
+      if (body.nextLink === undefined || body.nextLink === null) return;
+      url = pageUrl(body.nextLink);
+    }
+    reject(); // An unfinished list is never evidence that autoscale is absent.
+  }
   const scope = (configuration: AzurePoolConfiguration) => ['--resource-group',configuration.resourceGroup,'--name',configuration.scaleSetName];
   async function inventory(configuration: AzurePoolConfiguration): Promise<{capacity:number;instances:AzureInstance[]}> {
     const model = await command(configuration,['vmss','show',...scope(configuration)]);
@@ -146,9 +194,7 @@ export function createAzureElasticFleetIO(options: AzureFleetOptions): FleetIO {
       || !object(model.upgradePolicy.automaticOSUpgradePolicy) || model.upgradePolicy.automaticOSUpgradePolicy.enableAutomaticOSUpgrade !== false
       || !object(model.automaticRepairsPolicy) || model.automaticRepairsPolicy.enabled !== false || !matchingImage(imageReference(model.virtualMachineProfile),configuration.image)) reject();
     // Autoscale settings may live outside the VMSS resource group; inspect the whole subscription.
-    const autoscale = await command(configuration,['monitor','autoscale','list']);
-    if (!Array.isArray(autoscale) || !autoscale.every(rule => object(rule) && typeof rule.enabled === 'boolean' && text(rule.targetResourceUri))
-      || autoscale.some(rule => object(rule) && sameId(rule.targetResourceUri,configuration.resourceId) && rule.enabled === true)) reject();
+    await assertNoAutoscale(configuration);
     const rows = await command(configuration,['vmss','list-instances',...scope(configuration)]);
     if (!Array.isArray(rows) || rows.length !== model.sku.capacity) reject();
     const instances = rows.map((row):AzureInstance => {
@@ -164,7 +210,7 @@ export function createAzureElasticFleetIO(options: AzureFleetOptions): FleetIO {
     return {capacity:model.sku.capacity,instances};
   }
   async function native(configuration: AzurePoolConfiguration, instances: AzureInstance[], policy: FleetPolicy): Promise<FleetSnapshot> {
-    const current = now(); const observation = await options.observeNative({configuration,instances});
+    const observation = await options.observeNative({configuration,instances}); const current = now();
     if (!object(observation) || !integer(observation.observedAt) || observation.observedAt > current || current-observation.observedAt > policy.pollIntervalSeconds*1000
       || !Array.isArray(observation.demands) || !Array.isArray(observation.managedWorkers) || !Array.isArray(observation.permanentWorkers)) reject();
     const demands = observation.demands.map((d): FleetDemand=>{if(!object(d)||!text(d.id)||!text(d.capability))reject();return {id:d.id,capability:d.capability};});
