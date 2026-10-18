@@ -139,3 +139,16 @@ it('rejects complete EC, DSA and encrypted PKCS8 keys while allowing source head
     const literals = fixture('const headers = ["-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN DSA PRIVATE KEY-----", "-----BEGIN EC PRIVATE KEY-----"];');
     openRuntimeArtifact(literals.descriptor).close();
 });
+
+it.each(['pkcs8', 'encrypted-pkcs1'] as const)('rejects complete %s keys embedded in source independently of surrounding text', format => {
+    const key = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey;
+    const pem = (format === 'pkcs8'
+        ? key.export({ type: 'pkcs8', format: 'pem' })
+        : key.export({ type: 'pkcs1', format: 'pem', cipher: 'aes-256-cbc', passphrase: 'fixture' })).toString().trimEnd();
+    const template = 'export const key = `' + pem + '`;';
+    const splitFooter = ' '.repeat(1024 ** 2 - template.indexOf('-----END') - 10) + template;
+    for (const source of [template, 'source prefix ' + pem + ' source suffix', splitFooter]) {
+        const f = fixture(source);
+        expect(() => { const artifact = openRuntimeArtifact(f.descriptor); artifact.close(); }).toThrow('elastic_artifact_rejected');
+    }
+});

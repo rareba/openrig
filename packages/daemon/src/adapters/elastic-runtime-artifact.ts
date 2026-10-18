@@ -112,7 +112,8 @@ function privateKeyScanner(): (chunk: string) => void {
     const line = (value: string) => {
         value = value.trim();
         if (label) {
-            if (value === `-----END ${label}-----` && body >= 64) throw Error();
+            // The block can end inside a source line, before a closing quote or other host text.
+            if (body >= 64 && value.includes(`-----END ${label}-----`)) throw Error();
             if (/^[A-Za-z0-9+/=]+$/.test(value)) { body += value.length; return; }
             if (value === '' || (!body && /^(?:Proc-Type|DEK-Info):[^\r\n]+$/.test(value))) return;
             label = ''; body = 0;
