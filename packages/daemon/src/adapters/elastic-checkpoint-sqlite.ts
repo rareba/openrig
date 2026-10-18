@@ -39,6 +39,7 @@ export function inspectCheckpointSqlite(path: string): {
     try {
         db.pragma("trusted_schema=OFF");
         db.pragma("query_only=ON");
+        db.pragma("temp_store=MEMORY");
         if (db.pragma("integrity_check", { simple: true }) !== "ok" || (db.pragma("foreign_key_check") as unknown[]).length)
             fail();
         // Invalid UTF8 identifiers/schema cannot safely become SQL identifiers; refuse them explicitly.

@@ -57,7 +57,7 @@ describe("stopped checkpoint bytes", () => {
       "CREATE TABLE extra_runtime(id INTEGER, value TEXT); INSERT INTO extra_runtime VALUES(1,'shutdown-history')",
     );
     const repo = join(root, 'repo'); mkdirSync(repo);
-    const git = (...args:string[]) => execFileSync('/usr/bin/git', args, {cwd:repo,encoding:'utf8'}).trim();
+    const git = (...args:string[]) => execFileSync('/usr/bin/git', args, {cwd:repo,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
     git('init','-b','main');git('config','user.name','test');git('config','user.email','test@example.invalid');
     writeFileSync(join(repo,'committed.txt'),'object-backed business file');git('add','.');git('commit','-m','saved');
     const head = git('rev-parse','HEAD');

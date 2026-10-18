@@ -1,15 +1,17 @@
 import { constants, createDecipheriv, createPrivateKey, createPublicKey, privateDecrypt } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { rmSync } from "node:fs";
+import { CheckpointScratch } from "./elastic-checkpoint-scratch.js";
+import type { CheckpointPrivateStore } from "./elastic-checkpoint-private-store.js";
 import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
-import Database from "better-sqlite3";
-import { workerDigest, ElasticWorkerControl } from "../domain/elastic-worker-control.js";
+import { workerDigest } from "../domain/elastic-worker-control.js";
 import { parseLinuxManifest, type TrustedInstance } from "./linux-privileged-worker-boundary.js";
 import { decodeCheckpointArchive, sha256, type FinalBinding } from "./elastic-worker-checkpoint.js";
 import { aadSchema, canonicalBase64, checkpointFailure as fail, finalBindingSchema, sameBinding, type CheckpointDescriptor } from "./elastic-checkpoint-contract.js";
 import { gitObjectBudget } from "./elastic-checkpoint-git-objects.js";
-import { inspectCheckpointSqlite } from "./elastic-checkpoint-sqlite.js";
+import { inspectArchivedSqlite, requireArchivedSqlitePlatform } from "./elastic-checkpoint-sqlite-isolation.js";
 export interface CheckpointTrust {
     manifestRaw: string;
     instance: TrustedInstance;
@@ -31,7 +33,8 @@ export interface CheckpointVerification {
     gitRepositories: number;
 }
 /** No archived config, hooks, helpers, transports, alternates or worktree pointers reach Git. */
-function verifyGit(files: Map<string, Buffer>, refs: z.infer<typeof manifestSchema>["gitRefs"], roots: string[], scratch: string): number {
+function verifyGit(files: Map<string, Buffer>, refs: z.infer<typeof manifestSchema>["gitRefs"], roots: string[], allocation: CheckpointScratch): number {
+    const scratch = allocation.root;
     const archivedPath = (absolute: string) => {
         const i = roots.findIndex(r => absolute.startsWith(r + "/"));
         if (i < 0 || resolve(absolute) !== absolute)
@@ -54,7 +57,7 @@ function verifyGit(files: Map<string, Buffer>, refs: z.infer<typeof manifestSche
         fail();
     let index = 0;
     const objectBudget = gitObjectBudget();
-    const env = { PATH: "/usr/bin:/bin", HOME: scratch, XDG_CONFIG_HOME: scratch, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "", GIT_ATTR_NOSYSTEM: "1" };
+    const env = { PATH: "/usr/bin:/bin", HOME: "/dev/null", XDG_CONFIG_HOME: "/dev/null", XDG_CACHE_HOME: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "", GIT_ATTR_NOSYSTEM: "1" };
     for (const repo of [...repos].sort()) {
         const declared = refs.filter(r => r.repo === repo);
         if (declared.filter(r => r.ref === "HEAD").length !== 1 || new Set(declared.map(r => r.ref)).size !== declared.length)
@@ -81,9 +84,9 @@ function verifyGit(files: Map<string, Buffer>, refs: z.infer<typeof manifestSche
                 fail();
         }
         const target = join(scratch, `git-${index++}`);
-        mkdirSync(target, { mode: 0o700 });
-        mkdirSync(join(target, "refs"), { mode: 0o700 });
-        mkdirSync(join(target, "objects"), { mode: 0o700 });
+        allocation.directory(target);
+        allocation.directory(join(target, "refs"));
+        allocation.directory(join(target, "objects"));
         const prefix = archivedPath(common) + "/";
         for (const [path, bytes] of files) {
             if (!path.startsWith(prefix))
@@ -99,15 +102,14 @@ function verifyGit(files: Map<string, Buffer>, refs: z.infer<typeof manifestSche
             if (relative.split("/").some(c => c.startsWith("-") || /[\x00-\x20\\:]/.test(c)))
                 fail();
             const destination = join(target, relative);
-            mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-            writeFileSync(destination, bytes, { flag: "wx", mode: 0o600 });
+            allocation.write(destination, bytes);
         }
         const head = text(join(gitDir, "HEAD"));
         if (!/^(?:ref: refs\/[^\x00-\x20]+|[a-f0-9]{40}|[a-f0-9]{64})\n?$/.test(head))
             fail();
-        writeFileSync(join(target, "HEAD"), head, { flag: "wx", mode: 0o600 });
+        allocation.write(join(target, "HEAD"), head);
         const objectFormat = declared[0]!.sha.length === 64 ? "[extensions]\nobjectFormat=sha256\n" : "";
-        writeFileSync(join(target, "config"), `[core]\nbare=true\nrepositoryformatversion=${objectFormat ? 1 : 0}\n${objectFormat}`, { flag: "wx", mode: 0o600 });
+        allocation.write(join(target, "config"), `[core]\nbare=true\nrepositoryformatversion=${objectFormat ? 1 : 0}\n${objectFormat}`);
         const git = (args: string[]) => execFileSync("/usr/bin/git", ["--no-optional-locks", `--git-dir=${target}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never", "-c", "credential.helper=", ...args], { cwd: scratch, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10000, maxBuffer: 8 * 1024 * 1024 });
         const actual = [{ ref: "HEAD", sha: git(["rev-parse", "--verify", "HEAD"]).trim() }, ...git(["for-each-ref", "--format=%(refname) %(objectname)"]).trim().split("\n").filter(Boolean).map(line => { const [ref, sha] = line.split(" "); return { ref, sha }; })];
         if (workerDigest(actual.sort((a, b) => a.ref!.localeCompare(b.ref!))) !== workerDigest(declared.map(({ ref, sha }) => ({ ref, sha })).sort((a, b) => a.ref.localeCompare(b.ref))))
@@ -120,6 +122,7 @@ function verifyGit(files: Map<string, Buffer>, refs: z.infer<typeof manifestSche
                 if (!pointer.endsWith("/.git") || !repos.has(dirname(pointer)) || !files.has(archivedPath(pointer)))
                     fail();
             }
+        allocation.remove(target);
     }
     return repos.size;
 }
@@ -129,10 +132,16 @@ export function verifyCheckpointBytes(input: {
     ciphertext: Buffer;
     privateKeyPem: Buffer;
     scratchParent: string;
+    storage: {
+        store: CheckpointPrivateStore;
+        ceiling: number;
+    };
 }): CheckpointVerification {
+    requireArchivedSqlitePlatform();
     const { descriptor: d, trust } = input;
     const manifest = parseLinuxManifest(trust.manifestRaw);
-    const scratch = mkdtempSync(join(input.scratchParent, "verify-"));
+    const scratch = join(input.scratchParent, `verify-${randomBytes(12).toString("hex")}`);
+    const allocation = new CheckpointScratch(input.storage.store, scratch, input.storage.ceiling);
     let plaintext: Buffer | undefined;
     try {
         if (sha256(trust.manifestRaw) !== d.binding.manifestDigest || trust.instance.vmId !== d.binding.vmId || trust.instance.manifestDigest !== d.binding.manifestDigest || trust.instance.fleetEpoch !== d.binding.fleetEpoch || trust.instance.resourceId !== manifest.resourceId || trust.instance.imageReference !== manifest.linux.imageReference || sha256(input.ciphertext) !== d.ciphertextSha256 || input.ciphertext.length !== d.ciphertextBytes)
@@ -197,30 +206,24 @@ export function verifyCheckpointBytes(input: {
             if (!metadata || metadata.path !== path || !bytes)
                 fail();
             const target = join(scratch, `${i}.sqlite`);
-            writeFileSync(target, bytes, { flag: "wx", mode: 0o600 });
-            const checked = inspectCheckpointSqlite(target);
+            allocation.write(target, bytes);
+            const { inspection: checked, native } = inspectArchivedSqlite(target, source === manifest.linux.database);
             if (metadata.schemaDigest !== checked.schemaDigest || workerDigest(metadata.tables) !== workerDigest(checked.tables))
                 fail();
             sqlite.push({ path, logicalDigest: checked.logicalDigest });
             if (source === manifest.linux.database) {
-                const db = new Database(target, { readonly: true, fileMustExist: true });
-                try {
-                    db.pragma("trusted_schema=OFF");
-                    const control = new ElasticWorkerControl(db);
-                    const state = control.read();
-                    const ledger = control.ledger();
-                    if (!state || state.phase !== "sealed" || state.generation !== d.binding.drainGeneration || state.drainOperationId !== d.binding.removalOperationId || state.workerId !== d.binding.workerId || state.vmId !== d.binding.vmId || state.manifestDigest !== d.binding.manifestDigest || !ledger.complete || !ledger.clean || workerDigest(state) !== workerDigest(audit.state) || workerDigest(ledger) !== workerDigest(audit.ledger))
-                        fail();
-                }
-                finally {
-                    db.close();
-                }
+                if (!native)
+                    fail();
+                const { state, ledger } = native;
+                if (!state || state.phase !== "sealed" || state.generation !== d.binding.drainGeneration || state.drainOperationId !== d.binding.removalOperationId || state.workerId !== d.binding.workerId || state.vmId !== d.binding.vmId || state.manifestDigest !== d.binding.manifestDigest || !ledger.complete || !ledger.clean || workerDigest(state) !== workerDigest(audit.state) || workerDigest(ledger) !== workerDigest(audit.ledger))
+                    fail();
             }
+            allocation.remove(target);
         }
         // The archive may not introduce extra SQLite artifacts under an allowed prefix.
         if ([...files.keys()].filter(p => p.startsWith("sqlite/")).length !== m.sqlite.length)
             fail();
-        const gitRepositories = verifyGit(files, m.gitRefs, manifest.ownedRoots, scratch);
+        const gitRepositories = verifyGit(files, m.gitRefs, manifest.ownedRoots, allocation);
         return { version: 1, checkpointId: d.checkpointId, manifestDigest: d.manifestDigest, archiveSha256: aad.archiveSha256, archiveBytes: plaintext.length, entries: files.size, sqlite, gitRepositories };
     }
     catch {

@@ -11,7 +11,8 @@ import { parseLinuxManifest, privateIPv4 } from "./linux-privileged-worker-bound
 import { sha256, type FinalBinding } from "./elastic-worker-checkpoint.js";
 import { verifyCustodyReceipt, type CheckpointCapability, type CustodyReceiptBody, type SignedCustodyReceipt } from "./elastic-checkpoint-upload.js";
 import { checkpointDescriptorSchema, checkpointDigest, checkpointFailure as fail, finalBindingSchema, sameBinding, type CheckpointDescriptor } from "./elastic-checkpoint-contract.js";
-import { CheckpointPrivateStore } from "./elastic-checkpoint-private-store.js";
+import { CheckpointPrivateStore, exclusiveCollision } from "./elastic-checkpoint-private-store.js";
+import { requireArchivedSqlitePlatform } from "./elastic-checkpoint-sqlite-isolation.js";
 import { verifyCheckpointBytes, type CheckpointTrust, type CheckpointVerification } from "./elastic-checkpoint-verifier.js";
 const instanceSchema = z.object({ version: z.literal(1), imageReference: z.string().max(1024), resourceId: z.string().max(1024), vmId: z.string().max(512), manifestDigest: checkpointDigest, fleetEpoch: z.string().max(512), operationId: z.string().max(512), privateIPv4: z.string().max(64) }).strict();
 const enrollmentSchema = z.object({ version: z.literal(1), resourceId: z.string().max(1024), vmId: z.string().max(512), nonce: z.string().max(512), manifestDigest: checkpointDigest, operationId: z.string().max(512), fleetEpoch: z.string().max(512) }).strict();
@@ -43,8 +44,10 @@ export class CheckpointCustody {
     private readonly store: CheckpointPrivateStore;
     private activeUploads = 0;
     private inflightBytes = 0;
-    private capacity(extra: number): void { if (this.store.allocatedBytes() + this.inflightBytes + extra > this.options.maxStoredBytes)
-        fail(); }
+    private capacity(extra: number): void {
+        if (this.store.allocatedBytes() + this.inflightBytes + extra > this.options.maxStoredBytes)
+            fail();
+    }
     private readonly tlsKeyDigests = new Set<string>();
     assertSeparateTlsKey(publicKeyDer: Buffer): void {
         try {
@@ -64,12 +67,14 @@ export class CheckpointCustody {
     constructor(private readonly options: CheckpointCustodyOptions) {
         if (!/^[A-Za-z0-9_-]{1,128}$/.test(options.retentionPolicyId) || !Number.isSafeInteger(options.maxStoredBytes) || options.maxStoredBytes < options.maxBytes || options.maxStoredBytes > 1024 ** 4 || !/^[A-Za-z0-9_-]{1,128}$/.test(options.durableStoreId) || !Number.isSafeInteger(options.maxBytes) || options.maxBytes < 1 || options.maxBytes > 528 * 1024 * 1024 || !Number.isSafeInteger(options.maxReservedBytes) || options.maxReservedBytes < options.maxBytes || !Number.isSafeInteger(options.maxCheckpoints) || options.maxCheckpoints < 1 || options.maxCheckpoints > 1024)
             fail();
-        this.store = (() => { try {
-            return new CheckpointPrivateStore(options.directory);
-        }
-        catch {
-            return fail();
-        } })();
+        this.store = (() => {
+            try {
+                return new CheckpointPrivateStore(options.directory);
+            }
+            catch {
+                return fail();
+            }
+        })();
     }
     private exact(path: string, bytes: Buffer | string): void {
         const raw = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
@@ -81,7 +86,9 @@ export class CheckpointCustody {
         try {
             this.store.write(path, raw);
         }
-        catch {
+        catch (error) {
+            if (!exclusiveCollision(error))
+                throw error;
             if (!this.store.read(path, Math.max(raw.length, 128 * 1024)).equals(raw))
                 fail();
         }
@@ -230,10 +237,15 @@ export class CheckpointCustody {
             const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
             let size = 0;
             const hash = createHash("sha256");
-            const check = new Transform({ transform(chunk: Buffer, _enc, cb) { size += chunk.length; if (size > d.ciphertextBytes) {
-                    cb(Error("checkpoint_custody_rejected"));
-                    return;
-                } hash.update(chunk); cb(null, chunk); } });
+            const check = new Transform({ transform(chunk: Buffer, _enc, cb) {
+                    size += chunk.length;
+                    if (size > d.ciphertextBytes) {
+                        cb(Error("checkpoint_custody_rejected"));
+                        return;
+                    }
+                    hash.update(chunk);
+                    cb(null, chunk);
+                } });
             const timer = setTimeout(() => input.body.destroy(Error("checkpoint_custody_rejected")), 30000);
             timer.unref();
             try {
@@ -251,9 +263,9 @@ export class CheckpointCustody {
                 try {
                     linkSync(temp, destination);
                 }
-                catch {
-                    if (!existsSync(destination))
-                        fail();
+                catch (error) {
+                    if (!exclusiveCollision(error))
+                        throw error;
                 }
             }
             unlinkSync(temp);
@@ -291,8 +303,9 @@ export class CheckpointCustody {
         return { dir, descriptor };
     }
     verify(id: string): SignedCustodyReceipt {
+        requireArchivedSqlitePlatform();
         try {
-            this.capacity(this.options.maxBytes * 3 + 1024 * 1024);
+            this.capacity(128 * 1024);
             const { dir, descriptor: d } = this.descriptor(id);
             const { saved } = this.reservation(id);
             const attempt = this.attempt(saved.attemptId);
@@ -300,7 +313,7 @@ export class CheckpointCustody {
             let evidence: CheckpointVerification;
             try {
                 const bytes = this.store.read(join(dir, "ciphertext"), this.options.maxBytes);
-                evidence = verifyCheckpointBytes({ descriptor: d, trust: attempt.saved.trust, ciphertext: bytes, privateKeyPem: key, scratchParent: dir });
+                evidence = verifyCheckpointBytes({ descriptor: d, trust: attempt.saved.trust, ciphertext: bytes, privateKeyPem: key, scratchParent: dir, storage: { store: this.store, ceiling: this.options.maxStoredBytes - this.inflightBytes } });
                 this.exact(join(dir, "verification.json"), JSON.stringify(evidence));
                 this.exact(join(dir, "verified-commit.json"), JSON.stringify({ version: 1, checkpointId: id, evidenceSha256: sha256(JSON.stringify(evidence)), descriptorSha256: sha256(JSON.stringify(d)), keyDigest: attempt.saved.keyDigest }));
                 // Original per-enrollment RSA key; receipt is published only after evidence/ciphertext fsync.
@@ -311,9 +324,9 @@ export class CheckpointCustody {
                     try {
                         this.store.write(receiptPath, JSON.stringify(receipt));
                     }
-                    catch {
-                        if (!existsSync(receiptPath))
-                            fail();
+                    catch (error) {
+                        if (!exclusiveCollision(error))
+                            throw error;
                     }
                 }
                 return this.receipt(id)!;

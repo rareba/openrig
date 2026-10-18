@@ -2,6 +2,7 @@ import { constants, closeSync, existsSync, linkSync, unlinkSync, readdirSync, fs
 import { randomBytes } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { checkpointFailure } from "./elastic-checkpoint-contract.js";
+export function exclusiveCollision(error: unknown): boolean { return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST"; }
 /** Dedicated operator-configured retained controller store; never an archived worker path. */
 export class CheckpointPrivateStore {
     readonly root: string;
@@ -19,23 +20,34 @@ export class CheckpointPrivateStore {
                 break;
         }
     }
-    private confined(path: string): void { if (resolve(path) !== path || !(path === this.root || path.startsWith(this.root + "/")))
-        checkpointFailure(); }
+    private confined(path: string): void {
+        if (resolve(path) !== path || !(path === this.root || path.startsWith(this.root + "/")))
+            checkpointFailure();
+    }
     directory(path: string): void {
         this.confined(path);
         const s = lstatSync(path);
         if (!s.isDirectory() || s.isSymbolicLink() || s.uid !== process.getuid?.() || (s.mode & 0o777) !== 0o700 || realpathSync(path) !== path)
             checkpointFailure();
     }
-    sync(path: string): void { this.confined(path); const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW); try {
-        fsyncSync(fd);
+    sync(path: string): void {
+        this.confined(path);
+        const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+            fsyncSync(fd);
+        }
+        finally {
+            closeSync(fd);
+        }
     }
-    finally {
-        closeSync(fd);
-    } }
     existing(name: string): string {
-        if (!/^[a-f0-9]{64}$/.test(name)) checkpointFailure();
-        this.directory(this.root); const path=join(this.root,name); this.directory(path); return path;
+        if (!/^[a-f0-9]{64}$/.test(name))
+            checkpointFailure();
+        this.directory(this.root);
+        const path = join(this.root, name);
+        this.directory(path);
+        this.sync(this.root);
+        return path;
     }
     child(name: string): string {
         if (!/^[a-f0-9]{64}$/.test(name))
@@ -44,13 +56,13 @@ export class CheckpointPrivateStore {
         const path = join(this.root, name);
         try {
             mkdirSync(path, { mode: 0o700 });
-            this.sync(this.root);
         }
         catch (e) {
-            if (!existsSync(path))
+            if (!exclusiveCollision(e))
                 throw e;
         }
         this.directory(path);
+        this.sync(this.root);
         return path;
     }
     read(path: string, max = 128 * 1024): Buffer {
@@ -77,6 +89,8 @@ export class CheckpointPrivateStore {
             const after = fstatSync(fd);
             if (b.length !== a.size || a.ino !== after.ino || a.size !== after.size || a.mtimeMs !== after.mtimeMs)
                 checkpointFailure();
+            fsyncSync(fd);
+            this.sync(dirname(path));
             return b;
         }
         finally {
@@ -105,20 +119,29 @@ export class CheckpointPrivateStore {
     }
     allocatedBytes(): number {
         let total = 0, count = 0;
-        const visit = (path: string): void => { this.directory(path); for (const name of readdirSync(path)) {
-            if (++count > 200000)
+        const visit = (path: string): void => {
+            this.directory(path);
+            const directoryStat = lstatSync(path);
+            if (!Number.isSafeInteger(directoryStat.blocks) || directoryStat.blocks < 0)
                 checkpointFailure();
-            const child = join(path, name), stat = lstatSync(child);
-            if (stat.isDirectory())
-                visit(child);
-            else {
-                if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o600)
+            total += directoryStat.blocks * 512;
+            for (const name of readdirSync(path)) {
+                if (++count > 200000)
                     checkpointFailure();
-                total += stat.size;
-                if (!Number.isSafeInteger(total))
-                    checkpointFailure();
+                const child = join(path, name), stat = lstatSync(child);
+                if (stat.isDirectory())
+                    visit(child);
+                else {
+                    if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o600)
+                        checkpointFailure();
+                    if (!Number.isSafeInteger(stat.blocks) || stat.blocks < 0)
+                        checkpointFailure();
+                    total += stat.blocks * 512;
+                    if (!Number.isSafeInteger(total))
+                        checkpointFailure();
+                }
             }
-        } };
+        };
         visit(this.root);
         return total;
     }
