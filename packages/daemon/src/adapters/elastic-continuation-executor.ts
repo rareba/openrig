@@ -34,7 +34,7 @@ export class ElasticContinuationExecutor {
     if(action)return this.executeOwnedContinuation(action.action_id);
     for(const candidate of view.candidates) {
       const manifest=continuationManifest();
-      const kind=validateWithdrawalTarget(this.db,candidate.target,manifest);
+      const kind=validateWithdrawalTarget(this.db,candidate.outboxId,candidate.target,manifest);
       const issued=issueOwnedSuccessor(this.db,candidate.outboxId,candidate.target,kind);
       return this.executeOwnedContinuation(issued.actionId);
     }

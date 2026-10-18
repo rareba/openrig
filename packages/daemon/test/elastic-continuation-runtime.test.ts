@@ -10,8 +10,8 @@ import { QueueRepository } from '../src/domain/queue-repository.js';
 import { EventBus } from '../src/domain/event-bus.js';
 import { OutboxHandler } from '../src/domain/outbox-handler.js';
 import { ElasticWorkerControl } from '../src/domain/elastic-worker-control.js';
-import { continuationProcessSchema, issueWithdrawalAction, issueOwnedSuccessor, nativeContinuation, readContinuationAction, type ContinuationAction } from '../src/domain/elastic-continuation.js';
-import { continuationManifest, observeContinuationTarget, reconcileOwnedContinuation, verifyContinuationProcess } from '../src/adapters/elastic-owned-continuation.js';
+import { continuationProcessSchema, continuationTransition, issueWithdrawalAction, issueOwnedSuccessor, nativeContinuation, readContinuationAction, type ContinuationAction } from '../src/domain/elastic-continuation.js';
+import { continuationManifest, observeContinuationTarget, reconcileOwnedContinuation, spawnOwnedContinuation, validateWithdrawalTarget, verifyContinuationProcess } from '../src/adapters/elastic-owned-continuation.js';
 import { assertElasticEffectAllowed, assertElasticContinuationAllowed, assertElasticTmuxEffectAllowed, withElasticContinuationTransport } from '../src/domain/elastic-worker-guard.js';
 import { SeatDeliveryGuard } from '../src/domain/seat-delivery-guard.js';
 import { TmuxAdapter } from '../src/adapters/tmux.js';
@@ -57,12 +57,13 @@ describe.skipIf(process.platform!=='linux'||!root)('owned continuation across th
     const answer=activationResume ? {replyQitemId:queue.activateHumanResponseReturn({qitemId:question.qitemId,actorSession:'human@kernel',fingerprint:'fingerprint'}).qitemId} : queue.recordHumanResponse({qitemId:question.qitemId,requestRevision:question.humanRequestRevision!,actorSession:'human@kernel',replyId:'reply',response:{kind:'custom',text:'Continue the existing task'}});
     const outboxId=`wake-intent-${answer.replyQitemId}`,target=observeContinuationTarget(db,outboxId,manifest),native=nativeContinuation(db,outboxId).native;
     if(activationResume){process.kill(ids.runnerPid,'SIGTERM');await until(()=>{try{verifyContinuationProcess(target,'absent',manifest);return true;}catch{return false;}},'initial processes gone');}
+    if(activationResume)expect(validateWithdrawalTarget(db,outboxId,target,manifest)).toBe('resume-conversation');
     const action=db.transaction(()=>issueWithdrawalAction(db,{identity:fixed.identity,generation:1,operationId:'begin-1',withdrawalId:'22222222-2222-4222-8222-222222222222',outboxId,queueDigest:native.queue_digest,target},activationResume?'resume-conversation':'existing-runner')).immediate();
     const typed=new TmuxAdapter(async()=>{throw Error('shell transport forbidden');},undefined,async argv=>{assertElasticTmuxEffectAllowed(argv);return tm(argv.slice(1));});
     typed.deliveryGuard=new SeatDeliveryGuard(db,()=>({nodeId:'node',session:'owner@rig',occupant:'occupant',pane}));
     const messages=()=>readFileSync(sessionFile,'utf8').trim().split('\n').slice(1).map(line=>JSON.parse(line));
     const prove=async(a:ContinuationAction)=>{await until(()=>reconcileOwnedContinuation(db,a.actionId)==='proved',`native consumption ${a.actionId}`);};
-    return {fixed,manifest,db,queue,control,typed,action,ids,target,tm,pane,sidecar,sessionFile,messages,prove};
+    return {fixed,manifest,db,queue,control,typed,action,ids,target,tm,pane,sidecar,sessionFile,messages,prove,baseline};
   }
   it('consumes the exact native human wake once, then resumes that conversation for its native successor',async()=>{
     const f=await fixture();expect(procIdentity(f.ids.runnerPid).uid).toBe(501);expect(procIdentity(f.ids.childPid).ppid).toBe(f.ids.runnerPid);
@@ -92,6 +93,33 @@ describe.skipIf(process.platform!=='linux'||!root)('owned continuation across th
     expect(f.control.beginDrain(f.fixed.identity,'distinct-begin-3')).toMatchObject({phase:'draining',generation:3});
     expect(()=>assertElasticContinuationAllowed(successor.actionId,f.db)).toThrow();
     expect(f.db.prepare('SELECT generation,purpose FROM elastic_worker_generations ORDER BY generation').all()).toEqual([{generation:1,purpose:'removal'},{generation:2,purpose:'continuation'},{generation:3,purpose:'removal'}]);
+  },20000);
+  it.each(['before-claim','after-claim'] as const)('denies a replacement native runner %s without spawning another child',async point=>{
+    const f=await fixture(true);
+    const oldSidecar=readFileSync(f.sidecar,'utf8');
+    f.tm(['new-window','-d','-t','=owner@rig:','-n','replacement',f.baseline.replace('initial-launch','replacement-launch')]);
+    await until(()=>{try{const s=JSON.parse(readFileSync(f.sidecar,'utf8'));return s.ready&&s.launchId==='replacement-launch';}catch{return false;}},'replacement native runner');
+    const replacement=readFileSync(f.sidecar,'utf8');
+    const ids=continuationProcessSchema.parse(JSON.parse(replacement).processIdentity);
+    expect(()=>process.kill(ids.runnerPid,0)).not.toThrow();expect(()=>process.kill(ids.childPid,0)).not.toThrow();
+    if(point==='after-claim'){
+      writeFileSync(f.sidecar,oldSidecar);
+      f.db.function('replace_native_sidecar',()=>{writeFileSync(f.sidecar,replacement);return 1;});
+      f.db.exec("CREATE TRIGGER replace_at_spawn AFTER UPDATE OF stage ON elastic_continuation_actions WHEN NEW.stage='spawn-issued' BEGIN SELECT replace_native_sidecar(); END");
+    }
+    continuationTransition(f.db,f.action.actionId,'prepared','transport-issued');
+    expect(f.action.effect.kind).toBe('resume-conversation');
+    if(f.action.effect.kind!=='resume-conversation')throw Error('fixture requires resume');
+    const launchId=f.action.effect.launchId;
+    let spawned:ReturnType<typeof spawnOwnedContinuation>|undefined;
+    try {
+      expect(()=>{spawned=spawnOwnedContinuation(f.db,f.action.actionId,{sessionName:f.target.session,stateRoot:f.target.stateRoot,cwd:f.target.cwd,launchId,sessionFile:f.target.sessionFile,model:f.target.model??undefined,trust:'no-approve'},process.env);}).toThrow('elastic_continuation_denied');
+      expect(spawned).toBeUndefined();
+      expect(readContinuationAction(f.db,f.action.actionId)).toMatchObject({stage:point==='before-claim'?'transport-issued':'spawn-issued',runner:null});
+      expect(f.messages()).toEqual([]);
+      expect(f.db.prepare('SELECT COUNT(*) AS n FROM elastic_continuation_actions').get()).toEqual({n:1});
+      expect(JSON.parse(readFileSync(f.sidecar,'utf8')).processIdentity).toEqual(ids);
+    } finally {spawned?.kill();}
   },20000);
   it('derives native staged activation and refuses missing-conversation resume without a fresh child',async()=>{
     const f=await fixture(true);expect(f.action.parentId).toBeNull();

@@ -1104,7 +1104,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   fs.mkdirSync(paths.agentDir, { recursive: true });
   fs.mkdirSync(paths.sessionsDir, { recursive: true });
 
-  const { catchUpSince } = prepareRunnerSidecar(
+  // Continuation spawn must still see the complete prior native runner identity.
+  const { catchUpSince } = args.continuationActionId
+    ? { catchUpSince: parsePiRunnerState(fs.readFileSync(paths.runnerStatePath, "utf8"))?.lastEntryId }
+    : prepareRunnerSidecar(
     {
       readFile: (p) => fs.readFileSync(p, "utf8"),
       writeFile: (p, c) => fs.writeFileSync(p, c),

@@ -24,7 +24,7 @@ import { parseHelperPayload } from '../src/adapters/elastic-worker-helper.js';
 import { parseLinuxManifest } from '../src/adapters/linux-privileged-worker-boundary.js';
 import { openCheckpointCapability } from '../src/domain/elastic-enrollment.js';
 import { verifyCustodyReceipt, type SignedCustodyReceipt } from '../src/adapters/elastic-checkpoint-upload.js';
-import type { FleetMutation } from '../src/domain/elastic-fleet.js';
+import { ElasticFleetService, type FleetMutation } from '../src/domain/elastic-fleet.js';
 import type { AzureRemovalSeal } from '../src/adapters/azure-elastic-fleet.js';
 const cleanup: Array<() => void | Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -106,6 +106,9 @@ async function fixture() {
         const action=worker.transaction(()=>issueWithdrawalAction(worker,p,'existing-runner')).immediate();
         output={withdrawalId:p.withdrawalId,generation:action.generation,actionId:action.actionId};
       }
+      else if(request.operation==='finish-continuation') {
+        native.retireContinuation();output={generation:p.generation,retired:true,dispositionDigest:native.generation()!.disposition_digest};
+      }
       else if (request.operation === 'quiesce') {
         native.sealAdmission(p.binding, p.binding.drainGeneration); stopped = true;
         worker.exec('CREATE TABLE shutdown_business(value TEXT); INSERT INTO shutdown_business VALUES (\'last shutdown write\')');
@@ -174,7 +177,7 @@ async function fixture() {
   const turn = <T>(fn: () => Promise<T>) => owner.run('fleet', async () => { expect(owner.claimFleet('fixture-reconcile')).toBe(true); try { return await fn(); } finally { owner.releaseFleet('fixture-reconcile'); } });
   const io = createAzureElasticFleetIO({ run, now: () => clock, lifecycle, observeNative: async () => { throw Error('not used for removal'); },
     beginDrain: c => lifecycle.beginDrain(c), sealForRemoval: c => lifecycle.sealForRemoval(c), retireRegistration: c => lifecycle.retireRegistration(c) });
-  return { root, db, worker, native, a, owner, store, lifecycle, makeLifecycle, custody, io, operations, context, turn, registry, configuration, instance,
+  return { root, db, worker, native, a, owner, store, lifecycle, makeLifecycle, custody, projection, enrollment, now:()=>clock, io, operations, context, turn, registry, configuration, instance,
     prepareLateHuman:()=>{lateHuman=true;worker.exec(`INSERT INTO rigs(id,name) VALUES('rig','rig'); INSERT INTO nodes(id,rig_id,logical_id,runtime,cwd) VALUES('node','rig','owner','pi','/fixture');
       INSERT INTO sessions(id,node_id,session_name,resume_type,resume_token) VALUES('session','node','worker-a@elastic','pi_session_file','/fixture/session.jsonl');
       INSERT INTO bindings(id,node_id,tmux_session,tmux_pane) VALUES('binding','node','worker-a@elastic','%1');
@@ -332,4 +335,61 @@ it.each(['intent','submitted','unknown'] as const)('never withdraws after a pers
   await f.turn(async()=>{f.lifecycle.journal.advance(current,{commands:current.commands.map(c=>c.operation==='quiesce'?{...c,state}:c)});});
   f.unknown(true);await expect(f.turn(()=>f.lifecycle.sealForRemoval(f.context('remove')))).rejects.toThrow();
   expect(f.operations).toEqual(['begin-drain','quiesce']);expect(f.lifecycle.journal.read(f.a.id)?.withdrawal).toBeNull();
+});
+
+it.each(['projection','idle-delete'] as const)('repairs a finished journal after a real SQLite %s failure exactly once, then drains in a new generation',async point=>{
+  const f=await fixture();f.prepareLateHuman();await drain(f);f.answerLateHuman();
+  await expect(f.turn(()=>f.lifecycle.sealForRemoval(f.context('remove')))).rejects.toThrow();
+  await expect(f.turn(()=>f.lifecycle.sealForRemoval(f.context('remove')))).rejects.toThrow('withdrawn');
+  const operation=f.context('remove').operation,config=operation.configuration;
+  f.db.prepare("INSERT INTO elastic_fleet_operations VALUES(?,?,'withdrawn',?,?,?,?,?,?,NULL,?,?)").run(operation.operationId,operation.type,operation.workerId,operation.count,operation.targetCapacity,operation.revision,JSON.stringify(operation.snapshot),JSON.stringify(config),operation.createdAt,operation.updatedAt);
+  f.db.prepare("INSERT INTO elastic_fleet_drains VALUES(?,?,'continuation','drain-1',?,?)").run(f.a.workerId,config.policy.poolId,f.now(),f.now());
+  f.db.prepare('INSERT INTO elastic_idle_windows VALUES(?,?,?,?,?,?)').run(f.a.workerId,'old','old','old',0,0);
+  // Native runtime consumption is covered in the runner fixture; seed only that proof for this coordinator crash test.
+  f.worker.exec("UPDATE elastic_continuation_actions SET stage='proved',proved_at=1; UPDATE elastic_worker_generations SET progress_at=1 WHERE generation=2; UPDATE queue_items SET state='done',ts_updated='fresh-disposition'; UPDATE outbox_entries SET delivery_state='delivered'");
+  f.db.exec(point==='projection'?"CREATE TRIGGER fail_finish BEFORE UPDATE ON elastic_fleet_drains WHEN NEW.state='continuation-finished' BEGIN SELECT RAISE(ABORT,'crash_after_finished_journal'); END":"CREATE TRIGGER fail_finish BEFORE DELETE ON elastic_idle_windows BEGIN SELECT RAISE(ABORT,'crash_during_idle_reset'); END");
+  await f.turn(()=>f.lifecycle.reconcileContinuations(config));
+  await f.turn(()=>f.lifecycle.reconcileContinuations(config));
+  const finished=f.lifecycle.journal.read(f.a.id)!;
+  expect(finished.withdrawal?.finished).toBe(true);
+  expect(finished.commands.at(-1)).toMatchObject({operation:'finish-continuation',state:'succeeded'});
+  expect(f.db.prepare('SELECT state FROM elastic_fleet_drains').get()).toEqual({state:'continuation'});
+  expect(f.db.prepare('SELECT first_at FROM elastic_idle_windows').get()).toEqual({first_at:0});
+  f.db.exec('DROP TRIGGER fail_finish');
+  const restarted=f.makeLifecycle();
+  await f.turn(()=>restarted.reconcileContinuations(config));
+  expect(f.db.prepare('SELECT state FROM elastic_fleet_drains').get()).toEqual({state:'continuation-finished'});
+  expect(f.db.prepare('SELECT * FROM elastic_idle_windows').get()).toBeUndefined();
+  expect(restarted.journal.read(f.a.id)).toEqual(finished);
+  const observer=new ElasticFleetProjection(f.db,f.now);
+  const calls: FleetMutation[]=[];
+  const service=new ElasticFleetService(f.db,{
+    observe:async()=>{
+      await restarted.reconcileContinuations(config);
+      const observed=await f.enrollment.observeManagedWorker(f.a,f.configuration);
+      const worker={...operation.snapshot.workers[0]!,observedAt:f.now()};
+      const idleSince=observer.idleSince(f.a,{...observed,worker},120000);
+      return {...operation.snapshot,now:f.now(),observedAt:f.now(),workers:[{...worker,idleSince}]};
+    },
+    beginDrain:async op=>{calls.push(op);await restarted.beginDrain({...f.context('beginDrain'),operation:op});},
+    provision:async()=>{throw Error('unexpected provision');},remove:async()=>{throw Error('unexpected removal');},
+    inspectOperation:async op=>{await restarted.beginDrain({...f.context('beginDrain'),operation:{...op,configuration:config,policy:config.policy}});return 'succeeded';},
+  },f.now,f.owner);
+  await service.reconcile();const since=f.now();
+  expect(f.db.prepare('SELECT first_at FROM elastic_idle_windows').get()).toEqual({first_at:since});
+  // A later drain row and its new idle interval cannot be reset by the older finished journal.
+  f.db.prepare("UPDATE elastic_fleet_drains SET begin_operation_id='later-drain',state='continuation'").run();
+  await f.turn(()=>restarted.reconcileContinuations(config));
+  expect(f.db.prepare('SELECT state,begin_operation_id FROM elastic_fleet_drains').get()).toEqual({state:'continuation',begin_operation_id:'later-drain'});
+  expect(f.db.prepare('SELECT first_at FROM elastic_idle_windows').get()).toEqual({first_at:since});
+  f.db.prepare("UPDATE elastic_fleet_drains SET begin_operation_id='drain-1',state='continuation-finished'").run();
+  for(let i=0;i<14;i++){f.advanceClock(60000,60000);await service.reconcile();}
+  f.advanceClock(59999,59999);await service.reconcile();expect(calls).toEqual([]);
+  expect(f.db.prepare('SELECT first_at FROM elastic_idle_windows').get()).toEqual({first_at:since});
+  f.advanceClock(1,1);await service.reconcile();expect(calls).toHaveLength(1);
+  expect(calls[0]!.operationId).not.toBe('drain-1');
+  await service.reconcile();
+  expect(f.native.read()).toMatchObject({generation:3,drainOperationId:calls[0]!.operationId});
+  expect(restarted.journal.read(f.a.id)).toMatchObject({beginOperationId:calls[0]!.operationId,drain:{generation:3}});
+  expect(f.operations.filter(op=>op==='finish-continuation')).toHaveLength(1);
 });

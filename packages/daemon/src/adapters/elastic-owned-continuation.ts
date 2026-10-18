@@ -69,8 +69,12 @@ export function observeContinuationTarget(db:Database.Database,outboxId:string,m
   if(sidecar?.sessionFile!==target.sessionFile)deny();sessionHeader(target.sessionFile,target.conversation);
   return target;
 }
-export function validateWithdrawalTarget(db:Database.Database,target:ContinuationTarget,manifest:LinuxWorkerManifest):'existing-runner'|'resume-conversation' {
+function assertCanonicalContinuationTarget(db:Database.Database,outboxId:string,target:ContinuationTarget,manifest:LinuxWorkerManifest):void {
   assertContinuationTarget(db,target);
+  if(workerDigest(observeContinuationTarget(db,outboxId,manifest))!==workerDigest(target))deny();
+}
+export function validateWithdrawalTarget(db:Database.Database,outboxId:string,target:ContinuationTarget,manifest:LinuxWorkerManifest):'existing-runner'|'resume-conversation' {
+  assertCanonicalContinuationTarget(db,outboxId,target,manifest);
   if(target.stateRoot!==manifest.linux.stateRoot || !manifest.linux.seats.includes(target.session))deny();
   sessionHeader(target.sessionFile,target.conversation);
   const runner=start(target.process.runnerPid),child=start(target.process.childPid);
@@ -93,7 +97,9 @@ export function claimContinuationSpawn(db:Database.Database,actionId:string,argv
     const {action,stage}=assertElasticContinuationAllowed(actionId,db), t=action.target;
     if(action.effect.kind!=='resume-conversation' || stage!=='transport-issued' || argv.sessionName!==t.session || argv.stateRoot!==t.stateRoot
       || argv.cwd!==t.cwd || argv.launchId!==action.effect.launchId || argv.sessionFile!==t.sessionFile || argv.forkRef || (argv.model??null)!==t.model || argv.trust!=='no-approve')deny();
-    verifyContinuationProcess(t,'absent',continuationManifest());sessionHeader(t.sessionFile,t.conversation);
+    const manifest=continuationManifest();
+    assertCanonicalContinuationTarget(db,action.outboxId,t,manifest);
+    verifyContinuationProcess(t,'absent',manifest);
     continuationTransition(db,actionId,'transport-issued','spawn-issued');
   }).immediate();
 }
@@ -103,7 +109,8 @@ export function spawnOwnedContinuation(db:Database.Database,actionId:string,args
   return db.transaction(()=>{
     const row=assertElasticContinuationAllowed(actionId,db),a=row.action,t=a.target,manifest=continuationManifest();
     if(a.effect.kind!=='resume-conversation'||row.stage!=='spawn-issued'||row.runner)deny();
-    verifyContinuationProcess(t,'absent',manifest);sessionHeader(t.sessionFile,t.conversation);
+    assertCanonicalContinuationTarget(db,a.outboxId,t,manifest);
+    verifyContinuationProcess(t,'absent',manifest);
     if(realpathSync(process.execPath)!==manifest.linux.node)deny();
     const child=spawn(manifest.linux.node,[manifest.linux.pi,'--no-extensions',...buildPiChildArgs({sessionsDir:piSeatPaths(t.stateRoot,t.session).sessionsDir,
       sessionName:t.session,model:t.model??undefined,trust:'no-approve',sessionFile:t.sessionFile,runtime:'pi'})],

@@ -3,7 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LinuxWorkerLifecycle } from '../src/adapters/linux-worker-lifecycle.js';
 import type { LinuxPrivilegedWorkerBoundary } from '../src/adapters/linux-privileged-worker-boundary.js';
-import { continuationBootId } from '../src/adapters/elastic-owned-continuation.js';
+import { spawn, execFileSync } from 'node:child_process';
+import { once } from 'node:events';
+import { piSeatPaths } from '../src/adapters/pi-runner-protocol.js';
+import { continuationBootId, verifyContinuationProcess } from '../src/adapters/elastic-owned-continuation.js';
 import { azureWorkerId } from '../src/adapters/azure-elastic-fleet.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import Database from 'better-sqlite3';
@@ -13,7 +16,7 @@ import { ElasticWorkerControl, workerDigest } from '../src/domain/elastic-worker
 import { QueueRepository } from '../src/domain/queue-repository.js';
 import { EventBus } from '../src/domain/event-bus.js';
 import { OutboxHandler } from '../src/domain/outbox-handler.js';
-import { assertContinuationAction, continuationQueue, issueWithdrawalAction, issueOwnedSuccessor, nativeContinuation, readContinuationAction, type WithdrawalRequest } from '../src/domain/elastic-continuation.js';
+import { assertContinuationAction, continuationProcessSchema, continuationQueue, issueWithdrawalAction, issueOwnedSuccessor, nativeContinuation, readContinuationAction, type WithdrawalRequest } from '../src/domain/elastic-continuation.js';
 const dbs:Database.Database[]=[];const dirs:string[]=[];
 afterEach(()=>{for(const db of dbs.splice(0))db.close();for(const d of dirs.splice(0))rmSync(d,{recursive:true,force:true});});
 async function fixture(database=':memory:') {
@@ -112,13 +115,49 @@ describe('withdrawal publication crash recovery (native transactions; synthetic 
     const f=await fixture(join(root,'worker.sqlite')),sessionFile=join(root,'session.jsonl');
     writeFileSync(sessionFile,JSON.stringify({type:'session',id:'conversation'})+'\n');
     f.db.prepare('UPDATE sessions SET resume_token=?').run(sessionFile);
-    f.request.target={...f.request.target,sessionFile,process:{bootId:continuationBootId(),runnerPid:2147483646,childPid:2147483645,runnerStartTime:'absent',childStartTime:'absent'}};
+    f.request.target={...f.request.target,sessionFile,stateRoot:join(root,'state/pi'),process:{bootId:continuationBootId(),runnerPid:2147483646,childPid:2147483645,runnerStartTime:'absent',childStartTime:'absent'}};
+    const sidecar=piSeatPaths(f.request.target.stateRoot,f.request.target.session).runnerStatePath;
+    mkdirSync(join(f.request.target.stateRoot,f.request.target.session),{recursive:true});
+    const record={ready:false,updatedAt:new Date().toISOString(),sessionFile,sessionId:f.request.target.conversation,launchId:f.request.target.launchId,processIdentity:f.request.target.process};
+    writeFileSync(sidecar,JSON.stringify(record));
     let failAt:'transition'|'continuation'|null=null;
     const marker=join(root,'marker');
     const os={manifestDigest:f.identity.manifestDigest,instance:()=>f.identity,manifest:{resourceId:'/fixture',controlDirectory,linux:{stateRoot:f.request.target.stateRoot,seats:['owner@rig']}},
       publishAdmission:(state:unknown,purpose:string,operationId:string)=>{writeFileSync(marker,JSON.stringify({state,purpose,operationId}));if(purpose===failAt)throw Error('publication_crash');}} as unknown as LinuxPrivilegedWorkerBoundary;
-    return {...f,root,controlDirectory,marker,os,lifecycle:new LinuxWorkerLifecycle(os,f.control),fail:(at:typeof failAt)=>failAt=at};
+    return {...f,root,controlDirectory,marker,sidecar,record,os,lifecycle:new LinuxWorkerLifecycle(os,f.control),fail:(at:typeof failAt)=>failAt=at};
   }
+  it('denies forged absent PIDs while the canonical native runner and child are alive',async()=>{
+    const f=await publication();
+    const runner=spawn(process.execPath,['-e',`const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)']);console.log(JSON.stringify({runnerPid:process.pid,childPid:child.pid}));process.on('SIGTERM',()=>{child.on('exit',()=>process.exit());child.kill();});setInterval(()=>{},1000);`],{stdio:['ignore','pipe','inherit']});
+    try {
+      const [bytes]=await once(runner.stdout,'data');
+      const ids=continuationProcessSchema.pick({runnerPid:true,childPid:true}).parse(JSON.parse(bytes.toString()));
+      const started=(pid:number)=>process.platform==='linux'?readFileSync(`/proc/${pid}/stat`,'utf8').split(') ')[1]!.split(' ')[19]!:execFileSync('/bin/ps',['-p',String(pid),'-o','lstart='],{encoding:'utf8',env:{LC_ALL:'C',PATH:'/usr/bin:/bin'}}).trim();
+      const identity={...ids,bootId:continuationBootId(),runnerStartTime:started(ids.runnerPid),childStartTime:started(ids.childPid)};
+      writeFileSync(f.sidecar,JSON.stringify({...f.record,ready:true,processIdentity:identity}));
+      expect(()=>f.lifecycle.withdraw(f.request)).toThrow('elastic_continuation_denied');
+      expect(f.control.read()?.generation).toBe(1);
+      expect(f.db.prepare('SELECT COUNT(*) AS n FROM elastic_continuation_actions').get()).toEqual({n:0});
+      expect(()=>process.kill(ids.runnerPid,0)).not.toThrow();expect(()=>process.kill(ids.childPid,0)).not.toThrow();
+      runner.kill();await once(runner,'exit');
+      const target={...f.request.target,process:identity};
+      verifyContinuationProcess(target,'absent');
+      const receipt=f.lifecycle.withdraw({...f.request,withdrawalId:'33333333-3333-4333-8333-333333333333',target});
+      expect(readContinuationAction(f.db,receipt.actionId).action).toMatchObject({target,effect:{kind:'resume-conversation'}});
+      expect(f.db.prepare('SELECT COUNT(*) AS n FROM elastic_continuation_actions').get()).toEqual({n:1});
+    } finally {if(runner.exitCode===null){runner.kill();await once(runner,'exit');}}
+  });
+  it.each(['launch','conversation','process','missing'] as const)('denies an absent selector with a %s native sidecar mismatch',async kind=>{
+    const f=await publication();
+    const record={...f.record};
+    if(kind==='launch')record.launchId='replacement';
+    if(kind==='conversation')record.sessionId='another-conversation';
+    if(kind==='process')record.processIdentity={...record.processIdentity,runnerStartTime:'replacement'};
+    writeFileSync(f.sidecar,JSON.stringify(kind==='missing'?{ready:false,updatedAt:record.updatedAt}:record));
+    expect(()=>f.lifecycle.withdraw(f.request)).toThrow();
+    expect(f.control.read()?.generation).toBe(1);
+    expect(f.db.prepare('SELECT COUNT(*) AS n FROM elastic_continuation_actions').get()).toEqual({n:0});
+  });
   it.each(['transition','continuation'] as const)('recovers the same immutable request after %s publication failure',async point=>{
     const f=await publication();f.fail(point);
     expect(()=>f.lifecycle.withdraw(f.request)).toThrow('publication_crash');

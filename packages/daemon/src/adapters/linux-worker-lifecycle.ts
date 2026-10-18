@@ -130,7 +130,7 @@ export class LinuxWorkerLifecycle {
       return {withdrawalId:input.withdrawalId,generation:state.generation,actionId:row.action.actionId};
     }
     if(state.generation!==input.generation || state.drainOperationId!==input.operationId || this.control.generation()?.purpose!=='removal')fail();
-    const kind=validateWithdrawalTarget(this.control.db,input.target,this.os.manifest);
+    const kind=validateWithdrawalTarget(this.control.db,input.outboxId,input.target,this.os.manifest);
     this.os.publishAdmission(state,'transition',input.withdrawalId);
     const action=this.control.db.transaction(()=>issueWithdrawalAction(this.control.db,input,kind)).immediate();
     this.os.publishAdmission(this.control.read()!,'continuation',input.withdrawalId);

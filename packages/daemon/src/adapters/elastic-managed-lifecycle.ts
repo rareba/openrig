@@ -178,12 +178,30 @@ export class ElasticManagedLifecycle {
     }
     refuse('elastic_removal_withdrawn');
   }
+  private projectFinishedContinuation(a:ElasticWorkerAttempt,state:LifecycleState):void {
+    const w=state.withdrawal,command=state.commands.find(c=>c.operation==='finish-continuation');
+    if(!w?.finished || !w.receipt || command?.state!=='succeeded' || state.deleteIntent || state.commands.some(c=>c.operation==='quiesce')
+      || w.request.operationId!==state.beginOperationId || w.request.generation!==state.drain?.generation
+      || w.request.identity.workerId!==a.workerId || w.request.identity.vmId!==a.binding.vmId || w.request.identity.manifestDigest!==a.binding.manifestDigest
+      || w.receipt.withdrawalId!==w.request.withdrawalId || w.receipt.generation!==w.request.generation+1)refuse();
+    const result=z.object({generation:z.number().int().positive(),retired:z.literal(true),dispositionDigest:z.string()}).strict().parse(command.result);
+    if(result.generation!==w.receipt.generation)refuse();
+    this.options.db.transaction(()=>{
+      const changed=this.options.db.prepare("UPDATE elastic_fleet_drains SET state='continuation-finished',updated_at=? WHERE worker_id=? AND begin_operation_id=? AND state='continuation'")
+        .run(this.now(),a.workerId,state.beginOperationId).changes;
+      if(changed)this.options.db.prepare('DELETE FROM elastic_idle_windows WHERE worker_id=?').run(a.workerId);
+    }).immediate();
+  }
   /** Bounded progress of quarantined native lineages while the fleet can work on other workers. */
   async reconcileContinuations(configuration:import('../domain/elastic-fleet.js').ElasticFleetConfiguration):Promise<void> {
     this.options.owner.assertHeld('fleet');
     for(const a of this.options.store.list()) {
       let state=this.journal.read(a.id);const w=state?.withdrawal;
-      if(!state||!w?.receipt||w.finished||!state.removalOperationId)continue;
+      if(!state||!w?.receipt||!state.removalOperationId)continue;
+      if(w.finished) {
+        try {this.projectFinishedContinuation(a,state);}catch { /* Retry the exact journal projection on the next turn. */ }
+        continue;
+      }
       const row=this.options.db.prepare('SELECT * FROM elastic_fleet_operations WHERE operation_id=?').get(state.removalOperationId) as {operation_id:string;type:'remove';state:'withdrawn';worker_id:string;count:number;target_capacity:number;revision:number;snapshot:string;configuration:string;error:string|null;created_at:number;updated_at:number}|undefined;
       if(!row||row.state!=='withdrawn'||enrollmentDigest(JSON.parse(row.configuration))!==enrollmentDigest(configuration))continue;
       const operation: FleetMutation={operationId:row.operation_id,type:row.type,state:row.state,workerId:row.worker_id,count:row.count,targetCapacity:row.target_capacity,
@@ -201,8 +219,7 @@ export class ElasticManagedLifecycle {
         });
         if(!result.completed)continue;
         state=this.journal.advance(result.state,{withdrawal:{...w,finished:true}});
-        this.options.db.prepare("UPDATE elastic_fleet_drains SET state='continuation-finished',updated_at=? WHERE worker_id=? AND begin_operation_id=?").run(this.now(),a.workerId,state.beginOperationId);
-        this.options.db.prepare('DELETE FROM elastic_idle_windows WHERE worker_id=?').run(a.workerId);
+        this.projectFinishedContinuation(a,state);
       } catch { /* Native unknown effects retain this worker; continue disjoint lineages. */ }
     }
   }
