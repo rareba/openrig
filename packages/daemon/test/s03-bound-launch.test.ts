@@ -85,6 +85,7 @@ describe("S03 production managed capability selection", () => {
       OPENRIG_HOME: f.env.OPENRIG_HOME, openRigPort: "1", openRigHost: "127.0.0.1",
       resolvedActivityHookUrl: "http://127.0.0.1:1", resolvedActivityHookToken: "synthetic-only",
       providerAuthEnv: {}, daemonHome: f.env.HOME, codexHome: path.join(f.root, "codex"),
+      elasticWorkerMode: false, // OPENRIG_ELASTIC_GUARD is unset in this fixture
     });
     for (const key of Object.keys(f.env)) delete f.env[key];
     Object.assign(f.env, sessionEnv);
