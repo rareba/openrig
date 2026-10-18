@@ -53,7 +53,7 @@ export function humanResponsesRoutes(opts: { queueRepo?: QueueRepository; bearer
     const response = parseHumanResponse(body.response);
     if (typeof body.qitemId !== "string" || typeof body.replyId !== "string" || typeof body.requestRevision !== "string" || !response) return c.json({ error: "invalid_human_response" }, 400);
     try { return c.json(opts.queueRepo.humanResponseCommitEvidence({ qitemId: body.qitemId, replyId: body.replyId,
-      requestRevision: body.requestRevision, actorSession: actor.session, response })); }
+      requestRevision: body.requestRevision, actorSession: actor.session, identityProvenance: resolveRecordedProvenance(c, actor), response })); }
     catch (error) { if (!(error instanceof QueueRepositoryError)) throw error; return c.json({ error: error.code, message: error.message }, 409); }
   });
   app.post("/human-response", authBearerTokenMiddleware({ expectedToken: opts.bearerToken ?? null }), async (c) => {

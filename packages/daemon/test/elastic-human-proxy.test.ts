@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { Hono } from 'hono';
 import { humanResponsesRoutes } from '../src/routes/human-responses.js';
 import { HumanRelayService } from '../src/domain/human-relay.js';
+import type { HumanRelayWebhookTarget } from '../src/domain/human-relay-webhook.js';
 import type { ElasticHumanProxyAuthority, ElasticHumanForward } from '../src/domain/elastic-human-proxy.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createDb } from '../src/db/connection.js';
@@ -259,6 +260,72 @@ describe('elastic native human proxy', () => {
     expect(() => coordinator.repo.reconcileElasticHumanProxy({ proxyQitemId: proxy.qitemId, worker, origin: origin.repo.getById('qitem-original')!, disposition: 'remaining' })).toThrow(/actual manager question change/);
     coordinator.repo.reconcileElasticHumanProxy({ proxyQitemId: proxy.qitemId, worker, origin: origin.repo.getById('qitem-original')!, disposition: 'origin-changed' });
     expect(coordinator.repo.getById(proxy.qitemId)?.humanForwardingStatus).toBe('conflict');
+  });
+
+  it.each([
+    ['pull', 'sending'], ['pull', 'indeterminate'], ['webhook', 'sending'], ['webhook', 'indeterminate'],
+  ])('fences an already claimed %s delivery in %s through pending and awaiting-origin clarification', async (transport, state) => {
+    const { origin, coordinator, proxy } = await pair();
+    const binding = { connectorId: 'hermes', profile: 'default', humanSession: 'human@kernel', chatId: 'chat', senderId: 'person', channel: 'teams' as const };
+    const target: HumanRelayWebhookTarget = { connectorId: binding.connectorId, profile: binding.profile, channel: binding.channel,
+      endpointUrl: 'https://fixture.invalid/native-relay', secretFile: '/fixture/secret', mode: 'pull-bridge' };
+    const relay = new HumanRelayService(coordinator.db, coordinator.repo, { hostId: () => 'coordinator', bindings: () => [binding],
+      webhooks: () => transport === 'webhook' ? [target] : [] });
+    const delivery = transport === 'webhook' ? relay.webhookBatch(target)[0]!.delivery : relay.pull(binding).deliveries[0]!;
+    expect(relay.validate(delivery).current).toBe(true);
+    if (state === 'indeterminate') relay.receipt({ ...delivery, outcome: 'unknown' });
+    coordinator.repo.recordHumanResponse({ ...answer(proxy), response: { kind: 'clarification', text: 'Why?' } });
+    expect(coordinator.repo.getById(proxy.qitemId)?.humanRequestRevision).toBe(proxy.humanRequestRevision);
+    for (const phase of ['pending', 'awaiting-origin']) {
+      if (phase === 'awaiting-origin') {
+        const [intent] = coordinator.repo.pendingElasticHumanForwards();
+        settle(origin, coordinator, intent);
+      }
+      expect(coordinator.repo.getById(proxy.qitemId)?.humanForwardingStatus).toBe(phase);
+      expect(relay.validate(delivery).current).toBe(false);
+      expect(relay.pull(binding).deliveries).toEqual([]);
+      if (transport === 'webhook') expect(relay.webhookBatch(target)).toEqual([]);
+      expect(new OutboxHandler(coordinator.db).getById(delivery.deliveryId)?.deliveryState).toBe(state);
+    }
+  });
+
+  it.each(['pending', 'awaiting-origin', 'settled', 'superseded'])('compares normalized immutable provenance before mapped %s replay', async phase => {
+    const questions = phase === 'awaiting-origin' || phase === 'superseded' ? [question, { ...question, id: 'when' }] : [question];
+    const { origin, coordinator, proxy } = await pair(questions);
+    // Omitted native provenance normalizes to the same claimed:v1 stored in the typed intent.
+    const input = { ...answer(proxy), identityProvenance: undefined };
+    const initial = coordinator.repo.recordHumanResponse(input);
+    const [intent] = coordinator.repo.pendingElasticHumanForwards();
+    if (phase !== 'pending') {
+      const { committed } = settle(origin, coordinator, intent);
+      if (phase === 'superseded') coordinator.repo.reconcileElasticHumanProxy({ proxyQitemId: proxy.qitemId, worker, origin: committed.origin, disposition: 'remaining' });
+    }
+    expect(coordinator.repo.recordHumanResponse({ ...input, identityProvenance: 'claimed:v1' }).replyQitemId).toBe(initial.replyQitemId);
+    expect(coordinator.repo.recordHumanResponse(input).replyQitemId).toBe(initial.replyQitemId);
+    expect(() => coordinator.repo.recordHumanResponse({ ...input, identityProvenance: 'transport:v1' })).toThrow(/replyId/);
+    expect(JSON.parse(new OutboxHandler(coordinator.db).getById(intent.intentId)!.body).originInput.identityProvenance).toBe('claimed:v1');
+  });
+
+  it('binds the mapped typed intent provenance to the original native receipt transition', async () => {
+    const { coordinator, proxy } = await pair();
+    coordinator.repo.recordHumanResponse(answer(proxy));
+    const [intent] = coordinator.repo.pendingElasticHumanForwards();
+    coordinator.db.prepare('UPDATE outbox_entries SET body=? WHERE outbox_id=?').run(JSON.stringify({ ...intent,
+      originInput: { ...intent.originInput, identityProvenance: 'transport:v1' } }), intent.intentId);
+    expect(() => coordinator.repo.pendingElasticHumanForwards()).toThrow(/exact durable passive receipt/);
+  });
+
+  it('uses the same resolved transport provenance for mapped native receipt lookup', async () => {
+    const { coordinator, proxy } = await pair();
+    const input = answer(proxy);
+    const app = new Hono().route('/api/mission-control', humanResponsesRoutes({ queueRepo: coordinator.repo, bearerToken: 'coordinator-scoped' }));
+    const post = (operation: string) => app.request(`/api/mission-control/${operation}`, { method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer coordinator-scoped', 'X-OpenRig-Session': 'human@kernel' }, body: JSON.stringify(input) });
+    expect((await post('human-response')).status).toBe(200);
+    const lookup = await post('human-response-receipt');
+    expect(lookup.status).toBe(200);
+    expect(await lookup.json()).toEqual(coordinator.repo.humanResponseCommitEvidence({ ...input, identityProvenance: 'transport:v1' }));
+    expect(() => coordinator.repo.recordHumanResponse({ ...input, identityProvenance: 'claimed:v1' })).toThrow(/replyId/);
   });
 
 });

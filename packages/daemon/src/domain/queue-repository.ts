@@ -3503,7 +3503,8 @@ export class QueueRepository {
     const nativeReceipt = this.transitionLog.listForQitem(intent.mapping.proxyQitemId).some(t => {
       if (!t.transitionNote?.startsWith(HUMAN_RESPONSE_RECEIPT_PREFIX) || t.actorSession !== intent.mapping.coordinatorHuman) return false;
       const r = JSON.parse(t.transitionNote.slice(HUMAN_RESPONSE_RECEIPT_PREFIX.length)) as HumanResponseReceipt & { fingerprint: string };
-      return r.replyQitemId === intent.localReceiptQitemId && r.fingerprint === intent.fingerprint;
+      return r.replyQitemId === intent.localReceiptQitemId && r.fingerprint === intent.fingerprint
+        && (t.identityProvenance ?? 'claimed:v1') === (intent.originInput.identityProvenance ?? 'claimed:v1');
     });
     if (!response || !nativeReceipt || intent.version !== 1 || intent.localReceiptQitemId !== localReceiptId
       || intent.intentId !== `${ELASTIC_HUMAN_FORWARD_PREFIX}${localReceiptId}` || intent.originInput.replyId !== originReplyId
@@ -3719,6 +3720,9 @@ export class QueueRepository {
       if (receipt.replyQitemId !== replyQitemId) continue;
       if (receipt.fingerprint !== fingerprint || transition.actorSession !== input.actorSession) {
         throw new QueueRepositoryError("reply_id_conflict", "This replyId already records a different response.");
+      }
+      if (mapping && (transition.identityProvenance ?? 'claimed:v1') !== (input.identityProvenance ?? 'claimed:v1')) {
+        throw new QueueRepositoryError("reply_id_conflict", "This replyId already records a different response provenance.");
       }
       if (mapping && this.elasticHumanProxyState(mapping) === 'forward-pending') {
         const stored = this.outbox?.getById(`${ELASTIC_HUMAN_FORWARD_PREFIX}${replyQitemId}`);

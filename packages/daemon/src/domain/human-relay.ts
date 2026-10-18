@@ -213,7 +213,7 @@ export class HumanRelayService {
         if ((r.channel ?? "whatsapp") !== (b.channel ?? "whatsapp") || r.attemptId !== d.attemptId) fail("The relay attempt/channel changed.");
         if (e.webhook && !this.deps.webhooks?.().some(t => t.connectorId === d.connectorId && t.profile === d.profile && t.channel === (d.channel ?? "whatsapp") && t.endpointUrl === e.webhook!.endpoint && (t.mode ?? "push") === e.webhook!.mode)) fail("The webhook transport changed; the old receiver cannot send.");
         const q = this.queue.getById(d.qitemId);
-        return {delivery: d, current: ["sending", "indeterminate"].includes(state) && q?.state === "pending" && q.humanIntent !== "update" && q.humanRequestRevision === d.requestRevision, requestState: q?.state ?? "missing"};
+        return {delivery: d, current: ["sending", "indeterminate"].includes(state) && q?.state === "pending" && q.humanIntent !== "update" && !q.humanForwardingStatus && q.humanRequestRevision === d.requestRevision, requestState: q?.state ?? "missing"};
     }
     receipt(raw: unknown) {
         const r = object(raw);
