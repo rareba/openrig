@@ -240,3 +240,9 @@ describe('Azure dedicated VMSS boundary',()=>{
  });
 
 });
+
+ it('retains only an explicit absolute nonsecret deployment profile reference',()=>{
+  expect(validateAzurePoolConfiguration({...provider,deploymentProfileRef:'/var/lib/operator/profile.json'},'pool').deploymentProfileRef).toBe('/var/lib/operator/profile.json');
+  for(const deploymentProfileRef of ['relative.json','/tmp/bad\0file',42,null])expect(()=>validateAzurePoolConfiguration({...provider,deploymentProfileRef},'pool')).toThrow('invalid_azure_configuration');
+  expect(()=>validateAzurePoolConfiguration({...provider,deploymentProfile:{secret:'fixture'}},'pool')).toThrow('invalid_azure_configuration');
+ });

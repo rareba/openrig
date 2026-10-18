@@ -27,7 +27,8 @@ export interface AzureWorkerCommandOptions {
     privateDirectory: string;
     run?: AzureArgvRunner;
 }
-export type ManagedWorkerOperation = 'stage' | 'prepare' | 'enroll' | 'github-credential-install';
+import type { ManagedWorkerOperation } from './elastic-managed-operation.js';
+export { managedWorkerOperations, type ManagedWorkerOperation } from './elastic-managed-operation.js';
 export interface PinnedWorkerScript {
     path: string;
     sha256: string;
@@ -96,7 +97,11 @@ export class AzureWorkerCommandClient {
     commandIdentity(attempt: ElasticWorkerAttempt, operation: ManagedWorkerOperation, payload: unknown, script: PinnedWorkerScript) {
         const bytes = this.script(script);
         const requestDigest = enrollmentDigest({ binding: attempt.binding, operation, payload, scriptDigest: script.sha256 });
-        return { name: `openrig-${operation === 'github-credential-install' ? 'github' : operation}-${requestDigest.slice(0, 40)}`, requestDigest, bytes };
+        const commandNames: Partial<Record<ManagedWorkerOperation, string>> = {
+            'github-credential-install': 'github', 'final-checkpoint-export': 'export',
+            'final-checkpoint-upload': 'upload', 'final-checkpoint-ack': 'ack',
+        };
+        return { name: `openrig-${commandNames[operation] ?? operation}-${requestDigest.slice(0, 40)}`, requestDigest, bytes };
     }
     private script(script: PinnedWorkerScript): string {
         if (!isAbsolute(script.path) || !/^[a-f0-9]{64}$/.test(script.sha256))

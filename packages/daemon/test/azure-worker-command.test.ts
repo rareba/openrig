@@ -73,3 +73,28 @@ it('default execFile submits a private ARM body and reads the same managed comma
     expect(captured.request.instance.vmId).toBe(vmId);
     expect(await client.inspectManagedCommand(pending, configuration)).toEqual({ state: 'unknown' });
 });
+
+it('persists every finite root phase without exceeding ARM names and retains unknown command identity', () => {
+    const root=realpathSync(mkdtempSync(join(tmpdir(),'managed-phases-')));roots.push(root);chmodSync(root,0o700);
+    const script=join(root,'fixed.py');writeFileSync(script,'print("fixture")\n',{mode:0o600});
+    const client=new AzureWorkerCommandClient({executable:'/fixture',azureConfigDirectory:root,privateDirectory:root});
+    const store=new ElasticWorkerAttemptStore(root);
+    let a=store.createOrRead({resourceId,childResourceId:instance.resourceId,instanceId:'0',vmId,operationId:binding.operationId,fleetEpoch:binding.fleetEpoch,manifestDigest:binding.manifestDigest,artifactDigest:'b'.repeat(64),specDigest:'c'.repeat(64),checkoutDigest:'d'.repeat(64),configurationDigest:'e'.repeat(64)});
+    const pinned={path:script,sha256:createHash('sha256').update(readFileSync(script)).digest('hex')};
+    const names=new Set<string>();
+    for(const operation of ['begin-drain','quiesce','final-checkpoint-export','final-checkpoint-upload','final-checkpoint-ack','seal-status'] as const) {
+      const command=client.commandIdentity(a,operation,{binding:a.binding},pinned);
+      expect(command.name).toMatch(/^[a-zA-Z0-9-]{1,64}$/);expect(names.has(command.name)).toBe(false);names.add(command.name);
+      a=store.advance(a.id,a.revision,{command:{name:command.name,requestDigest:command.requestDigest,operation,state:'unknown'}});
+      const recovered=new ElasticWorkerAttemptStore(root).read(a.id);expect(recovered.command).toEqual(a.command);
+      expect(()=>store.advance(a.id,a.revision,{command:null})).toThrow();
+      a=store.advance(a.id,a.revision,{command:{...a.command!,state:'succeeded'}});
+    }
+});
+
+import { parseHelperPayload } from '../src/adapters/elastic-worker-helper.js';
+it('requires a sealed capability for the fixed upload command without accepting proof overrides',()=>{
+ const binding={workerId:'fixture',vmId:'11111111-1111-4111-8111-111111111111',manifestDigest:'a'.repeat(64),fleetEpoch:'epoch',drainGeneration:1,removalOperationId:'original'};
+ expect(parseHelperPayload('final-checkpoint-upload',{binding,capabilityEnvelope:'sealed'})).toEqual({binding,capabilityEnvelope:'sealed'});
+ for(const value of [{binding},{binding,capabilityEnvelope:''},{binding,capabilityEnvelope:'sealed',verified:true},{binding:{...binding,drainGeneration:0},capabilityEnvelope:'sealed'}])expect(()=>parseHelperPayload('final-checkpoint-upload',value)).toThrow();
+});

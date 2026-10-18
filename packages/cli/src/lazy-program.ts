@@ -17,6 +17,7 @@ export const COMMAND_LOADERS: ReadonlyMap<string, Load> = new Map<string, Load>(
   ["daemon", async () => (await import("./commands/daemon.js")).daemonCommand()],
   ["status", async () => (await import("./commands/status.js")).statusCommand()],
   ["github", async () => (await import("./commands/github.js")).githubCommand()],
+  ["elastic", async () => (await import("./commands/elastic.js")).elasticCommand()],
   ["snapshot", async () => (await import("./commands/snapshot.js")).snapshotCommand()],
   ["restore", async () => (await import("./commands/restore.js")).restoreCommand()],
   ["crash-cart", async () => (await import("./commands/crash-cart.js")).crashCartCommand()],

@@ -20,7 +20,12 @@ export interface FleetOperation {
   updatedAt: number;
 }
 export interface FleetMutation extends FleetOperation { policy: FleetPolicy; configuration: ElasticFleetConfiguration }
+export type FleetOperationResult = "succeeded" | "pending" | "unknown";
 export interface FleetIO {
+  /** Runs only inside the held native fleet scope, before attempt mutation. */
+  recoverAttempts?(): void;
+  /** Advance a confirmed pending operation. Unknown operations are only inspected. */
+  advanceOperation?(operation: FleetMutation): Promise<FleetOperationResult>;
   validateConfiguration?(configuration: ElasticFleetConfiguration): void;
   observe(policy: FleetPolicy, configuration: ElasticFleetConfiguration): Promise<FleetSnapshot>;
   provision(operation: FleetMutation): Promise<void>;
@@ -172,7 +177,7 @@ export class ElasticFleetService {
     }).immediate();
   }
   async reconcile(): Promise<ElasticFleetStatus> {
-    if (this.nativeOwner) return this.nativeOwner.run('fleet', async () => { this.nativeOwner!.recoverFleet(); return this.reconcileExclusive(); });
+    if (this.nativeOwner) return this.nativeOwner.run('fleet', async () => { this.nativeOwner!.recoverFleet(); this.io.recoverAttempts?.(); return this.reconcileExclusive(); });
     return this.reconcileExclusive();
   }
   private async reconcileExclusive(): Promise<ElasticFleetStatus> {
@@ -194,7 +199,16 @@ export class ElasticFleetService {
       try {
         const inspected = await this.io.inspectOperation(operation(pending), JSON.parse(pending.configuration));
         if (inspected === "succeeded") this.finish(pending);
-        else this.error(inspected === "pending" ? "operation_pending" : "operation_unknown");
+        else {
+          const current = this.status();
+          const saved = configuration(JSON.parse(pending.configuration));
+          const mayAdvance = inspected === 'pending' && !current.paused && current.config?.policy.enabled
+            && current.config.policy.mode === 'active' && isDeepStrictEqual(current.config, saved);
+          const result = mayAdvance && this.io.advanceOperation
+            ? await this.io.advanceOperation({ ...operation(pending), policy: saved.policy, configuration: saved }) : inspected;
+          if (result === 'succeeded') this.finish(pending);
+          else this.error(result === 'pending' ? 'operation_pending' : 'operation_unknown');
+        }
       } catch { this.error("inspection_failed"); }
       return this.status();
     }

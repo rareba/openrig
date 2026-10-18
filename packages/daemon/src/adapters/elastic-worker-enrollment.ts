@@ -200,6 +200,7 @@ export class ElasticWorkerEnrollment {
             }
             return this.options.store.advance(a.id, a.revision, { phase: 'enrolled', command: { ...command, state: 'succeeded' } });
         }
+        if (command.operation !== 'github-credential-install') reject();
         const receipt = z.object({ revision: z.string(), expiresAt: z.number().int().positive(), materialDigest: hash }).strict().parse(JSON.parse(output));
         const saved = z.object({ binding: z.unknown(), materialEnvelope: z.string(), revision: z.string(), expiresAt: z.number(), materialDigest: hash }).strict().parse(this.options.store.readPrivateInput(a.id, `github-${receipt.materialDigest}`));
         if (this.options.commands.commandIdentity(a, 'github-credential-install', { binding: saved.binding, materialEnvelope: saved.materialEnvelope }, this.options.helperScript).requestDigest !== command.requestDigest)

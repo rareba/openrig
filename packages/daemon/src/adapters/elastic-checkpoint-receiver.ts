@@ -1,3 +1,4 @@
+import type { RuntimeArtifact } from './elastic-runtime-artifact.js';
 import { createPrivateKey, X509Certificate, createPublicKey } from "node:crypto";
 import { createServer, type Server } from "node:https";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -42,6 +43,10 @@ export function checkpointReceiverHandler(custody: CheckpointCustody): (req: Inc
         })();
     };
 }
+export function privateTransferHandler(custody:CheckpointCustody,artifact:RuntimeArtifact) {
+    const receive=checkpointReceiverHandler(custody);
+    return (req:IncomingMessage,res:ServerResponse)=>{if(req.url?.startsWith('/api/elastic-artifacts/'))artifact.handle(req,res);else receive(req,res);};
+}
 export interface PrivateCheckpointListenerOptions {
     bindIPv4: string;
     port: number;
@@ -65,14 +70,14 @@ export function validatePrivateCheckpointListener(options: PrivateCheckpointList
         return fail();
     }
 }
-export async function listenPrivateCheckpoints(custody: CheckpointCustody, options: PrivateCheckpointListenerOptions): Promise<{
+export async function listenPrivateCheckpoints(custody: CheckpointCustody, options: PrivateCheckpointListenerOptions, artifact?: RuntimeArtifact): Promise<{
     close: () => Promise<void>;
 }> {
     validatePrivateCheckpointListener(options);
     custody.assertSeparateTlsKey(createPublicKey(createPrivateKey(options.tlsPrivateKeyPem)).export({ type: "spki", format: "der" }));
-    const server: Server = createServer({ cert: options.certificatePem, key: options.tlsPrivateKeyPem, minVersion: "TLSv1.3", maxVersion: "TLSv1.3", maxHeaderSize: 20000, headersTimeout: 5000, requestTimeout: 30000, keepAliveTimeout: 1 }, checkpointReceiverHandler(custody));
+    const server: Server = createServer({ cert: options.certificatePem, key: options.tlsPrivateKeyPem, minVersion: "TLSv1.3", maxVersion: "TLSv1.3", maxHeaderSize: 20000, headersTimeout: 5000, requestTimeout: 30000, keepAliveTimeout: 1 }, artifact ? privateTransferHandler(custody,artifact) : checkpointReceiverHandler(custody));
     server.setTimeout(30000, socket => socket.destroy());
-    server.maxConnections = 4;
+    server.maxConnections = artifact ? 8 : 4;
     server.maxHeadersCount = 12;
     server.on("clientError", (_error, socket) => socket.destroy());
     await new Promise<void>((resolve, reject) => { const failed = () => reject(Error("checkpoint_custody_rejected")); server.once("error", failed); server.listen({ host: options.bindIPv4, port: options.port, exclusive: true }, () => { server.off("error", failed); resolve(); }); });

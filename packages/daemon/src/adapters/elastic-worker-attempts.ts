@@ -1,3 +1,4 @@
+import { managedWorkerOperations } from './elastic-managed-operation.js';
 import { nativeOwnerIdentity, nativeOwnerStopped, type ElasticNativeOwner } from './elastic-native-owner.js';
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes } from 'node:crypto';
 import { closeSync, existsSync, openSync, readdirSync, unlinkSync, writeFileSync, fsyncSync, lstatSync, readFileSync } from 'node:fs';
@@ -11,7 +12,7 @@ const text = z.string().min(1).max(1024).regex(/^[^\x00-\x1f]+$/);
 export const attemptIdentitySchema = z.object({ resourceId: text, childResourceId: text, instanceId: z.string().regex(/^\d{1,10}$/), vmId: z.string().uuid(), operationId: text, fleetEpoch: text,
     manifestDigest: digest, artifactDigest: digest, specDigest: digest, checkoutDigest: digest, configurationDigest: digest }).strict();
 export type AttemptIdentity = z.infer<typeof attemptIdentitySchema>;
-const commandSchema = z.object({ name: z.string().regex(/^[a-zA-Z0-9-]{1,64}$/), operation: z.enum(['stage', 'prepare', 'enroll', 'github-credential-install']), requestDigest: digest,
+const commandSchema = z.object({ name: z.string().regex(/^[a-zA-Z0-9-]{1,64}$/), operation: z.enum(managedWorkerOperations), requestDigest: digest,
     state: z.enum(['intent', 'submitted', 'succeeded', 'failed', 'unknown']) }).strict();
 const attemptSchema = z.object({ version: z.literal(1), id: digest, revision: z.number().int().nonnegative(), identity: attemptIdentitySchema, binding: z.object({ version: z.literal(1), resourceId: text, vmId: z.string().uuid(), nonce: text, manifestDigest: digest, operationId: text, fleetEpoch: text }).strict(),
     workerId: text, keyDigest: digest, phase: z.enum(['reserved', 'staging', 'installed', 'prepared', 'enrolled', 'preparing-native', 'registered', 'ready', 'blocked', 'unknown']),

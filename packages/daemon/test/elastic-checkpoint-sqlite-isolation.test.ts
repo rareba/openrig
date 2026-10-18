@@ -14,12 +14,12 @@ vi.mock("node:child_process", async (original) => {
         } } };
 });
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync, chmodSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, chmodSync, rmSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
-import { inspectArchivedSqlite, requireArchivedSqlitePlatform } from "../src/adapters/elastic-checkpoint-sqlite-isolation.js";
+import { inspectArchivedSqlite, preflightArchivedSqlite, requireArchivedSqlitePlatform } from "../src/adapters/elastic-checkpoint-sqlite-isolation.js";
 import { inspectCheckpointSqlite } from "../src/adapters/elastic-checkpoint-sqlite.js";
 const dirs: string[] = [];
 function fixture(sql: string, rows = 1) { const root = realpathSync(mkdtempSync(join(tmpdir(), "sqlite-limits-"))); dirs.push(root); const path = join(root, "archive.sqlite"), db = new Database(path); db.pragma("ignore_check_constraints=ON"); db.exec(sql); if (rows)
@@ -29,6 +29,14 @@ afterEach(() => { for (const p of dirs.splice(0))
     rmSync(p, { recursive: true, force: true }); execution.signal = ""; execution.code = ""; });
 describe("OS-enforced archive SQLite boundary", () => {
     it.runIf(process.platform !== "linux")("fails closed clearly on unsupported platforms", () => { expect(() => requireArchivedSqlitePlatform()).toThrow("checkpoint_sqlite_platform_unsupported"); });
+    it("preflights the real isolated helper on Linux and rejects unsupported platforms before filesystem effects", () => {
+        const root = realpathSync(mkdtempSync(join(tmpdir(), "sqlite-preflight-")));
+        dirs.push(root);
+        chmodSync(root, 0o700);
+        if (process.platform === "linux") preflightArchivedSqlite(root);
+        else expect(() => preflightArchivedSqlite(root)).toThrow("checkpoint_sqlite_platform_unsupported");
+        expect(readdirSync(root)).toEqual([]);
+    });
     it.runIf(process.platform === "linux")("preserves ordinary CHECK schemas, lossless TEXT and arbitrary table values inside actual limits", () => {
         const path = fixture("CREATE TABLE t(v CHECK(v>0));CREATE TABLE exact(v);INSERT INTO exact VALUES(CAST(x'80' AS TEXT)),(9007199254740993),(1.5),(x'00FF'),(NULL)");
         expect(inspectArchivedSqlite(path, false).inspection).toEqual(inspectCheckpointSqlite(path));

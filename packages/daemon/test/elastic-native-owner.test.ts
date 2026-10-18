@@ -131,9 +131,10 @@ const service=new ElasticFleetService(db,io,()=>time,owner);service.configure({p
     const submitted=JSON.parse(bytes.trim());const saved=db.prepare("SELECT owner,identity FROM elastic_native_owners WHERE scope='fleet-reconcile'").get() as {owner:string;identity:string};
     expect(db.prepare('SELECT reconcile_owner FROM elastic_fleet_config WHERE id=1').get()).toEqual({reconcile_owner:saved.owner});expect(saved.owner).toMatch(new RegExp('^'+child.pid+':'));
     const exited=once(child,'exit');child.kill('SIGKILL');await exited;
-    const inspected:string[]=[];let mutations=0;
-    const io:FleetIO={observe:async()=>{throw Error('pending operation must be inspected first')},provision:async()=>{mutations++},beginDrain:async()=>{mutations++},remove:async()=>{mutations++},inspectOperation:async operation=>{inspected.push(operation.operationId);expect(operation.targetCapacity).toBe(submitted.targetCapacity);return 'pending';}};
-    const restarted=new ElasticFleetService(db,io,()=>30000,new ElasticNativeOwner(db,path));await restarted.reconcile();
+    const inspected:string[]=[];let mutations=0;let recovered=0;
+    const owner=new ElasticNativeOwner(db,path);
+    const io:FleetIO={recoverAttempts:()=>{owner.assertHeld('fleet');expect(db.prepare('SELECT reconcile_owner FROM elastic_fleet_config WHERE id=1').get()).toEqual({reconcile_owner:null});recovered++;},observe:async()=>{throw Error('pending operation must be inspected first')},provision:async()=>{mutations++},beginDrain:async()=>{mutations++},remove:async()=>{mutations++},inspectOperation:async operation=>{inspected.push(operation.operationId);expect(operation.targetCapacity).toBe(submitted.targetCapacity);return 'pending';}};
+    const restarted=new ElasticFleetService(db,io,()=>30000,owner);await restarted.reconcile();expect(recovered).toBe(1);expect(()=>owner.assertHeld('fleet')).toThrow('native_owner_required');
     expect(inspected).toEqual([submitted.operationId]);expect(mutations).toBe(0);expect(restarted.status().operation?.operationId).toBe(submitted.operationId);expect(restarted.status().operation?.state).toBe('pending');
     expect(db.prepare("SELECT owner FROM elastic_native_owners WHERE scope='fleet-reconcile'").get()).toBeUndefined();
 });

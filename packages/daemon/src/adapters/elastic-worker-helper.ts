@@ -87,6 +87,7 @@ const payloads = {
   "final-checkpoint-export": z
     .object({ binding: finalBinding, capabilityEnvelope: z.string().max(16384).optional() })
     .strict(),
+  "final-checkpoint-upload": z.object({ binding: finalBinding, capabilityEnvelope: z.string().min(1).max(16384) }).strict(),
   "final-checkpoint-ack": z.object({ binding: finalBinding, receipt }).strict(),
   "seal-status": z.object({ binding: finalBinding }).strict(),
 };
@@ -168,8 +169,9 @@ export async function runWorkerHelper(argv: string[]): Promise<unknown> {
     switch (operation) {
       case "quiesce":
         return lifecycle.quiesce(payloads.quiesce.parse(input).binding);
-      case "final-checkpoint-export": {
-        const p = payloads["final-checkpoint-export"].parse(input);
+      case "final-checkpoint-export":
+      case "final-checkpoint-upload": {
+        const p = payloads[operation].parse(input);
         let cap;
         if (p.capabilityEnvelope) {
           const prepared = JSON.parse(noFollowRead(join(manifest.controlDirectory, 'enrollment.json'), 16384).toString()) as { binding: EnrollmentBinding; privateKeyPem: string };

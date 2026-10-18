@@ -1,5 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { lstatSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync, mkdtempSync, chmodSync, rmSync } from "node:fs";
+import Database from "better-sqlite3";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { checkpointFailure as fail } from "./elastic-checkpoint-contract.js";
@@ -31,4 +33,17 @@ export function inspectArchivedSqlite(path: string, native: boolean): z.infer<ty
     catch {
         return fail();
     }
+}
+
+/** Exercise the same compiled helper, limits and native ABI before activating custody. */
+export function preflightArchivedSqlite(directory:string):void {
+    requireArchivedSqlitePlatform();
+    const root=mkdtempSync(join(directory,'preflight-'));chmodSync(root,0o700);
+    try {
+        const path=join(root,'probe.sqlite');const db=new Database(path);
+        try {db.exec('CREATE TABLE preflight(value INTEGER NOT NULL); INSERT INTO preflight VALUES(1)');}finally{db.close();}
+        chmodSync(path,0o600);
+        const result=inspectArchivedSqlite(path,false);
+        if(!result.inspection.tables.includes('preflight'))fail();
+    } finally {rmSync(root,{recursive:true,force:true});}
 }

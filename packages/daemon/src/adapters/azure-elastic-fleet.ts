@@ -4,6 +4,7 @@ import type { ElasticFleetConfiguration, FleetIO, FleetMutation, FleetOperation 
 import type { FleetDemand, FleetPolicy, FleetSnapshot, FleetWorkerObservation } from '../domain/elastic-fleet-policy.js';
 
 export interface AzurePoolConfiguration {
+  deploymentProfileRef?: string;
   kind: 'azure-vmss';
   subscription: string;
   resourceGroup: string;
@@ -79,7 +80,8 @@ function reject(): never { throw Error('azure_boundary_rejected'); }
 export function azureWorkerId(resourceId: string, vmId: string): string { return `azure:${resourceId.toLowerCase()}:${vmId.toLowerCase()}`; }
 export function validateAzurePoolConfiguration(value: unknown, poolId: string): AzurePoolConfiguration {
   try {
-    if (!object(value) || !exact(value, ['kind','subscription','resourceGroup','scaleSetName','resourceId','poolId','ownershipTag','image','bootstrap'])
+    if (!object(value) || !exact(value, ['kind','subscription','resourceGroup','scaleSetName','resourceId','poolId','ownershipTag','image','bootstrap',...(Object.hasOwn(value,'deploymentProfileRef')?['deploymentProfileRef']:[])])
+      || (Object.hasOwn(value,'deploymentProfileRef') && (typeof value.deploymentProfileRef !== 'string' || !value.deploymentProfileRef.startsWith('/') || value.deploymentProfileRef.includes('\0') || value.deploymentProfileRef.length>4096))
       || value.kind !== 'azure-vmss' || typeof value.subscription !== 'string' || !uuid.test(value.subscription)
       || typeof value.resourceGroup !== 'string' || !name.test(value.resourceGroup) || typeof value.scaleSetName !== 'string' || !name.test(value.scaleSetName)
       || value.poolId !== poolId || !text(poolId)) reject();
@@ -100,7 +102,7 @@ export function validateAzurePoolConfiguration(value: unknown, poolId: string): 
         || !text(value.image.sku) || !name.test(value.image.sku) || typeof value.image.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(value.image.version)) reject();
       image = {kind:'marketplace',publisher:value.image.publisher,offer:value.image.offer,sku:value.image.sku,version:value.image.version};
     }
-    return {kind:'azure-vmss',subscription:value.subscription,resourceGroup:value.resourceGroup,scaleSetName:value.scaleSetName,resourceId:expected,poolId,
+    return {...(typeof value.deploymentProfileRef==='string'?{deploymentProfileRef:value.deploymentProfileRef}:{}),kind:'azure-vmss',subscription:value.subscription,resourceGroup:value.resourceGroup,scaleSetName:value.scaleSetName,resourceId:expected,poolId,
       ownershipTag:{key:value.ownershipTag.key,value:poolId},image,bootstrap:{path:value.bootstrap.path,digest:value.bootstrap.digest}};
   } catch { throw Error('invalid_azure_configuration'); }
 }

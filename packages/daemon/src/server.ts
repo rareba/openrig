@@ -102,6 +102,7 @@ import { PermissionDriftObserver, type PermissionDriftReader } from "./domain/pe
 import { chatRoutes } from "./routes/chat.js";
 import { streamRoutes } from "./routes/stream.js";
 import { queueRoutes } from "./routes/queue.js";
+import { elasticFleetRoutes } from "./routes/elastic-fleet.js";
 import { githubIntakeRoutes } from "./routes/github-intake.js";
 import { humanRelayRoutes } from "./routes/human-relay.js";
 import { humanResponsesRoutes } from "./routes/human-responses.js";
@@ -219,6 +220,7 @@ export interface AppDeps {
   slowOpRecorder?: SlowOperationInstrumentation;
   requestPhaseObserver?: import("./domain/request-phase-observer.js").RequestPhaseObserver;
   queueRepo?: QueueRepository;
+  elasticFleetService?: import("./domain/elastic-fleet.js").ElasticFleetService;
   githubIntakeService?: import("./domain/github-intake.js").GithubIntakeService;
   githubIntakeScheduler?: import("./domain/github-poll-scheduler.js").PollScheduler;
   humanRelayService?: import("./domain/human-relay.js").HumanRelayService;
@@ -814,7 +816,8 @@ export function createApp(deps: AppDeps): Hono {
       services: { bootstrap: deps.bootstrapOrchestrator, rigs: deps.rigRepo, sessions: deps.sessionRegistry, queue: deps.queueRepo } });
   }
   app.route("/api/elastic-worker", elasticWorkerRoutes({ probe: deps.elasticWorkerProbe, bearerToken: deps.missionControlBearerToken ?? null,
-    preparation: elasticPreparation, ...(elasticPreparation ? { runtime: () => ({ selfHostId: getSelfHostId(), build: stampFields() }) } : {}) }));
+    queue: deps.queueRepo, preparation: elasticPreparation, ...(elasticPreparation ? { runtime: () => ({ selfHostId: getSelfHostId(), build: stampFields() }) } : {}) }));
+  app.route("/api/elastic-fleet", elasticFleetRoutes({service:deps.elasticFleetService,bearerToken:deps.missionControlBearerToken??null}));
   app.route("/api/github-intake", githubIntakeRoutes({ service: deps.githubIntakeService, bearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/mission-control", humanResponsesRoutes({ queueRepo: deps.queueRepo, bearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/mission-control", humanRelayRoutes({ service: deps.humanRelayService, queueRepo: deps.queueRepo, bearerToken: deps.missionControlBearerToken ?? null }));

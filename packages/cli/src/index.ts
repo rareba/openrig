@@ -38,6 +38,7 @@ import { transcriptCommand } from "./commands/transcript.js";
 import { sendCommand } from "./commands/send.js";
 import { streamCommand, type StreamDeps } from "./commands/stream.js";
 import { queueCommand, type QueueDeps } from "./commands/queue.js";
+import { elasticCommand } from "./commands/elastic.js";
 import { githubCommand } from "./commands/github.js";
 import { slackCommand, type SlackDeps } from "./commands/slack.js";
 import { projectCommand, type ProjectDeps } from "./commands/project.js";
@@ -124,6 +125,7 @@ export interface ProgramDeps {
   streamDeps?: StreamDeps;
   queueDeps?: QueueDeps;
   githubDeps?: StatusDeps;
+  elasticDeps?: StatusDeps;
   gatewayDeps?: GatewayCommandDeps;
   slackDeps?: SlackDeps;
   projectDeps?: ProjectDeps;
@@ -176,6 +178,7 @@ export function createProgram(depsOverride?: ProgramDeps): Command {
   program.addCommand(daemonCommand(depsOverride?.daemonDeps));
   program.addCommand(statusCommand(depsOverride?.statusDeps));
   program.addCommand(githubCommand(depsOverride?.githubDeps));
+  program.addCommand(elasticCommand(depsOverride?.elasticDeps));
   program.addCommand(snapshotCommand(depsOverride?.snapshotDeps));
   program.addCommand(restoreCommand(depsOverride?.restoreDeps));
   program.addCommand(crashCartCommand());

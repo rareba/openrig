@@ -229,3 +229,32 @@ describe("durable elastic fleet lifecycle", () => {
   });
 
 });
+
+it('advances only confirmed pending work under unchanged active authority and never replays the original mutation', async () => {
+  const db = database(); const b = boundary();
+  b.io.provision = async op => { b.calls.push(op); throw Error('uncertain'); };
+  const service = new ElasticFleetService(db,b.io,()=>time); service.configure(config);
+  await service.reconcile(); time += 10_000; b.set(snapshot()); await service.reconcile();
+  const original=service.status().operation!; const advanced: FleetOperation[]=[];
+  b.io.advanceOperation=async op=>{advanced.push(op);return 'pending';};
+  await service.plan(); service.status(); await service.reconcile();
+  expect(advanced).toEqual([]); expect(b.calls).toHaveLength(1);
+  b.inspect('pending'); await service.reconcile();
+  expect(advanced).toHaveLength(1); expect(advanced[0]).toMatchObject({operationId:original.operationId,targetCapacity:original.targetCapacity,revision:original.revision});
+  service.pause(); await service.reconcile(); expect(advanced).toHaveLength(1);
+  service.configure({...config,policy:{...config.policy,mode:'dry-run'}}); await service.reconcile(); expect(advanced).toHaveLength(1);
+  service.configure(config); b.io.advanceOperation=async op=>{advanced.push(op);return 'succeeded';};
+  await service.reconcile();
+  expect(advanced).toHaveLength(2); expect(service.status().operation).toMatchObject({operationId:original.operationId,state:'succeeded'});
+  expect(b.calls).toHaveLength(1);
+});
+
+it('rechecks pause and configuration after delayed pending readback before advancement', async () => {
+  const db=database(); const b=boundary(); b.io.provision=async op=>{b.calls.push(op);throw Error('uncertain');};
+  const service=new ElasticFleetService(db,b.io,()=>time); service.configure(config);
+  await service.reconcile(); time+=10_000; b.set(snapshot()); await service.reconcile();
+  let finish!:(value:'pending')=>void; let advances=0;
+  b.io.inspectOperation=()=>new Promise(resolve=>{finish=resolve;}); b.io.advanceOperation=async()=>{advances++;return 'succeeded';};
+  const running=service.reconcile(); service.pause(); finish('pending'); await running;
+  expect(advances).toBe(0); expect(service.status().operation?.state).toBe('pending');
+});

@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 
-ALLOWED = {'prepare', 'enroll', 'github-credential-install'}
+ALLOWED = {'prepare', 'enroll', 'github-credential-install', 'begin-drain', 'quiesce', 'final-checkpoint-export', 'final-checkpoint-upload', 'final-checkpoint-ack', 'seal-status'}
 def require(value):
     if not value:
         raise RuntimeError()
