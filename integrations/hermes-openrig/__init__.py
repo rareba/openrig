@@ -3,6 +3,7 @@ No LLM turn can manufacture a native answer. Quoted explicit commands own submis
 """
 import asyncio
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -80,6 +81,16 @@ class RelayPlugin:
         self.webhook_route = ctx.get_config('webhook_route', 'openrig-human-relay')
         self.webhook_lock = asyncio.Lock()
         self.hosts = ctx.get_config('origin_hosts', ['local'])[:10]
+        self.bridge = None
+        self.bridge_cursor = 0
+        if self.delivery_mode == 'webhook-bridge':
+            # Native plugin loaders may load this file without a package namespace.
+            spec = importlib.util.spec_from_file_location('openrig_local_bridge', pathlib.Path(__file__).with_name('_bridge.py'))
+            bridge_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(bridge_module)
+            self.bridge = bridge_module.LocalWebhookBridge(ctx)
+            if not isinstance(self.hosts, list) or not self.hosts or any(not isinstance(h, str) or not h for h in self.hosts):
+                raise ValueError('The local webhook bridge needs explicit origin host aliases.')
         self.poll_lock = asyncio.Lock()
         self.inbound_lock = asyncio.Lock()
         self.host_cursor = 0
@@ -124,7 +135,7 @@ class RelayPlugin:
                         'humanSession', 'profile', 'chatId', 'senderId', 'body')
             if (not isinstance(d, dict) or any(not isinstance(d.get(k), str) or not d[k] for k in required)
                     or d.get('channel', 'whatsapp') not in ('whatsapp', 'slack', 'teams')
-                    or not isinstance(d.get('questions'), list) or not d['questions']
+                    or not isinstance(d.get('questions'), list)
                     or d['connectorId'] != self.connector or d['profile'] != self.profile
                     or d['deliveryId'] != payload['deliveryId'] or delivery_id != payload['deliveryId']):
                 raise ValueError('invalid_delivery')
@@ -358,6 +369,9 @@ class RelayPlugin:
                 self.schedule_notice(identity)
             for identity, item in self.due('outbound', ('queued',), connected_only=True):
                 await self.send_delivery(item)
+            if self.delivery_mode == 'webhook-bridge':
+                await self.poll_bridge()
+                return
             if self.delivery_mode == 'webhook':
                 return  # Durable admission replaces pull, but all retry lanes remain active.
             if not any(a and a.is_connected for a in [self.adapter, *self.adapters.values()]):
@@ -376,6 +390,36 @@ class RelayPlugin:
                     item = {'delivery': delivery, 'hostId': host, 'state': 'queued', 'at': self.now()}
                     self.save_outbound(delivery['deliveryId'], item)
                     await self.send_delivery(item)
+
+    async def poll_bridge(self):
+        # One host/channel pair per tick; every configured pair gets bounded service.
+        pairs = [(host, channel) for host in self.hosts for channel in self.bridge.channels]
+        host, channel = pairs[self.bridge_cursor % len(pairs)]
+        self.bridge_cursor = (self.bridge_cursor + 1) % len(pairs)
+        try:
+            batch = await self.transport.post('webhook-pull', {'hostId': host, 'connectorId': self.connector,
+                                             'profile': self.profile, 'channel': channel, 'limit': 2})
+            events = batch['events'][:2]
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+        for event in events:
+            try:
+                await self.bridge.post(event)
+                delivery = event['delivery']
+                await self.transport.post('webhook-accepted', {
+                    'hostId': delivery['originHostId'], 'connectorId': self.connector,
+                    'profile': self.profile, 'channel': delivery.get('channel', 'whatsapp'),
+                    'chatId': delivery['chatId'], 'senderId': delivery['senderId'],
+                    'deliveryId': event['deliveryId'], 'attemptId': delivery['attemptId'],
+                    'fingerprint': event['fingerprint']})
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Origin retains the immutable event; the local receiver deduplicates
+                # any lost local HTTP/native acceptance acknowledgment on the next poll.
+                continue
 
     def connected_delivery(self, item):
         adapter = self.platform_adapter(item['delivery'].get('channel', 'whatsapp'))
@@ -437,10 +481,12 @@ class RelayPlugin:
             self.save_outbound(self.outbound_key(item), item)
         await self.flush_platform_receipt(item)
 
-    def known_question(self, quoted_id, channel='whatsapp'):
+    def known_question(self, quoted_id, channel='whatsapp', binding=None):
         return next((item for item in self.ctx.state.get('outbound', {}).values()
                      if quoted_id and quoted_id in item.get('messageIds', [])
-                     and item['delivery'].get('channel', 'whatsapp') == channel), None)
+                     and item['delivery'].get('channel', 'whatsapp') == channel
+                     and (binding is None or (item['delivery']['profile'], item['delivery']['chatId'],
+                                              item['delivery']['senderId']) == binding)), None)
 
     def quoted_id(self, event):
         quoted = getattr(event, 'reply_to_message_id', None)
@@ -491,11 +537,13 @@ class RelayPlugin:
         if channel not in ('whatsapp', 'slack', 'teams'):
             return None
         quoted_id = self.quoted_id(event)
-        item = self.known_question(quoted_id, channel)
+        profile = getattr(source, 'profile', None) or self.profile
+        item = self.known_question(quoted_id, channel, (profile, source.chat_id, source.user_id))
         if not item:
+            if self.known_question(quoted_id, channel):
+                return {'action': 'skip', 'reason': 'OpenRig question belongs to a different bound sender/profile/chat.'}
             return None
         d = item['delivery']
-        profile = getattr(source, 'profile', None) or self.profile
         if (profile != d['profile'] or source.chat_id != d['chatId'] or source.user_id != d['senderId']):
             return {'action': 'skip', 'reason': 'OpenRig question belongs to a different bound sender/profile/chat.'}
         text = self.command_text(event)

@@ -77,6 +77,26 @@ Duplicate `(originHostId, deliveryId)` callbacks return that same stored acknowl
 
 Disconnected native adapters leave admissions queued. The existing supervised poller drains queued work, saved platform receipts and incoming answers. `delivery_mode: webhook` disables only legacy pull. Immediately before each platform send, the plugin asks the original OpenRig origin to validate the exact delivery, attempt, question revision and current binding. Unavailable or malformed validation holds it for retry; a changed or answered request suppresses the platform send. The plugin persists `sending` before provider I/O. Restarted or timed-out sends with no saved platform receipt remain indeterminate and never automatically repost.
 
+## Optional outbound-only local bridge
+
+When OpenRig is reachable from Hermes through an existing private connection, but Hermes' existing webhook listener is bound to loopback, use `delivery_mode: webhook-bridge`. Configure the origin's webhook target with `mode: pull-bridge` so its daemon retains immutable webhook events for this bridge instead of pushing them. Keep the binding and matching target connector, profile, channel and endpoint unchanged while an event is pending.
+
+In the existing Hermes plugin settings:
+
+```yaml
+delivery_mode: webhook-bridge
+bridge_url: http://127.0.0.1:8644/hooks/openrig-human-relay
+bridge_secret_file: /EXISTING/LOCAL/HERMES-ROUTE-SECRET
+bridge_channels: [whatsapp]
+origin_hosts: [local, azure, azure2, azure3]
+```
+
+Use the actual existing local route path and port; this example creates no listener. `bridge_url` must be a numeric loopback HTTP URL, without embedded credentials or a fragment. Redirects and ambient proxies are disabled. `bridge_secret_file` names the already-authorized plain HMAC secret of that route. The payload cannot nominate another destination. This mode needs no inbound network expansion and uses no LLM.
+
+After existing receipt, response and queued-delivery retries, each poll rotates through one configured origin/channel pair (at most ten origins and three distinct supported channels). It requests at most two immutable events from native `webhook-pull`, then signs and POSTs each canonical event to the configured loopback route with a five-second bound. The normal native webhook hook validates and durably admits the event even when the platform is disconnected. Only an exact schema/status/delivery ID/fingerprint acceptance acknowledgment permits native `webhook-accepted`; that acknowledgment carries the original origin, attempt and complete channel/profile/chat/sender binding. The daemon separately retains platform submission receipts.
+
+A lost local HTTP or native acceptance acknowledgment repeats the original event. The durable receiver returns the same stored acknowledgment and never resends a platform message just because a bridge acknowledgment was lost. Local storage refusal, incorrect acknowledgment or redirect leaves the native event pending. The existing queue and send uncertainty rules continue to apply.
+
 ## Channel binding and provider limits
 
 Set optional `channel` on the native binding to `slack` or `teams`; omitted `channel` preserves the existing WhatsApp binding and reply identity. The plugin attaches each through `register_platform_handler` and chooses an adapter by that native channel. A quoted reply must match the saved channel, profile, chat, sender and actual provider receipt. Non-WhatsApp response payloads carry `channel`; their inbound deduplication keys include that channel. Text cannot supply the actor or quoted identity. SDK71 WhatsApp stanza-only quotes and identity-matched owner prefixes retain their original behavior.
@@ -99,7 +119,7 @@ The original origin host, qitem ID and request revision are preserved. Native in
 
 ## Offline delivery and honest receipts
 
-Native pending questions remain in the existing queue while Hermes or WhatsApp is offline. A connected plugin pulls bounded pages from explicit origins. Before any platform send, OpenRig persists a sending claim in its existing `outbox_entries` under `human-relay-`; Hermes also persists its local sending claim. This namespace cannot execute as a seat wake. A definite not-attempted delivery can retry with backoff; one held question does not hide later questions.
+Native pending questions remain in the existing queue while Hermes or a configured platform is offline. A connected plugin pulls bounded pages from explicit origins. Before any platform send, OpenRig persists a sending claim in its existing `outbox_entries` under `human-relay-`; Hermes also persists its local sending claim. This namespace cannot execute as a seat wake. A definite not-attempted delivery can retry with backoff; one held question does not hide later questions.
 
 A platform message ID is the evidence of a platform submission, not proof that a handset displayed or a person read it. Hermes saves actual platform IDs before acknowledging them to OpenRig. A lost acknowledgment retries only that receipt, never the send. The current WhatsApp adapter has no caller-supplied send idempotency key or query-by-key API. A crash or timeout after an attempt without a saved receipt remains **indeterminate** and requires reconciliation; automatic reposting would risk duplicates. The same conservative rule applies to a crash between claiming and sending when the boundary cannot be proven.
 

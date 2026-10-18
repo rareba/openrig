@@ -137,6 +137,25 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
   for item in saved.values():item['nextAttemptAt']=1 if item['delivery'].get('channel')=='slack' else 0
   self.ctx.state.set('outbound',saved)
   await self.plugin.poll_once();self.assertEqual(len(slack.sent),1);self.assertEqual(self.adapter.sent,[])
+ async def test_same_platform_receipt_in_other_chat_matches_full_native_binding(self):
+  for channel in ('slack','teams'):
+   for chat in ('chat','different-chat'):
+    d=copy.deepcopy(DELIVERY);d['channel']=channel;d['chatId']=chat;d['deliveryId']+='-'+channel+'-'+chat
+    self.plugin.adapters[channel]=Adapter()
+    await self.admit(envelope(d),delivery_id=d['deliveryId']);await self.plugin.poll_once()
+   e=event('/answer Bound native answer');e.source.platform.value=channel;e.source.chat_id='different-chat';e.message_id='reply-'+channel
+   result=await self.plugin.handle_event(e);self.assertEqual(result['action'],'skip')
+   records=list(self.ctx.state.get('inbound',{}).values())
+   self.assertTrue(any(r['payload']['channel']==channel and r['payload']['deliveryId'].endswith('-different-chat') for r in records))
+ async def test_unstructured_native_request_preserves_quoted_custom_answer(self):
+  d=copy.deepcopy(DELIVERY);d['questions']=[]
+  self.assertEqual((await self.admit(envelope(d)))['status'],200)
+  await self.plugin.poll_once()
+  self.assertEqual((await self.plugin.handle_event(event('/answer Explicit unstructured answer')))['action'],'skip')
+  await self.plugin.poll_once()
+  record=next(iter(self.ctx.state.get('inbound').values()))
+  self.assertEqual(record['state'],'recorded')
+  self.assertEqual(record['payload']['response'],{'kind':'custom','text':'Explicit unstructured answer'})
  async def test_registers_exact_async_hook_and_all_supported_platforms(self):
   module.register(self.ctx)
   self.assertIn('openrig-human-relay',self.ctx.hooks)
