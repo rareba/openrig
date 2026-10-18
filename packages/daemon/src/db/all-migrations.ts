@@ -120,6 +120,8 @@ import { sessionAgentAppSchema } from "./migrations/114_session_agent_app.js";
 
 import { githubIntakeSchema } from "./migrations/115_github_intake.js";
 
+import { elasticFleetSchema } from "./migrations/116_elastic_fleet.js";
+
 export const ALL_MIGRATIONS: Migration[] = [
   coreSchema,
   bindingsSessionsSchema,
@@ -232,4 +234,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   appliedLaunchDaemonOptOutSchema,
   sessionAgentAppSchema,
   githubIntakeSchema,
+  elasticFleetSchema,
 ];
