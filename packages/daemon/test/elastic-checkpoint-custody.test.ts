@@ -312,13 +312,14 @@ describe("bounded private TLS checkpoint receiver", () => {
             auth?: string;
             extra?: Record<string, string>;
             duplicate?: boolean;
+            early?: boolean;
         } = {}) => new Promise<{
             status: number;
             body: string;
-        }>((resolve, reject) => { const headers: Record<string, string> | string[] = change.duplicate ? ["authorization", `Bearer ${f.cap.token}`, "authorization", `Bearer ${f.cap.token}`, "content-type", "application/octet-stream", "content-length", String(f.ciphertext.length), "x-openrig-checkpoint", Buffer.from(JSON.stringify(checkpointDescriptorSchema.parse(f.descriptor))).toString("base64")] : { authorization: `Bearer ${change.auth ?? f.cap.token}`, "content-type": "application/octet-stream", "content-length": String(f.ciphertext.length), "x-openrig-checkpoint": Buffer.from(JSON.stringify(checkpointDescriptorSchema.parse(f.descriptor))).toString("base64"), ...change.extra }; const req = request({ host: "127.0.0.1", port: address.port, method: change.method ?? "PUT", path: change.path ?? `/api/elastic-checkpoints/${f.cp.checkpointId}`, ca: tlsCert, minVersion: "TLSv1.3", headers }, res => { let body = ""; res.on("data", b => body += b); res.on("end", () => resolve({ status: res.statusCode!, body })); }); req.on("error", e => ["EPIPE", "ECONNRESET"].includes((e as NodeJS.ErrnoException).code ?? "") ? resolve({ status: 400, body: "" }) : reject(e)); req.end(f.ciphertext); });
+        }>((resolve, reject) => { const headers: Record<string, string> | string[] = change.duplicate ? ["authorization", `Bearer ${f.cap.token}`, "authorization", `Bearer ${f.cap.token}`, "content-type", "application/octet-stream", "content-length", String(f.ciphertext.length), "x-openrig-checkpoint", Buffer.from(JSON.stringify(checkpointDescriptorSchema.parse(f.descriptor))).toString("base64")] : { authorization: `Bearer ${change.auth ?? f.cap.token}`, "content-type": "application/octet-stream", "content-length": String(f.ciphertext.length), "x-openrig-checkpoint": Buffer.from(JSON.stringify(checkpointDescriptorSchema.parse(f.descriptor))).toString("base64"), ...change.extra }; let observed = false; const req = request({ host: "127.0.0.1", port: address.port, method: change.method ?? "PUT", path: change.path ?? `/api/elastic-checkpoints/${f.cp.checkpointId}`, ca: tlsCert, minVersion: "TLSv1.3", headers }); req.once("response", res => { observed = true; let body = ""; res.on("data", b => body += b); res.on("error", reject); res.on("end", () => resolve({ status: res.statusCode!, body })); if (change.early) req.end(f.ciphertext); }); req.on("error", e => { if (!observed) reject(e); }); if (change.early) req.flushHeaders(); else req.end(f.ciphertext); });
         try {
             for (const change of [{ auth: "x".repeat(43) }, { method: "POST" }, { path: "/api/operator" }, { extra: { "content-encoding": "gzip" } }, { duplicate: true }])
-                expect((await send(change)).status).toBe(400);
+                expect((await send({ ...change, early: true })).status).toBe(400);
             expect(f.custody.status(f.cp.checkpointId).phase).toBe("reserved");
             expect((await send()).status).toBe(201);
             expect(f.custody.status(f.cp.checkpointId).phase).toBe("uploaded");
