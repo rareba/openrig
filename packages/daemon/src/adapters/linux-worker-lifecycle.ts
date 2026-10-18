@@ -1,3 +1,4 @@
+import { inspectManagedTmuxIpc, retireStoppedTmuxIpc, type ManagedTmuxIpc } from "./managed-tmux-ipc.js";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -92,6 +93,7 @@ export class LinuxWorkerLifecycle {
       env: {
         PATH: "/usr/bin:/bin",
         HOME: m.linux.home,
+        TMUX_TMPDIR: m.linux.temp,
         OPENRIG_ELASTIC_MANIFEST: this.os.manifestPath,
         OPENRIG_ELASTIC_MANIFEST_DIGEST: this.os.manifestDigest,
       },
@@ -125,13 +127,17 @@ export class LinuxWorkerLifecycle {
       )
         fail();
       this.filesystem();
-      this.save("quiesced.json", { binding, phase: "sealing" });
+      const managedIpc = inspectManagedTmuxIpc(this.os.manifest);
+      this.save("quiesced.json", { binding, phase: "sealing", managedIpc });
       this.control.sealAdmission(state, binding.drainGeneration);
     } else if (!existing) fail();
     this.os.installSealMarker();
     this.os.stopUnit();
     this.stopped(binding);
-    this.save("quiesced.json", { binding, phase: "stopped" });
+    const record = this.read<{ managedIpc: ManagedTmuxIpc[]; ipcAudit?: unknown }>("quiesced.json");
+    const ipcAudit = retireStoppedTmuxIpc(this.os.manifest, record.managedIpc);
+    this.stopped(binding);
+    this.save("quiesced.json", { binding, phase: "stopped", managedIpc: record.managedIpc, ipcAudit: record.ipcAudit ?? ipcAudit });
     return { quiesced: true, binding };
   }
   async export(
@@ -189,6 +195,7 @@ export class LinuxWorkerLifecycle {
           identity: this.os.instance(),
           state: this.control.read(),
           ledger: this.control.ledger(),
+          managedIpc: this.read("quiesced.json"),
         },
         gitRefs: fs.refs,
       });

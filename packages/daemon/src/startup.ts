@@ -612,6 +612,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     OPENRIG_ELASTIC_MANIFEST: process.env.OPENRIG_ELASTIC_MANIFEST,
     OPENRIG_ELASTIC_MANIFEST_DIGEST: process.env.OPENRIG_ELASTIC_MANIFEST_DIGEST,
     OPENRIG_ELASTIC_PI: process.env.OPENRIG_ELASTIC_PI,
+    ...(elasticWorkerMode ? { TMUX_TMPDIR: process.env.TMUX_TMPDIR } : {}),
     OPENRIG_HOME,
     OPENRIG_PORT: openRigPort,
     OPENRIG_HOST: openRigHost,

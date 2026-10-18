@@ -26,6 +26,16 @@ and private TLS IP/port. `linux.pi` must point to the real Pi Node entry file in
 `home/state/pi`. Every writable workspace, cache, HOME, database and tool temp directory
 must lie below `ownedRoots`; standard paths outside the inventory become read-only or
 inaccessible in the unit. `/tmp` and `/var/tmp` bind to persistent inventoried `temp`.
+`TMUX_TMPDIR` is pinned to that same canonical host-visible path. Only its exact
+`tmux-<uid>/default` Unix listener can be represented as managed IPC: the live proof binds
+its owner/device/inode/mode, private parent directory, `/proc/net/unix` listening kernel
+inode, and an fd held by the pinned tmux process in the exact service cgroup with matching
+`TMUX_TMPDIR` environment. No `/tmp` path alias, alternate socket, special file or whole
+scratch directory is exempted. Ordinary temp files remain business custody. Quiesce records
+that IPC identity before sealing; after twice proving whole-unit/UID absence it requires
+that endpoint to be absent and retires only the exact same dead filesystem socket, if left
+behind. The final archive retains the evidence/disposition in its audit. Replaced or still
+live endpoints retain the VM.
 
 On the staged Linux image, run as root with a clean environment:
 
@@ -113,7 +123,10 @@ are bounded at 64 MiB each, source total 512 MiB, 100,000 paths; unsupported cus
 All Git metadata/objects and all declared runtime SQLite backup files are included. SQLite
 backup uses the native backup API; WAL/SHM are not separate restoration artifacts. Final
 rechecks compare all business bytes and complete SQLite schema/table row contents, so SQLite
-connection housekeeping does not invalidate otherwise identical stopped custody.
+connection housekeeping does not invalidate otherwise identical stopped custody. Logical
+SQLite equality preserves full-width INTEGER values, REAL IEEE bits, TEXT/BLOB/NULL storage
+classes, accessible rowids, all declared columns and database version/application/encoding
+metadata. Unsupported rowid ambiguity fails closed.
 
 `SignedCustodyReceipt` is `{body,signature}`. Body in serializer order:
 `{version:1,binding,checkpointId,manifestDigest,ciphertextSha256,ciphertextBytes,verified:true,durableStoreId}`.
@@ -130,7 +143,7 @@ stopped VM and its root-private archive indefinitely.
 
 The focused tests cover real SQLite/Git/archive/crypto and lifecycle ordering with OS effects
 stubbed. They do not prove the target image's systemd sandbox, source layout, account policy,
-PID/cgroup census, private TLS server, model execution, tool execution or reboot behavior.
+PID/cgroup/managed-IPC census, private TLS server, model execution, tool execution or reboot behavior.
 Validate unit effective directives and foreground PID, deliberate escaped-UID retention,
 missing/changed pin refusal, sealed boot/start/input/launch refusal, per-seat Pi model/tool
 execution, shutdown history/full DB restore and verified final upload on Linux first.

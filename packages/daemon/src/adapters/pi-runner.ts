@@ -427,13 +427,21 @@ export class RunnerCore {
   private v2Limit: number | null = null;
   private frameDecoder: OmpFrameDecoder | null = null;
   private idleSequence = 0;
-  private idleRequest: string | null = null;
+  private idleRequest: { id: string; at: number; generation: number } | null = null;
+  private idleGeneration = 0;
   private idleProof: PiRunnerState["idleProof"];
   pollIdle(): void {
     if (this.runtime !== "pi" || !this.identity.launchId) return;
+    this.invalidateIdle();
+    this.idleRequest = { id: `elastic-idle:${++this.idleSequence}`, at: Date.parse(this.io.now()), generation: this.idleGeneration };
+    this.io.sendRpc({ type: "get_state", id: this.idleRequest.id });
+  }
+
+  private invalidateIdle(): void {
+    this.idleGeneration++;
+    this.idleRequest = null;
     this.idleProof = undefined;
-    this.idleRequest = `elastic-idle:${++this.idleSequence}`;
-    this.io.sendRpc({ type: "get_state", id: this.idleRequest });
+    this.writeSidecar({});
   }
 
   constructor(
@@ -523,8 +531,7 @@ export class RunnerCore {
       this.handleResponse(record);
       return;
     }
-    this.idleProof = undefined;
-    this.writeSidecar({});
+    this.invalidateIdle();
     this.handleEvent(record);
   }
 
@@ -538,8 +545,7 @@ export class RunnerCore {
   /** One aggregated paste block from pane stdin. */
   handleUserBlock(block: string): void {
     try { assertElasticEffectAllowed(); } catch { this.io.mirrorLine("[pi-runner] input denied by worker drain/seal"); return; }
-    this.idleProof = undefined;
-    this.writeSidecar({});
+    this.invalidateIdle();
     if (block === "/abort") {
       this.io.sendRpc({ type: "abort" });
       this.io.mirrorLine("[pi-runner] abort sent");
@@ -564,6 +570,7 @@ export class RunnerCore {
 
   /** Child process exit — honest, loud, durable. */
   handlePiExit(code: number | null): void {
+    this.invalidateIdle();
     this.ready = false;
     this.reportDroppedFrame(this.frameDecoder?.incomplete());
     this.io.mirrorLine(`[${this.runtime}-runner] EXITED ${this.runtime} exited (code ${code ?? "unknown"})`);
@@ -572,11 +579,17 @@ export class RunnerCore {
   }
 
   private handleResponse(record: Record<string, unknown>): void {
-    if (this.idleRequest && record.id === this.idleRequest) {
+    if (this.idleRequest && record.id === this.idleRequest.id) {
+      const request = this.idleRequest;
       this.idleRequest = null;
+      const now = Date.parse(this.io.now());
+      if (request.generation !== this.idleGeneration || !Number.isFinite(request.at) || !Number.isFinite(now) || now < request.at || now - request.at > 3000) {
+        this.invalidateIdle();
+        return;
+      }
       const data = record.data as Record<string, unknown> | undefined;
       const ids = this.io.processIdentity?.();
-      this.idleProof = ids && this.identity.launchId ? { at: Date.parse(this.io.now()), ...ids, launchId: this.identity.launchId, idle: this.ready && typeof data?.sessionId === "string" && typeof data?.sessionFile === "string" && record.success === true && data?.sessionId === this.sessionId && data?.sessionFile === this.sessionFile && data?.isStreaming === false && data?.isCompacting === false && data?.pendingMessageCount === 0 && !this.streaming } : undefined;
+      this.idleProof = ids && this.identity.launchId ? { at: request.at, ...ids, launchId: this.identity.launchId, idle: this.ready && typeof data?.sessionId === "string" && typeof data?.sessionFile === "string" && record.success === true && data?.sessionId === this.sessionId && data?.sessionFile === this.sessionFile && data?.isStreaming === false && data?.isCompacting === false && data?.pendingMessageCount === 0 && !this.streaming } : undefined;
       this.writeSidecar({}); return;
     }
     if (record.id === NEGOTIATE_ID && this.v2Limit !== null) {

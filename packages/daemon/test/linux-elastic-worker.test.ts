@@ -176,3 +176,28 @@ describe('stable Linux manifest confinement',()=>{
 });
 
 it('refuses a mutation during stopped checkpoint capture rather than acknowledging an older archive',async()=>{const f=fixture();const history=join(f.root,'history');writeFileSync(history,'before');const audit={toJSON(){writeFileSync(history,'changed during capture');return {phase:'sealed'};}};await expect(captureFinalCheckpoint({binding,roots:[f.root],databases:[],controlDirectory:f.control,journal:Buffer.alloc(0),audit,gitRefs:[]})).rejects.toThrow();});
+
+describe('lossless SQLite stopped custody equality', () => {
+  it('distinguishes full-width integers and storage types without JSON number coercion', () => {
+    const f = fixture();
+    const path = join(f.root, 'wide.sqlite');
+    const db = new Database(path);
+    try {
+      db.exec('CREATE TABLE values_exact(value); INSERT INTO values_exact VALUES(9007199254740992)');
+      const digest = () => stoppedSourceDigest([f.root], [path]);
+      const first = digest();
+      db.exec('UPDATE values_exact SET value=9007199254740993');
+      expect(digest()).not.toBe(first);
+      const integer = digest();
+      db.exec("UPDATE values_exact SET value='9007199254740993'");
+      expect(digest()).not.toBe(integer);
+      const text = digest();
+      db.exec("UPDATE values_exact SET value=x'39303037313939323534373430393933'");
+      expect(digest()).not.toBe(text);
+      db.exec('UPDATE values_exact SET value=1');const integerOne=digest();
+      db.exec('UPDATE values_exact SET value=1.0');expect(digest()).not.toBe(integerOne);
+      const priorRowid=digest();db.exec('UPDATE values_exact SET rowid=9');expect(digest()).not.toBe(priorRowid);
+      const priorVersion=digest();db.pragma('user_version=5');expect(digest()).not.toBe(priorVersion);
+    } finally { db.close(); }
+  });
+});

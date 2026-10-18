@@ -574,6 +574,7 @@ export class LinuxPrivilegedWorkerBoundary implements PrivilegedWorkerBoundary {
       OPENRIG_ELASTIC_MANIFEST: this.manifestPath,
       OPENRIG_ELASTIC_MANIFEST_DIGEST: this.manifestDigest,
       TMPDIR: m.linux.temp,
+      TMUX_TMPDIR: m.linux.temp,
       XDG_CACHE_HOME: join(m.linux.home, "cache"),
       PATH: `${dirname(m.linux.pi)}:${dirname(m.linux.node)}:/usr/bin:/bin`,
     };
@@ -632,7 +633,7 @@ export interface LinuxProcessIdentity {
   executable: string;
   argv: string[];
 }
-function procIdentity(pid: number): LinuxProcessIdentity {
+export function procIdentity(pid: number): LinuxProcessIdentity {
   const base = `/proc/${pid}`;
   const status = readFileSync(join(base, "status"), "utf8");
   const uid = Number(/^Uid:\s+(\d+)/m.exec(status)?.[1]);

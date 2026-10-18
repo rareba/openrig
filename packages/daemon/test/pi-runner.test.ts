@@ -754,3 +754,23 @@ describe('elastic launch-scoped native idle evidence', () => {
     expect(f.sidecars.at(-1)?.idleProof).toBeUndefined();
   });
 });
+
+describe('elastic idle observation ordering', () => {
+  it.each(['input', 'event', 'exit', 'expired'])('rejects an outstanding response after %s', (kind) => {
+    const f = fakeIo();
+    let now = Date.parse('2026-10-18T12:00:00Z');
+    f.io.now = () => new Date(now).toISOString();
+    f.io.processIdentity = () => ({runnerPid:123,childPid:456,runnerStartTime:'1',childStartTime:'2'});
+    const core = new RunnerCore(f.io, {sessionName:SESSION,launchId:'launch'});
+    core.start();
+    core.handlePiLine(JSON.stringify({type:'response',id:'pi-runner-get-state',success:true,data:{sessionId:'id',sessionFile:SESSION_FILE}}));
+    core.pollIdle();
+    const id = f.rpc.at(-1)!.id;
+    if (kind === 'input') core.handleUserBlock('new work');
+    if (kind === 'event') core.handlePiLine(JSON.stringify({type:'auto_compaction_start'}));
+    if (kind === 'exit') core.handlePiExit(0);
+    if (kind === 'expired') now += 4000;
+    core.handlePiLine(JSON.stringify({type:'response',id,success:true,data:{sessionId:'id',sessionFile:SESSION_FILE,isStreaming:false,isCompacting:false,pendingMessageCount:0}}));
+    expect(f.sidecars.at(-1)?.idleProof).toBeUndefined();
+  });
+});

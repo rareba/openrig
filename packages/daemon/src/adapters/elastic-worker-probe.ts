@@ -1,3 +1,4 @@
+import { sameManagedSocket, type ManagedTmuxIpc } from "./managed-tmux-ipc.js";
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
@@ -7,7 +8,7 @@ import { workerDigest } from '../domain/elastic-worker-control.js';
 
 export interface WorkerFileProof { path: string; bytes: number; sha256: string }
 export interface WorkerRefProof { repo: string; ref: string; sha: string }
-export interface WorkerFilesystemProof { complete: boolean; blockers: string[]; files: WorkerFileProof[]; refs: WorkerRefProof[]; digest: string }
+export interface WorkerFilesystemProof { complete: boolean; blockers: string[]; files: WorkerFileProof[]; refs: WorkerRefProof[]; digest: string; managedIpc?: ManagedTmuxIpc[] }
 export interface WorkerCheckpoint { digest: string; files: WorkerFileProof[]; refs: WorkerRefProof[] }
 export interface WorkerProcessProof { observedAt: number; complete: boolean; idle: boolean; processes: number; uid: number; cgroup: string }
 export interface ElasticWorkerProbe {
@@ -22,8 +23,9 @@ function git(cwd: string, args: string[]): string {
     env: { ...inherited, GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: '', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } });
 }
 /** Owned roots are a trusted enrollment inventory, not worker-provided deletion exemptions. */
-export function inspectWorkerFilesystem(ownedRoots: readonly string[], declaredCwds: readonly string[], excludedSqlitePaths: readonly string[] = []): WorkerFilesystemProof {
+export function inspectWorkerFilesystem(ownedRoots: readonly string[], declaredCwds: readonly string[], excludedSqlitePaths: readonly string[] = [], managedIpc: ManagedTmuxIpc[] = []): WorkerFilesystemProof {
   const blockers = new Set<string>(); const files: WorkerFileProof[] = []; const refs: WorkerRefProof[] = [];
+  const verifiedIpc = new Set<string>();
   const roots: string[] = []; const repositories = new Set<string>(); const visited = new Set<string>(); let bytes = 0;
   try {
     if (!ownedRoots.length || ownedRoots.length > 128) throw Error();
@@ -73,9 +75,14 @@ export function inspectWorkerFilesystem(ownedRoots: readonly string[], declaredC
         const content = readFileSync(path); const after = lstatSync(path);
         if (stat.ino !== after.ino || stat.size !== after.size || stat.mtimeMs !== after.mtimeMs) throw Error();
         files.push({ path, bytes: content.length, sha256: createHash('sha256').update(content).digest('hex') });
+      } else if (stat.isSocket()) {
+        const proof = managedIpc.find(p => p.path === path);
+        if (!proof || verifiedIpc.has(path) || Date.now() < proof.observedAt || Date.now() - proof.observedAt > 3000 || !sameManagedSocket(proof)) throw Error();
+        verifiedIpc.add(path);
       } else throw Error();
     };
     for (const root of roots) walk(root);
+    if (verifiedIpc.size !== managedIpc.length) throw Error();
     for (const cwd of declaredCwds) if (!isAbsolute(cwd) || realpathSync(cwd) !== cwd || !contained(cwd) || !lstatSync(cwd).isDirectory()) throw Error();
     for (const repo of repositories) {
       // Audit actual metadata/object custody before Git is allowed to read any objects.
@@ -113,17 +120,17 @@ export function inspectWorkerFilesystem(ownedRoots: readonly string[], declaredC
   } catch { blockers.add('filesystem_incomplete'); }
   files.sort((a,b) => a.path.localeCompare(b.path)); refs.sort((a,b) => `${a.repo}:${a.ref}`.localeCompare(`${b.repo}:${b.ref}`));
   const list = [...blockers].sort();
-  return { complete: !blockers.has('filesystem_incomplete'), blockers: list, files, refs, digest: workerDigest({ files, refs }) };
+  return { complete: !blockers.has('filesystem_incomplete'), blockers: list, files, refs, digest: workerDigest({ files, refs }), ...(managedIpc.length ? { managedIpc } : {}) };
 }
 export function verifyWorkerCheckpoint(proof: WorkerFilesystemProof, checkpoint: WorkerCheckpoint | null): boolean {
   return proof.complete && proof.blockers.length === 0 && checkpoint !== null && checkpoint.digest === proof.digest
     && workerDigest({ files: checkpoint.files, refs: checkpoint.refs }) === proof.digest;
 }
 export function inspectElasticWorker(options: { control: ElasticWorkerControl; ownedRoots: string[]; declaredCwds: string[];
-  processes: WorkerProcessProof; checkpoint?: WorkerCheckpoint | null; now?: number; sqlitePaths?: string[] }): ElasticWorkerProbe {
+  processes: WorkerProcessProof; checkpoint?: WorkerCheckpoint | null; now?: number; sqlitePaths?: string[]; managedIpc?: ManagedTmuxIpc[] }): ElasticWorkerProbe {
   const state = options.control.read(); if (!state) throw Error('elastic_worker_unavailable');
   const observedAt = options.now ?? Date.now(); const ledger = options.control.ledger();
-  const filesystem = inspectWorkerFilesystem(options.ownedRoots, options.declaredCwds, options.sqlitePaths);
+  const filesystem = inspectWorkerFilesystem(options.ownedRoots, options.declaredCwds, options.sqlitePaths, options.managedIpc);
   const checkpointAcknowledged = verifyWorkerCheckpoint(filesystem, options.checkpoint ?? null);
   const process = options.processes;
   const processFresh = process.complete && process.observedAt <= observedAt && observedAt - process.observedAt <= 5_000

@@ -1,3 +1,4 @@
+import { inspectManagedTmuxIpc } from "./managed-tmux-ipc.js";
 import Database from "better-sqlite3";
 import {
   parseLinuxManifest,
@@ -20,7 +21,9 @@ export function loadForegroundManifest() {
   const bytes = noFollowRead(path, 65536);
   if (sha256(bytes) !== process.env.OPENRIG_ELASTIC_MANIFEST_DIGEST)
     throw Error("elastic_worker_unavailable");
-  return parseLinuxManifest(bytes.toString());
+  const manifest = parseLinuxManifest(bytes.toString());
+  if (process.env.TMUX_TMPDIR !== manifest.linux.temp) throw Error("elastic_worker_unavailable");
+  return manifest;
 }
 export function workerDeclaredCwds(control: ElasticWorkerControl): string[] {
   const rows = control.db.prepare("SELECT cwd FROM nodes").all() as Array<{
@@ -65,6 +68,7 @@ export function createElasticForegroundProbe(
       declaredCwds: workerDeclaredCwds(control),
       processes: inspectLinuxProcesses(m),
       sqlitePaths: m.linux.databases,
+      managedIpc: inspectManagedTmuxIpc(m),
     });
 }
 // This fixed executable is invoked as the dedicated UID by the root boundary; Git never runs as root.
@@ -86,6 +90,7 @@ if (
             m.ownedRoots,
             workerDeclaredCwds(new ElasticWorkerControl(db)),
             m.linux.databases,
+            inspectManagedTmuxIpc(m),
           ),
         ),
       );

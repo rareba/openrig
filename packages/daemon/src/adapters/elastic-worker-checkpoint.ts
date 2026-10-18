@@ -155,6 +155,19 @@ function walkRoots(
   }
   return files;
 }
+/** Preserve SQLite storage classes and every INTEGER/REAL bit used by custody equality. */
+function sqliteValue(value: unknown): unknown {
+  if (value === null) return ["null"];
+  if (typeof value === "bigint") return ["integer", value.toString()];
+  if (typeof value === "number") {
+    const bits = Buffer.alloc(8);
+    bits.writeDoubleBE(value);
+    return ["real", bits.toString("hex")];
+  }
+  if (typeof value === "string") return ["text", value];
+  if (Buffer.isBuffer(value)) return ["blob", value.toString("base64")];
+  fail();
+}
 export function stoppedSourceDigest(
   roots: string[],
   databases: string[] = [],
@@ -173,6 +186,7 @@ export function stoppedSourceDigest(
   const logical = databases.map((path) => {
     const db = new Database(path, { readonly: true, fileMustExist: true });
     try {
+      db.pragma("trusted_schema=OFF");
       if (db.pragma("integrity_check", { simple: true }) !== "ok") fail();
       const schema = db
         .prepare(
@@ -184,15 +198,23 @@ export function stoppedSourceDigest(
           "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name",
         )
         .all() as Array<{ name: string }>;
-      const content = tables.map((t) => ({
-        name: t.name,
-        rows: db
-          .prepare(`SELECT * FROM "${t.name.replaceAll('"', '""')}"`)
-          .all()
-          .map((row) => JSON.stringify(row))
-          .sort(),
-      }));
-      const encoded = JSON.stringify({ schema, content });
+      const tableKinds = db.pragma("table_list") as Array<{name: string; wr: number}>;
+      const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
+      const content = tables.map((t) => {
+        const columns = db.pragma(`table_xinfo(${quote(t.name)})`) as Array<{name: string}>;
+        const kind = tableKinds.find(table => table.name === t.name);
+        if (!kind) fail();
+        const rowid = ["rowid", "_rowid_", "oid"].find(name => !columns.some(c => c.name.toLowerCase() === name));
+        if (!kind.wr && !rowid) fail();
+        const select = [...(!kind.wr ? [quote(rowid!)] : []), ...columns.map(c => quote(c.name))].join(",");
+        return {
+          name: t.name,
+          rows: db.prepare(`SELECT ${select} FROM ${quote(t.name)}`).raw(true).safeIntegers(true).all()
+            .map(row => JSON.stringify((row as unknown[]).map(sqliteValue))).sort(),
+        };
+      });
+      const metadata = {userVersion: db.pragma("user_version", {simple:true}), applicationId: db.pragma("application_id", {simple:true}), encoding: db.pragma("encoding", {simple:true})};
+      const encoded = JSON.stringify({ schema, content, metadata });
       if (Buffer.byteLength(encoded) > CHECKPOINT_LIMIT) fail();
       return { path, digest: sha256(encoded) };
     } finally {
