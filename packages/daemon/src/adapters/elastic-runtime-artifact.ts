@@ -1,35 +1,61 @@
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, openSync, readSync, createReadStream } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
+import { Blob } from 'node:buffer';
+import { Readable } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-/** Validate the inert uncompressed ustar artifact before serving a pinned descriptor. */
-export function openRuntimeArtifact(input: {
-    path: string;
-    archiveSha256: string;
-    archiveBytes: number;
-}) {
-    if (!Number.isSafeInteger(input.archiveBytes) || input.archiveBytes < 1024 || input.archiveBytes > 3 * 1024 ** 3 || input.archiveBytes % 512 !== 0)
+export const MAX_RUNTIME_ARTIFACT_BYTES = 1024 ** 3;
+const chunkBytes = 1024 ** 2;
+const memoryOverhead = 256 * 1024 ** 2;
+type ArtifactInput = { path: string; archiveSha256: string; archiveBytes: number };
+
+/** Capture, validate and copy into an immutable Blob before exposing any response. */
+function validatedSnapshot(input: ArtifactInput): Blob {
+    if (!Number.isSafeInteger(input.archiveBytes) || input.archiveBytes < 1024 || input.archiveBytes > MAX_RUNTIME_ARTIFACT_BYTES || input.archiveBytes % 512 !== 0)
         throw Error('elastic_artifact_rejected');
+    // This is a conservative process/cgroup-aware preflight, not a memory reservation.
+    // Capture buffers and the immutable Blob can coexist until garbage collection.
+    if (process.availableMemory() < 2 * input.archiveBytes + memoryOverhead)
+        throw Error('elastic_artifact_memory_unavailable');
     const fd = openSync(input.path, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
         const stat = fstatSync(fd);
         if ((stat.uid !== 0 && stat.uid !== process.getuid?.()) || !stat.isFile() || stat.nlink !== 1 || stat.mode & 0o022 || stat.size !== input.archiveBytes || !/^[a-f0-9]{64}$/.test(input.archiveSha256))
             throw Error();
+        const chunks: Buffer[] = [];
         const hash = createHash('sha256');
-        const buffer = Buffer.alloc(1024 * 1024);
         for (let offset = 0; offset < stat.size;) {
-            const n = readSync(fd, buffer, 0, Math.min(buffer.length, stat.size - offset), offset);
-            if (!n)
-                throw Error();
-            hash.update(buffer.subarray(0, n));
-            offset += n;
+            const chunk = Buffer.allocUnsafe(Math.min(chunkBytes, stat.size - offset));
+            let copied = 0;
+            while (copied < chunk.length) {
+                const count = readSync(fd, chunk, copied, chunk.length - copied, offset + copied);
+                if (!count) throw Error();
+                copied += count;
+            }
+            chunks.push(chunk);
+            hash.update(chunk);
+            offset += chunk.length;
         }
-        if (hash.digest('hex') !== input.archiveSha256)
-            throw Error();
+        if (hash.digest('hex') !== input.archiveSha256) throw Error();
+        // All subsequent validation reads the captured bytes, never the live inode.
+        const read = (target: Buffer, count: number, offset: number): number => {
+            if (offset + count > stat.size) return 0;
+            let copied = 0;
+            while (copied < count) {
+                const at = offset + copied;
+                const chunk = chunks[Math.floor(at / chunkBytes)]!;
+                const start = at % chunkBytes;
+                const length = Math.min(count - copied, chunk.length - start);
+                chunk.copy(target, copied, start, start + length);
+                copied += length;
+            }
+            return copied;
+        };
+        const buffer = Buffer.alloc(chunkBytes);
         const header = Buffer.alloc(512);
         const names = new Set<string>();
         let ended = false;
         for (let offset = 0; offset < stat.size;) {
-            if (readSync(fd, header, 0, 512, offset) !== 512)
+            if (read(header, 512, offset) !== 512)
                 throw Error();
             offset += 512;
             if (header.every(b => b === 0)) {
@@ -59,66 +85,85 @@ export function openRuntimeArtifact(input: {
                 throw Error();
             if (names.size >= 250000)
                 throw Error();
-            let suffix = '';
+            const inspect = privateKeyScanner();
             for (let position = offset; position < offset + size;) {
-                const n = readSync(fd, buffer, 0, Math.min(buffer.length, offset + size - position), position);
+                const n = read(buffer, Math.min(buffer.length, offset + size - position), position);
                 if (!n)
                     throw Error();
-                const text = suffix + buffer.subarray(0, n).toString('latin1');
-                if (/-----BEGIN ((?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY)-----[\r\n]+[A-Za-z0-9+/=\r\n]{64,}-----END \1-----/.test(text))
-                    throw Error();
-                suffix = text.slice(-32768);
+                inspect(buffer.subarray(0, n).toString('latin1'));
                 position += n;
             }
+            inspect('\n');
             names.add(name);
             offset += Math.ceil(size / 512) * 512;
         }
-        if (!ended || !names.has('provenance.json') || fstatSync(fd).mtimeMs !== stat.mtimeMs || fstatSync(fd).ctimeMs !== stat.ctimeMs)
-            throw Error();
-        let active = 0;
-        const streams = new Set<ReturnType<typeof createReadStream>>();
-        let closed = false;
-        const unchanged = () => { const next = fstatSync(fd); return next.ino === stat.ino && next.dev === stat.dev && next.size === stat.size && next.mtimeMs === stat.mtimeMs && next.ctimeMs === stat.ctimeMs; };
-        const route = `/api/elastic-artifacts/${input.archiveSha256}`;
-        return {
-            path: route,
-            handle(req: IncomingMessage, res: ServerResponse): void {
-                if (closed || req.url !== route || !['GET', 'HEAD'].includes(req.method ?? '') || req.headers.range || !unchanged()) {
-                    res.writeHead(404, { connection: 'close' });
-                    res.end();
-                    return;
-                }
-                if (active >= 2) {
-                    res.writeHead(503, { connection: 'close' });
-                    res.end();
-                    return;
-                }
-                res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': stat.size, etag: `"${input.archiveSha256}"`, connection: 'close' });
-                if (req.method === 'HEAD') {
-                    res.end();
-                    return;
-                }
-                active++;
-                const stream = createReadStream(input.path, { fd, autoClose: false, start: 0, end: stat.size - 1 });
-                streams.add(stream);
-                const timer = setTimeout(() => { stream.destroy(); res.destroy(); }, 30000);
-                let finished = false;
-                const finish = () => { if (finished)
-                    return; finished = true; clearTimeout(timer); active--; streams.delete(stream); stream.destroy(); };
-                res.once('close', finish);
-                stream.once('error', () => res.destroy());
-                stream.pipe(res);
-            },
-            close() { if (!closed) {
-                closed = true;
-                for (const stream of streams) stream.destroy();
-                closeSync(fd);
-            } },
-        };
-    }
-    catch {
-        closeSync(fd);
+        if (!ended || !names.has('provenance.json')) throw Error();
+        return new Blob(chunks);
+    } catch {
         throw Error('elastic_artifact_rejected');
+    } finally {
+        closeSync(fd);
     }
+}
+
+/** Complete PEM blocks, including traditional encryption headers; literals alone are inert. */
+function privateKeyScanner(): (chunk: string) => void {
+    let pending = '', label = '', body = 0;
+    const line = (value: string) => {
+        value = value.trim();
+        if (label) {
+            if (value === `-----END ${label}-----` && body >= 64) throw Error();
+            if (/^[A-Za-z0-9+/=]+$/.test(value)) { body += value.length; return; }
+            if (value === '' || (!body && /^(?:Proc-Type|DEK-Info):[^\r\n]+$/.test(value))) return;
+            label = ''; body = 0;
+        }
+        label = /-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----$/.exec(value)?.[1] ?? '';
+    };
+    return chunk => {
+        const text = pending + chunk;
+        let start = 0, end: number;
+        while ((end = text.indexOf('\n', start)) !== -1) {
+            line(text.slice(start, end));
+            start = end + 1;
+        }
+        pending = text.slice(start);
+        if (pending.length > 16384) {
+            // Refuse an oversized candidate rather than discard part of a possible key.
+            if (label) throw Error();
+            pending = pending.slice(-512);
+        }
+    };
+}
+
+/** At most two downloads of a validated immutable snapshot; the source fd is already closed. */
+export function openRuntimeArtifact(input: ArtifactInput) {
+    let snapshot: Blob | null = validatedSnapshot(input);
+    const streams = new Set<Readable>();
+    const route = `/api/elastic-artifacts/${input.archiveSha256}`;
+    return {
+        path: route,
+        handle(req: IncomingMessage, res: ServerResponse): void {
+            if (!snapshot || req.url !== route || !['GET', 'HEAD'].includes(req.method ?? '') || req.headers.range) {
+                res.writeHead(404, { connection: 'close' }); res.end(); return;
+            }
+            if (streams.size >= 2) {
+                res.writeHead(503, { connection: 'close' }); res.end(); return;
+            }
+            res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': snapshot.size, etag: `"${input.archiveSha256}"`, connection: 'close' });
+            if (req.method === 'HEAD') { res.end(); return; }
+            const stream = Readable.fromWeb(snapshot.stream());
+            streams.add(stream);
+            const timer = setTimeout(() => { stream.destroy(); res.destroy(); }, 30000);
+            const finish = () => { clearTimeout(timer); streams.delete(stream); stream.destroy(); };
+            res.once('close', finish);
+            stream.once('close', () => { clearTimeout(timer); streams.delete(stream); if (!res.writableFinished) res.destroy(); });
+            stream.once('error', () => res.destroy());
+            stream.pipe(res);
+        },
+        close() {
+            snapshot = null;
+            for (const stream of streams) stream.destroy();
+        },
+    };
 }
 export type RuntimeArtifact = ReturnType<typeof openRuntimeArtifact>;

@@ -27,6 +27,8 @@ it('validates private profile, pinned origin and finite seats without cloud or l
     const script = { path: scriptPath, sha256: hash('print("fixed")') };
     const directories = ['attempts', 'commands', 'custody'].map(name => { const path = join(root, name); mkdirSync(path, { mode: 0o700 }); return path; });
     const profile = { version: 1, fleetEpoch: 'fixture', workerBuildCommit: 'a'.repeat(40), coordinatorManager: 'manager@fixture', coordinatorHuman: 'human@kernel', originHuman: 'human@kernel', manifestPath, preparationPlanPath, packageRecipePath, registryPath: join(root, 'hosts.yaml'), attemptDirectory: directories[0], commandDirectory: directories[1], azure: { executable: '/usr/bin/az', configDirectory: root }, stageScript: script, helperScript: script, artifact: { path: join(root, 'artifact.tar'), archiveSha256: 'a'.repeat(64), archiveBytes: 1024 }, tls: { bindIPv4: '10.0.0.1', port: 8443, certificatePath: join(root, 'tls.cert'), keyPath: join(root, 'tls.key'), caPath: join(root, 'tls.cert'), certificateSha256: new X509Certificate(cert).fingerprint256.replaceAll(':', '').toLowerCase() }, custody: { directory: directories[2], durableStoreId: 'fixture', maxBytes: 1024, maxReservedBytes: 1024, maxStoredBytes: 1024 * 1024, retentionPolicyId: 'fixture', maxCheckpoints: 2 } };
+    put('too-large.json', { ...profile, artifact: { ...profile.artifact, archiveBytes: 1024 ** 3 + 512 } });
+    expect(() => loadElasticDeploymentProfile(join(root, 'too-large.json'))).toThrow();
     const profilePath = put('profile.json', profile);
     const loaded = loadElasticDeploymentProfile(profilePath);
     expect(loaded.artifact.url).toBe('https://10.0.0.1:8443/api/elastic-artifacts/' + 'a'.repeat(64));

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { MAX_RUNTIME_ARTIFACT_BYTES } from './elastic-runtime-artifact.js';
 import { lstatSync, readFileSync, realpathSync, openSync, closeSync, fstatSync, constants } from 'node:fs';
 import { createHash, X509Certificate } from 'node:crypto';
 import { isAbsolute, dirname } from 'node:path';
@@ -17,7 +18,7 @@ export const elasticDeploymentProfileSchema = z.object({
     attemptDirectory: path, commandDirectory: path,
     azure: z.object({ executable: path, configDirectory: path }).strict(),
     stageScript: pin, helperScript: pin,
-    artifact: z.object({ path, archiveSha256: digest, archiveBytes: z.number().int().positive().max(3 * 1024 ** 3) }).strict(),
+    artifact: z.object({ path, archiveSha256: digest, archiveBytes: z.number().int().positive().max(MAX_RUNTIME_ARTIFACT_BYTES) }).strict(),
     tls: z.object({ bindIPv4: z.string(), port: z.number().int(), certificatePath: path, keyPath: path, caPath: path, certificateSha256: digest }).strict(),
     custody: z.object({ directory: path, durableStoreId: label, maxBytes: z.number().int().positive().max(528 * 1024 ** 2), maxReservedBytes: z.number().int().positive(), maxStoredBytes: z.number().int().positive().max(1024 ** 4), retentionPolicyId: label, maxCheckpoints: z.number().int().min(1).max(1024) }).strict(),
 }).strict();
