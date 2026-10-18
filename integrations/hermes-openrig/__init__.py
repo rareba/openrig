@@ -131,6 +131,7 @@ class RelayPlugin:
         self.inbound_lock = asyncio.Lock()
         self.host_cursor = 0
         self.notice_tasks = {}
+        self.validation_notices = {}
         self.notice_limit = asyncio.Semaphore(2)
         self.poll_task = None
         self.stopped = False
@@ -255,16 +256,25 @@ class RelayPlugin:
             return 'OpenRig did not accept this reply. It is retained for review, and no newer question was substituted.'
         return 'Your reply is saved in Hermes and queued for confirmation by OpenRig. A native receipt has not been confirmed yet.'
 
-    def schedule_notice(self, identity, failure=None):
-        if self.stopped or (identity in self.notice_tasks and not self.notice_tasks[identity].done()):
+    def schedule_notice(self, identity, failure=None, validation=None):
+        if self.stopped or identity in self.validation_notices or (identity in self.notice_tasks and not self.notice_tasks[identity].done()):
             return
         async def deliver():
             async with self.notice_limit:
                 try:
                     item = self.ctx.state.get('inbound', {}).get(identity)
-                    channel = item['payload'].get('channel', 'whatsapp') if item else (failure[2] if failure else 'whatsapp')
+                    target = validation or failure
+                    channel = item['payload'].get('channel', 'whatsapp') if item else (target[2] if target else 'whatsapp')
                     adapter = self.platform_adapter(channel)
                     if not adapter or not adapter.is_connected:
+                        return
+                    if validation:
+                        chat, message_id, _, text = validation
+                        if message_id:
+                            self.validation_notices[identity] = True
+                            if len(self.validation_notices) > 256:
+                                self.validation_notices.pop(next(iter(self.validation_notices)))
+                        await adapter.send(chat, text, reply_to=message_id)
                         return
                     if failure:
                         chat, message_id = failure[:2]
@@ -623,7 +633,22 @@ class RelayPlugin:
             if not event.message_id:
                 raise ValueError('Native inbound message identity is required.')
         except (ValueError, IndexError):
-            return {'action': 'skip', 'reason': 'Malformed OpenRig reply; no answer was queued.'}
+            question_ref = hashlib.sha256(d['qitemId'].encode()).hexdigest()[:12]
+            if not event.message_id:
+                guidance = 'Hermes cannot verify this reply’s native message identity, so it was not queued. Please send a new quoted reply to the question.'
+            elif not d['questions']:
+                guidance = ('OpenRig could not validate this reply, so it was not queued. This question needs a written reply: '
+                            'reply to it with /answer <your answer> or /ask <your clarification>.')
+            else:
+                guidance = ('OpenRig could not validate this reply, so it was not queued. Reply to the question with '
+                            '/choose <question number> <option number>, /answer <your answer>, or /ask <your clarification>. '
+                            'For one question, /choose <option number> also works. Use the displayed numbers.')
+            guidance += ' Question reference: ' + question_ref + '.'
+            notice_id = 'validation:' + hashlib.sha256(json.dumps(
+                [channel, d['profile'], d['chatId'], d['senderId'], quoted_id, event.message_id],
+                separators=(',', ':')).encode()).hexdigest()
+            self.schedule_notice(notice_id, validation=(d['chatId'], event.message_id, channel, guidance))
+            return {'action': 'skip', 'reason': 'Malformed OpenRig reply; no answer was queued. question_ref=' + question_ref}
         payload = {**base, 'messageId': event.message_id, 'qitemId': d['qitemId'],
                    'requestRevision': d['requestRevision'], 'response': response}
         identity = hashlib.sha256(json.dumps([channel, d['profile'], d['chatId'], d['senderId'], event.message_id], separators=(',', ':')).encode()).hexdigest()
