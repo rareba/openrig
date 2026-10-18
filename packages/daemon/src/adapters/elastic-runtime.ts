@@ -85,24 +85,26 @@ export class ElasticRuntime {
     const provider = createAzureElasticFleetIO({ run, lifecycle, assertMutation: operation => this.assertMutation(operation),
       observeNative: async ({ instances }) => {
         const state = this.service.status(), cfg = this.intake?.status().config;
-        if (!cfg || !this.baseIO) throw Error('elastic_intake_not_composed');
+        if (!cfg || !this.baseIO || !this.intake) throw Error('elastic_intake_not_composed');
         const observations = await this.baseIO.observeTargets(cfg);
+        const capacity = await this.intake.readyCapacity(cfg, observations);
         const managed = await this.directory.refresh((state.config?.policy.pollIntervalSeconds ?? 60) * 1000 + 5000);
         const at = Date.now();
-        const permanentWorkers: FleetWorkerObservation[] = [...new Set(cfg.targets.map(t => t.physicalHost))].map(id => {
-          const targets = cfg.targets.filter(t => t.physicalHost === id);
-          const sampled = targets.map(t => observations.find(o => o.host === t.host && o.session === t.session));
-          const complete = sampled.every(o => o?.available && o.hostActive !== null);
-          return { id, permanent: true, managed: false, state: complete ? 'ready' : 'quarantined',
-            capabilities: [...new Set(targets.flatMap(t => t.capabilities))], slots: targets.reduce((n, t) => n + t.capacity, 0),
-            active: complete ? sampled.reduce((n, o) => n + Math.min(1, o!.active), 0) : null,
-            observedAt: at, idleSince: null, clean: complete, pendingHumanReturns: complete ? false : null };
-        });
-        const rows = options.db.prepare("SELECT repository_id,issue_number,capability FROM github_intake_issues WHERE in_scope=1 AND eligibility='ready' AND approved_revision=json_extract(issue_json,'$.updatedAt') AND qitem_id IS NULL").all();
-        const demands = z.array(z.object({ repository_id: z.string(), issue_number: z.number().int(), capability: z.string() })).parse(rows)
-          .map(r => ({ id: `${r.repository_id}:${r.issue_number}`, capability: r.capability }));
+        // Each scalar row represents a witnessed allocation for one capability. Sharing a
+        // physical activation budget or unioning unlike target capabilities cannot mint slots.
+        const permanentWorkers: FleetWorkerObservation[] = capacity.unknownHosts.map(host => ({
+          id: `permanent-unknown:${enrollmentDigest(host)}`, permanent: true, managed: false, state: 'quarantined',
+          capabilities: [], slots: null, active: null, observedAt: at, idleSince: null, clean: null, pendingHumanReturns: null,
+        }));
+        for (const witness of capacity.witnesses) {
+          const id = `permanent-witness:${enrollmentDigest([witness.physicalHost, witness.capability])}`;
+          const existing = permanentWorkers.find(w => w.id === id);
+          if (existing) existing.slots!++;
+          else permanentWorkers.push({ id, permanent: true, managed: false, state: 'ready', capabilities: [witness.capability],
+            slots: 1, active: 0, observedAt: at, idleSince: null, clean: true, pendingHumanReturns: false });
+        }
         const attempts = this.store.list();
-        return { observedAt: at, demands, permanentWorkers,
+        return { observedAt: at, demands: capacity.demands, permanentWorkers,
           managedWorkers: instances.map(i => managed.find(w => w.id === i.workerId) ?? { id: i.workerId, managed: true, permanent: false, state: 'quarantined', capabilities: [], slots: null, active: null, observedAt: at, idleSince: null, clean: null, pendingHumanReturns: null }),
           provisioningAttempts: attempts.filter(a => instances.some(i => i.vmId === a.binding.vmId)).map(a => ({ workerId: a.workerId, vmId: a.binding.vmId, operationId: a.identity.operationId })) };
       },
@@ -118,7 +120,10 @@ export class ElasticRuntime {
       inspectNative: context => context.operation.type === 'provision' ? this.enrollment.inspectNative(context) : lifecycle.inspectNative(context),
     });
     const io: FleetIO = {
-      recoverAttempts: () => this.store.recoverStoppedLocks(),
+      recoverAttempts: () => {
+        const policy = this.service.status().config?.policy;
+        if (policy?.enabled && policy.mode === 'active') this.store.recoverStoppedLocks();
+      },
       validateConfiguration: config => {
         provider.validateConfiguration?.(config);
         const azure = validateAzurePoolConfiguration(config.provider, config.policy.poolId);
@@ -131,14 +136,20 @@ export class ElasticRuntime {
         // Explicit purpose prevents an overlapping plan request borrowing a held reconcile scope.
         if (purpose !== 'reconcile') return { ...this.snapshot, now: Date.now() };
         try { this.owner.assertHeld('fleet'); } catch { return { ...this.snapshot, now: Date.now() }; }
-        if (!policy.enabled || policy.mode !== 'active' || this.service.status().paused) return { ...this.snapshot, now: Date.now() };
-        await this.activate();
+        if (!policy.enabled || this.service.status().paused) return { ...this.snapshot, now: Date.now() };
+        if (policy.mode === 'active') await this.activate();
+        else {
+          const azure = validateAzurePoolConfiguration(config.provider, policy.poolId);
+          const account = z.object({ id: z.string(), state: z.literal('Enabled') }).passthrough().parse(await this.commands.run(['account', 'show', '--subscription', azure.subscription]));
+          if (account.id.toLowerCase() !== azure.subscription.toLowerCase() || this.closed || this.service.status().paused
+            || enrollmentDigest(this.service.status().config) !== enrollmentDigest(config)) throw Error('elastic_read_observation_superseded');
+        }
         this.snapshot = await provider.observe(policy, config);
         return this.snapshot;
       },
       inspectOperation: async (operation, config) => {
         this.owner.assertHeld('fleet');
-        // Existing active effects may be read while paused. Disabled/dry-run do no ARM work.
+        // Existing active effects may be read while paused. Dry-run never advances enrollment.
         const current = this.service.status().config;
         if (!current?.policy.enabled || current.policy.mode !== 'active') return 'unknown';
         return provider.inspectOperation(operation, config);

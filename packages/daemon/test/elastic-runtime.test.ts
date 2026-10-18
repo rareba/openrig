@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { rmSync, chmodSync, writeFileSync, realpathSync } from 'node:fs';
+import { rmSync, chmodSync, writeFileSync, realpathSync, existsSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createDb } from '../src/db/connection.js';
 import { migrate } from '../src/db/migrate.js';
@@ -20,6 +20,8 @@ import { OutboxHandler } from '../src/domain/outbox-handler.js';
 import { elasticWorkerRoutes } from '../src/routes/elastic-worker.js';
 import { humanResponsesRoutes } from '../src/routes/human-responses.js';
 import { queueRoutes } from '../src/routes/queue.js';
+import { createGithubIntakeIO } from '../src/adapters/github-intake.js';
+import type { GithubIntakeTarget } from '../src/domain/github-intake.js';
 import { createElasticRuntime } from '../src/adapters/elastic-runtime.js';
 import { elasticProfileFixture } from './helpers/elastic-profile.js';
 const cleanup: Array<() => void | Promise<void>> = [];
@@ -41,7 +43,7 @@ it('absent profile has zero file/owner/runtime effects', () => {
   const runtime = createElasticRuntime({ db, databasePath: '/not-read', sessions: new SessionRegistry(db), hostId: 'coordinator' });
   expect(runtime).toBeUndefined(); expect(db.prepare('SELECT * FROM elastic_native_owners').all()).toEqual([]);
 });
-it('constructs same-queue native authority with real manager and keeps disabled/dry-run/status/plan inert', async () => {
+it('constructs same-queue native authority with real manager and keeps disabled composition and status/plan inert', async () => {
   const f = fixture();
   // No executable/artifact exists and the private bind address is unavailable. Inert composition must still work.
   const runtime = createElasticRuntime(f.options)!; cleanup.push(() => runtime.close());
@@ -57,7 +59,7 @@ it('constructs same-queue native authority with real manager and keeps disabled/
   runtime.service.configure({ policy, provider });
   await runtime.service.plan(); await runtime.service.reconcile();
   runtime.service.configure({ policy: { ...policy, enabled: true }, provider });
-  await runtime.service.plan(); await runtime.service.reconcile();
+  await runtime.owner.run('fleet', () => runtime.service.plan());
   runtime.service.configure({ policy: { ...policy, mode: 'active' }, provider });
   await runtime.service.reconcile();
   runtime.service.configure({ policy: { ...policy, enabled: true, mode: 'active' }, provider });
@@ -177,3 +179,129 @@ it('uses the real directory and SAME queue/owner to forward a native answer on i
   expect(originDb.prepare("SELECT count(*) n FROM outbox_entries WHERE outbox_id LIKE 'wake-intent-%'").get()).toEqual({ n: originWakeBaseline + 1 });
   expect(f.db.prepare('SELECT * FROM elastic_fleet_operations').all()).toEqual([]);
 }, 30000);
+
+async function observationFixture(targets: GithubIntakeTarget[] = [], hostCapacity = 2) {
+  const f = fixture();
+  f.put('hosts.yaml', { hosts: [] });
+  const callsPath = f.put('readonly-calls.jsonl', '');
+  const executable = join(f.root, 'readonly-az');
+  const model = { id: f.manifest.resourceId, tags: { pool: 'fixture' }, orchestrationMode: 'Uniform', provisioningState: 'Succeeded', overprovision: false,
+    sku: { capacity: 0 }, upgradePolicy: { mode: 'Manual', automaticOSUpgradePolicy: { enableAutomaticOSUpgrade: false } }, automaticRepairsPolicy: { enabled: false },
+    virtualMachineProfile: { storageProfile: { imageReference: { publisher: 'Canonical', offer: 'ubuntu', sku: '24', version: '1.2.3' } } } };
+  const script = `#!${realpathSync(process.execPath)}\nconst fs=require('fs'),a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(callsPath)},JSON.stringify(a)+'\\n');
+    if(a[0]==='account'&&a[1]==='show')process.stdout.write(JSON.stringify({id:'00000000-0000-0000-0000-000000000001',state:'Enabled'}));
+    else if(a[0]==='vmss'&&a[1]==='show'&&!a.includes('--instance-id'))process.stdout.write(${JSON.stringify(JSON.stringify(model))});
+    else if(a[0]==='vmss'&&a[1]==='list-instances')process.stdout.write('[]');
+    else if(a[0]==='rest'&&a.includes('get'))process.stdout.write('{"value":[]}');
+    else throw Error('mutating effect forbidden');`;
+  writeFileSync(executable, script, { mode: 0o700 });
+  f.put('profile.json', { ...f.profile, azure: { ...f.profile.azure, executable, sha256: createHash('sha256').update(script).digest('hex') } });
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now); cleanup.push(() => clock.mockRestore());
+  const runtime = createElasticRuntime(f.options)!; cleanup.push(() => runtime.close());
+  const queue = new QueueRepository(f.db, new EventBus(f.db), { validateRig: () => true, elasticHumanProxyAuthority: runtime.directory.authority() });
+  let nodes = targets.map(t => ({ canonicalSessionName: t.session, sessionStatus: 'running', startupStatus: 'ready', terminalActive: false, agentActivity: { state: 'idle' } }));
+  const issues = [1, 2].map(number => ({ repositoryId: '1', repository: 'fixture/repo', number, url: `https://github.com/fixture/repo/issues/${number}`, title: 'Fixture', body: 'Synthetic ready work', updatedAt: 'revision-1', state: 'open' as const, assignees: ['operator'] }));
+  let unavailable = false;
+  const nativeIO = createGithubIntakeIO({ queue, localNodes: () => { if (unavailable) throw Error('Native inventory unavailable'); return nodes; } });
+  const intake = runtime.attach(queue, { ...nativeIO, listIssues: async () => issues });
+  intake.configure({ enabled: true, assignee: 'operator', repositories: [{ id: '1', name: 'fixture/repo' }], targets: [], hostCapacity });
+  expect((await intake.reconcile()).error).toBeNull();
+  for (const issue of issues) intake.markEligibility({ repositoryId: '1', number: issue.number, revision: issue.updatedAt, eligibility: 'ready', capability: 'github:1:public-read', reason: 'Synthetic reviewed source' });
+  intake.configure({ ...intake.status().config!, targets });
+  const configuration = { policy: { poolId: 'fixture', enabled: true, mode: 'dry-run' as const, maxWorkers: 1, slotsPerWorker: 2, capabilities: ['github:1:public-read'], pollIntervalSeconds: 60, scaleOutSamples: 2, idleSeconds: 900 },
+    provider: { kind: 'azure-vmss', subscription: '00000000-0000-0000-0000-000000000001', resourceGroup: 'fixture', scaleSetName: 'fixture', resourceId: f.manifest.resourceId,
+      poolId: 'fixture', ownershipTag: { key: 'pool', value: 'fixture' }, image: { kind: 'marketplace', publisher: 'Canonical', offer: 'ubuntu', sku: '24', version: '1.2.3' },
+      bootstrap: { path: '/etc/openrig-elastic/manifest.json', digest: JSON.parse(requirePlan(f)).manifestDigest }, deploymentProfileRef: f.profilePath } };
+  runtime.service.configure(configuration);
+  return { ...f, runtime, queue, intake, nativeIO, configuration, calls: () => readFileSync(callsPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as string[]),
+    advance: () => now += 60000, setNodes: (value: typeof nodes) => nodes = value, unavailable: () => unavailable = true };
+}
+it('enabled dry-run takes two fresh serialized native/ARM samples and proposes add without active setup or mutations', async () => {
+  const f = await observationFixture();
+  const registry = readFileSync(f.profile.registryPath, 'utf8');
+  const attempts = readdirSync(f.profile.attemptDirectory!);
+  const recovery = vi.spyOn(f.runtime.store, 'recoverStoppedLocks');
+  await f.runtime.service.plan(); await f.runtime.owner.run('fleet', () => f.runtime.service.plan());
+  expect(f.calls()).toEqual([]);
+  const first = await f.runtime.service.reconcile();
+  expect(first.plan).toMatchObject({ add: 0, demandSamples: 1, eligibleDemand: 2, freeSlots: 0, reasons: ['awaiting_demand_samples'] });
+  f.advance();
+  const second = await f.runtime.service.reconcile();
+  expect(second.plan).toMatchObject({ add: 1, demandSamples: 2, eligibleDemand: 2, reasons: ['eligible_demand_exceeds_capacity'] });
+  expect(f.calls().filter(a => a[0] === 'vmss' && a[1] === 'list-instances')).toHaveLength(2);
+  expect(f.calls().every(a => a[0] === 'account' && a[1] === 'show' || a[0] === 'vmss' && ['show', 'list-instances'].includes(a[1]!) || a[0] === 'rest' && a.includes('get'))).toBe(true);
+  expect(existsSync(f.profile.artifact.path)).toBe(false); expect(readdirSync(f.profile.attemptDirectory!)).toEqual(attempts); expect(readdirSync(f.profile.commandDirectory!)).toEqual([]);
+  expect(readFileSync(f.profile.registryPath, 'utf8')).toBe(registry); expect(f.queue.list()).toEqual([]);
+  expect(f.db.prepare('SELECT * FROM elastic_fleet_operations').all()).toEqual([]);
+  expect(recovery).not.toHaveBeenCalled();
+  const calls = f.calls(); f.runtime.service.configure({ ...f.configuration, policy: { ...f.configuration.policy, enabled: false } });
+  await f.runtime.service.reconcile(); await f.runtime.service.plan(); expect(f.calls()).toEqual(calls);
+});
+it('concrete runtime sees no permanent free capacity when unconfigured occupied seats fill the physical host', async () => {
+  const targets = ['a@permanent', 'b@permanent'].map(session => ({ host: 'local', session, physicalHost: 'permanent', capacity: 1, capabilities: ['github:1:public-read'] }));
+  const f = await observationFixture(targets);
+  f.setNodes([...targets.map(t => ({ canonicalSessionName: t.session, sessionStatus: 'running', startupStatus: 'ready', terminalActive: false, agentActivity: { state: 'idle' } })),
+    ...['other-a@permanent', 'other-b@permanent'].map(session => ({ canonicalSessionName: session, sessionStatus: 'running', startupStatus: 'ready', terminalActive: true, agentActivity: { state: 'running' } }))]);
+  expect(await f.nativeIO.observeTargets(f.intake.status().config!)).toEqual(targets.map(t => ({ host: t.host, session: t.session, available: true, active: 0, hostActive: 2 })));
+  await f.runtime.service.reconcile(); f.advance();
+  expect((await f.runtime.service.reconcile()).plan).toMatchObject({ add: 1, freeSlots: 0, eligibleDemand: 2 });
+  expect(f.intake.status().config!.targets).toEqual(targets);
+  await f.intake.reconcile(); expect(f.queue.list()).toEqual([]);
+});
+
+it.each([
+  { name: 'heterogeneous capabilities', hostCapacity: 2, secondCapability: 'github:1:write' },
+  { name: 'one shared physical activation budget', hostCapacity: 1, secondCapability: 'github:1:public-read' },
+])('permanent projection and actual intake agree on $name', async ({ hostCapacity, secondCapability }) => {
+  const targets = ['github:1:public-read', secondCapability].map((capability, index) => ({ host: 'local', session: `seat${index}@permanent`, physicalHost: 'permanent', capacity: 1, capabilities: [capability] }));
+  const f = await observationFixture(targets, hostCapacity);
+  await f.runtime.service.reconcile(); f.advance();
+  expect((await f.runtime.service.reconcile()).plan).toMatchObject({ add: 1, freeSlots: 1, eligibleDemand: 2 });
+  await f.intake.reconcile();
+  expect(f.queue.list()).toHaveLength(1); expect(f.queue.list()[0]!.destinationSession).toBe(targets[0]!.session);
+});
+
+it.each([1, 2])('permanent occupied target with %i packets retains remaining packet capacity without consuming another physical seat', async packets => {
+  const target = { host: 'local', session: 'a@permanent', physicalHost: 'permanent', capacity: 3, capabilities: ['github:1:public-read'] };
+  const f = await observationFixture([target], 1);
+  for (let i = 0; i < packets; i++) await f.queue.create({ sourceSession: 'manager@fixture', destinationSession: target.session, messageType: 'task', body: 'Existing packet', nudge: false });
+  expect(await f.nativeIO.observeTargets(f.intake.status().config!)).toEqual([{ host: 'local', session: target.session, available: true, active: packets, hostActive: 1 }]);
+  await f.runtime.service.reconcile(); f.advance();
+  expect((await f.runtime.service.reconcile()).plan).toMatchObject({ add: packets - 1, freeSlots: 3 - packets, eligibleDemand: 2 });
+  await f.intake.reconcile(); expect(f.queue.list()).toHaveLength(3);
+  expect(f.intake.status().issues.filter(i => i.qitemId && i.session === target.session)).toHaveLength(3 - packets);
+});
+
+it('permanent witnesses follow native ordering conservatively when a different assignment could match more work', async () => {
+  const targets = [
+    { host: 'local', session: 'a@permanent', physicalHost: 'permanent', capacity: 1, capabilities: ['github:1:public-read', 'github:1:write'] },
+    { host: 'local', session: 'b@permanent', physicalHost: 'permanent', capacity: 1, capabilities: ['github:1:public-read'] },
+  ];
+  const f = await observationFixture(targets);
+  f.intake.markEligibility({ repositoryId: '1', number: 2, revision: 'revision-1', eligibility: 'ready', capability: 'github:1:write', reason: 'Synthetic reviewed write capability' });
+  f.runtime.service.configure({ ...f.configuration, policy: { ...f.configuration.policy, capabilities: ['github:1:public-read', 'github:1:write'] } });
+  await f.runtime.service.reconcile(); f.advance();
+  expect((await f.runtime.service.reconcile()).plan).toMatchObject({ add: 1, freeSlots: 1, eligibleDemand: 2 });
+  await f.intake.reconcile();
+  expect(f.queue.list()).toHaveLength(1); expect(f.intake.status().issues[0]).toMatchObject({ session: targets[0]!.session });
+  expect(f.intake.status().issues[1]!.qitemId).toBeNull();
+});
+
+it('unknown native occupancy fails closed for both permanent projection and intake', async () => {
+  const f = await observationFixture([{ host: 'local', session: 'a@permanent', physicalHost: 'permanent', capacity: 2, capabilities: ['github:1:public-read'] }]);
+  f.unavailable();
+  await f.runtime.service.reconcile(); f.advance();
+  expect((await f.runtime.service.reconcile()).plan).toMatchObject({ add: 0, freeSlots: 0, reasons: ['unknown_worker_telemetry'] });
+  await f.intake.reconcile(); expect(f.queue.list()).toEqual([]);
+});
+
+it('outstanding native reservations consume the shared physical activation budget', async () => {
+  const targets = ['a@permanent', 'b@permanent'].map(session => ({ host: 'local', session, physicalHost: 'permanent', capacity: 1, capabilities: ['github:1:public-read'] }));
+  const f = await observationFixture(targets, 1);
+  const reservedIssue = { ...f.intake.status().issues[0]!.issue, number: 99, url: 'https://github.com/fixture/repo/issues/99' };
+  f.db.prepare(`INSERT INTO github_intake_issues(repository_id,issue_number,issue_json,first_seen,in_scope,eligibility,approved_revision,capability,qitem_id,target_host,target_session,target_machine,current_host,current_session,stage,delivery,pickup)
+    VALUES('1',99,?, ?,0,'ready','revision-1','github:1:public-read','qitem-reserved','local','a@permanent','permanent','local','a@permanent','ready','reserved','unknown')`).run(JSON.stringify(reservedIssue), new Date().toISOString());
+  await f.runtime.service.reconcile(); f.advance();
+  expect((await f.runtime.service.reconcile()).plan).toMatchObject({ add: 1, freeSlots: 0, eligibleDemand: 2 });
+  await f.intake.reconcile(); expect(f.queue.list()).toEqual([]);
+});

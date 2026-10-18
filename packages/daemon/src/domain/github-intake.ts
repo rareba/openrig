@@ -92,6 +92,45 @@ const targetKey = (target: { host: string; session: string }) => `${target.host}
 const terminal = (task: GithubTask) => ["done", "canceled", "denied", "failed"].includes(task.state);
 const waiting = (task: GithubTask) => task.waitingForHuman === true || hasLiveHumanGate({ ...task, blockedOn: task.blockedOn ?? null });
 
+/** Shared packet/physical-seat accounting for native dispatch and read-only fleet witnesses. */
+function admissionCapacity(config: GithubIntakeConfig, observations: GithubTargetObservation[], rows: Row[], tasks: Map<string, GithubTask>) {
+  if (!Array.isArray(observations) || observations.some(o => typeof o.available !== "boolean" || !Number.isSafeInteger(o.active) || o.active < 0 || (o.hostActive !== undefined && o.hostActive !== null && (!Number.isSafeInteger(o.hostActive) || o.hostActive < 0)))) throw new Error("Invalid host observations");
+  const usage = new Map<string, number>();
+  for (const target of config.targets) {
+    const observed = observations.find(o => targetKey(o) === targetKey(target));
+    const assigned = rows.filter(r => r.qitem_id && (r.current_host ?? r.target_host) === target.host && (r.current_session ?? r.target_session) === target.session);
+    const knownActive = assigned.filter(r => tasks.has(r.qitem_id!) && !terminal(tasks.get(r.qitem_id!)!) && !waiting(tasks.get(r.qitem_id!)!)).length;
+    const uncertain = assigned.filter(r => !tasks.has(r.qitem_id!)).length;
+    // Confirmed native tasks are already observed; unconfirmed reservations consume session capacity.
+    usage.set(targetKey(target), Math.max(observed?.active ?? 0, knownActive) + uncertain);
+  }
+  const machineUsage = (machine: string) => {
+    const targets = config.targets.filter(t => t.physicalHost === machine);
+    let total = 0;
+    for (const host of new Set(targets.map(t => t.host))) {
+      const hostTargets = targets.filter(t => t.host === host);
+      const hostObservations = observations.filter(o => o.host === host);
+      if (!hostObservations.length || hostObservations.some(o => o.hostActive === null)) return Infinity;
+      const observedTotal = hostObservations.some(o => o.hostActive !== undefined)
+        ? Math.max(...hostObservations.map(o => o.hostActive ?? 0))
+        : hostTargets.reduce((n, t) => n + Math.min(1, observations.find(o => targetKey(o) === targetKey(t))?.active ?? 0), 0);
+      // Pending packets share a seat; only its first reservation adds physical occupancy.
+      const delta = hostTargets.reduce((n, t) => n + Math.max(0, Math.min(1, usage.get(targetKey(t)) ?? 0) - Math.min(1, observations.find(o => targetKey(o) === targetKey(t))?.active ?? 0)), 0);
+      total += observedTotal + delta;
+    }
+    return total;
+  };
+  const canAdmit = (target: GithubIntakeTarget, triage = false) => {
+    const observed = observations.find(o => targetKey(o) === targetKey(target));
+    if (!observed?.available || (usage.get(targetKey(target)) ?? 0) >= target.capacity) return false;
+    const occupied = machineUsage(target.physicalHost);
+    // Triage on an observed occupied manager adds no seat and can reconcile legacy overload.
+    return Number.isFinite(occupied) && ((triage && observed.active > 0)
+      || occupied + ((usage.get(targetKey(target)) ?? 0) > 0 ? 0 : 1) <= config.hostCapacity);
+  };
+  return { usage, machineUsage, canAdmit };
+}
+
 /** A source/custody index only: execution and human waits remain native queue items. */
 export class GithubIntakeService {
   constructor(private db: Database.Database, readonly queue: QueueRepository, private io: GithubIntakeIO, private now = () => new Date(), private admission?: GithubIntakeAdmission) {}
@@ -158,6 +197,65 @@ export class GithubIntakeService {
     return current;
   }
 
+  /** Witness the native ready-order allocation on manual targets, without reserving or delivering.
+   * This is deliberately conservative, not a globally optimal reassignment of physical seats. */
+  async readyCapacity(config: GithubIntakeConfig, observations: GithubTargetObservation[]) {
+    const revision = this.revision();
+    if (JSON.stringify(config) !== JSON.stringify(this.status().config)) throw Error('Intake configuration changed during observation');
+    const rows = this.rows(), tasks = new Map<string, GithubTask>();
+    for (const row of rows.filter(r => r.qitem_id)) {
+      try {
+        const { task, currentHost } = await this.readTask(row, revision);
+        if (task) {
+          tasks.set(row.qitem_id!, task);
+          row.current_host = currentHost; row.current_session = task.destinationSession;
+        }
+      } catch { /* An unknown reservation retains its last known seat. */ }
+    }
+    this.assertCurrent(revision);
+    const { usage, machineUsage, canAdmit } = admissionCapacity(config, observations, rows, tasks);
+    const unknownHosts = [...new Set(config.targets.map(t => t.physicalHost))].filter(host => !Number.isFinite(machineUsage(host)));
+    const demands: Array<{ id: string; capability: string }> = [];
+    const witnesses: Array<{ physicalHost: string; capability: string }> = [];
+    if (config.enabled) for (const row of rows) {
+      if (!row.in_scope || row.qitem_id || row.eligibility !== 'ready' || !row.capability
+        || row.approved_revision !== (JSON.parse(row.issue_json) as GithubIssue).updatedAt) continue;
+      demands.push({ id: `${row.repository_id}:${row.issue_number}`, capability: row.capability });
+      const target = config.targets.find(t => t.capabilities.includes(row.capability!) && canAdmit(t));
+      if (!target) continue;
+      usage.set(targetKey(target), (usage.get(targetKey(target)) ?? 0) + 1);
+      witnesses.push({ physicalHost: target.physicalHost, capability: row.capability });
+    }
+    return { demands, witnesses, unknownHosts };
+  }
+
+  private async readTask(row: Row, revision: number) {
+    let task = await this.io.getTask(row.target_host!, row.qitem_id!);
+    this.assertCurrent(revision);
+    if (task && task.qitemId !== row.qitem_id) throw new Error("Queue readback returned the wrong task");
+    let currentHost = row.target_host!;
+    const seen = new Set<string>();
+    while (task && (task.state === "handed-off" || task.closureReason === "handed_off_to" || task.handedOffTo)) {
+      const key = `${currentHost}:${task.qitemId}`;
+      if (seen.has(key)) throw new Error("Queue handoff cycle");
+      seen.add(key);
+      const source = task;
+      const remoteSuccessor = /^(qitem-[^@]+)@([^@]+)$/.exec(source.closureTarget ?? "");
+      if (remoteSuccessor) {
+        currentHost = remoteSuccessor[2]!;
+        task = await this.io.getTask(currentHost, remoteSuccessor[1]!);
+        this.assertCurrent(revision);
+        if (!task || task.qitemId !== remoteSuccessor[1]) throw new Error("Queue cross-host successor unknown");
+      } else {
+        const successor = await this.io.findSuccessor?.(currentHost, source);
+        this.assertCurrent(revision);
+        if (!successor || successor.task.handedOffFrom !== source.qitemId) throw new Error("Queue native successor unknown or invalid");
+        currentHost = successor.host; task = successor.task;
+      }
+    }
+    return { task, currentHost };
+  }
+
   private rows(): Row[] {
     return this.db.prepare("SELECT * FROM github_intake_issues ORDER BY CASE WHEN eligibility='ready' THEN 0 ELSE 1 END, CASE priority WHEN 'critical' THEN 0 WHEN 'urgent' THEN 1 ELSE 2 END,first_seen,repository_id,issue_number").all() as Row[];
   }
@@ -216,29 +314,7 @@ export class GithubIntakeService {
       const unknown = new Set<string>();
       for (const row of rows.filter(r => r.qitem_id)) {
         try {
-          let task = await this.io.getTask(row.target_host!, row.qitem_id!);
-          this.assertCurrent(revision);
-          if (task && task.qitemId !== row.qitem_id) throw new Error("Queue readback returned the wrong task");
-          let currentHost = row.target_host!;
-          const seen = new Set<string>();
-          while (task && (task.state === "handed-off" || task.closureReason === "handed_off_to" || task.handedOffTo)) {
-            const key = `${currentHost}:${task.qitemId}`;
-            if (seen.has(key)) throw new Error("Queue handoff cycle");
-            seen.add(key);
-            const source = task;
-            const remoteSuccessor = /^(qitem-[^@]+)@([^@]+)$/.exec(source.closureTarget ?? "");
-            if (remoteSuccessor) {
-              currentHost = remoteSuccessor[2]!;
-              task = await this.io.getTask(currentHost, remoteSuccessor[1]!);
-              this.assertCurrent(revision);
-              if (!task || task.qitemId !== remoteSuccessor[1]) throw new Error("Queue cross-host successor unknown");
-            } else {
-              const successor = await this.io.findSuccessor?.(currentHost, source);
-              this.assertCurrent(revision);
-              if (!successor || successor.task.handedOffFrom !== source.qitemId) throw new Error("Queue native successor unknown or invalid");
-              currentHost = successor.host; task = successor.task;
-            }
-          }
+          const { task, currentHost } = await this.readTask(row, revision);
           if (task) {
             tasks.set(row.qitem_id!, task);
             this.update(row, { current_host: currentHost, current_session: task.destinationSession, delivery: "delivered", pickup: terminal(task) ? "terminal" : waiting(task) ? "waiting-human" : task.claimedAt ? "claimed" : "unclaimed", error: null });
@@ -247,31 +323,7 @@ export class GithubIntakeService {
           unknown.add(row.qitem_id!); this.update(row, { error: errorText(error), pickup: "unknown" });
         }
       }
-      const usage = new Map<string, number>();
-      for (const target of config.targets) {
-        const observed = observations.find(o => targetKey(o) === targetKey(target));
-        const assigned = rows.filter(r => r.qitem_id && (r.current_host ?? r.target_host) === target.host && (r.current_session ?? r.target_session) === target.session);
-        const knownActive = assigned.filter(r => tasks.has(r.qitem_id!) && !terminal(tasks.get(r.qitem_id!)!) && !waiting(tasks.get(r.qitem_id!)!)).length;
-        const uncertain = assigned.filter(r => !tasks.has(r.qitem_id!)).length;
-        // Confirmed native tasks are already observed; unconfirmed reservations consume session capacity.
-        usage.set(targetKey(target), Math.max(observed?.active ?? 0, knownActive) + uncertain);
-      }
-      const machineUsage = (machine: string) => {
-        const targets = config.targets.filter(t => t.physicalHost === machine);
-        let total = 0;
-        for (const host of new Set(targets.map(t => t.host))) {
-          const hostTargets = targets.filter(t => t.host === host);
-          const hostObservations = observations.filter(o => o.host === host);
-          if (!hostObservations.length || hostObservations.some(o => o.hostActive === null)) return Infinity;
-          const observedTotal = hostObservations.some(o => o.hostActive !== undefined)
-            ? Math.max(...hostObservations.map(o => o.hostActive ?? 0))
-            : hostTargets.reduce((n, t) => n + Math.min(1, observations.find(o => targetKey(o) === targetKey(t))?.active ?? 0), 0);
-          // Pending packets share a seat; only its first reservation adds physical occupancy.
-          const delta = hostTargets.reduce((n, t) => n + Math.max(0, Math.min(1, usage.get(targetKey(t)) ?? 0) - Math.min(1, observations.find(o => targetKey(o) === targetKey(t))?.active ?? 0)), 0);
-          total += observedTotal + delta;
-        }
-        return total;
-      };
+      const { usage, machineUsage, canAdmit } = admissionCapacity(config, observations, rows, tasks);
       for (const row of rows) {
         this.assertCurrent(revision);
         const issue = JSON.parse(row.issue_json) as GithubIssue;
@@ -299,12 +351,7 @@ export class GithubIntakeService {
         if (!stage) continue;
         const target = config.targets.find(t => {
           if (stage === "triage" ? t.host !== config.manager?.host || t.session !== config.manager.session : !t.capabilities.includes(row.capability!)) return false;
-          const observed = observations.find(o => targetKey(o) === targetKey(t));
-          if (!observed?.available || (usage.get(targetKey(t)) ?? 0) >= t.capacity) return false;
-          const occupied = machineUsage(t.physicalHost);
-          // Triage on an observed occupied manager adds no seat and can reconcile legacy overload.
-          return Number.isFinite(occupied) && ((stage === "triage" && observed.active > 0)
-            || occupied + ((usage.get(targetKey(t)) ?? 0) > 0 ? 0 : 1) <= config.hostCapacity);
+          return canAdmit(t, stage === "triage");
         });
         if (!target) continue;
         const generation = row.generation + 1;
