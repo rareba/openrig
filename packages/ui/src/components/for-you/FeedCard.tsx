@@ -569,7 +569,7 @@ export function FeedCard({
                 buttons are self-evident. Deny/route stay retired. */}
             <div className="flex flex-wrap items-center gap-2">
               {destination && isHumanSeatSessionRef(destination) && queueItem?.humanIntent !== "update" ? (queueItem?.humanRequestRevision ? (
-                <HumanResponse actorSession={actorSession} requestRevision={queueItem.humanRequestRevision} qitemId={queueItem.qitemId} destinationSession={queueItem.destinationSession}
+                <HumanResponse forwardingStatus={queueItem.humanForwardingStatus} actorSession={actorSession} requestRevision={queueItem.humanRequestRevision} qitemId={queueItem.qitemId} destinationSession={queueItem.destinationSession}
                   questions={queueItem.humanQuestions ?? []} answers={queueItem.humanAnswers ?? {}} hostId={card.hostId} />
               ) : <p>Refresh this request to load its current questions before responding.</p>) : <VerbActions
                 qitemId={qitemViewerData.qitemId}

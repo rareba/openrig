@@ -1,3 +1,4 @@
+import { ELASTIC_HUMAN_FORWARD_PREFIX, ELASTIC_HUMAN_FORWARD_GATE, type ElasticHumanWorker, type ElasticHumanProxyAuthority, type ElasticHumanProxyCreate, type ElasticHumanProxyMapping, type ElasticHumanForward, type ElasticHumanForwardSettle, type ElasticHumanProxyReconcile, type NativeHumanResponseCommit } from './elastic-human-proxy.js';
 import { authorizeElasticSuccessor } from "./elastic-worker-control.js";
 import { readWakeLadderBackstop } from "./queue-wake-ladder.js";
 import type Database from "better-sqlite3";
@@ -150,6 +151,7 @@ export interface QueueItem {
   tsCreated: string;
   tsUpdated: string;
   humanRequestRevision?: string;
+  humanForwardingStatus?: "pending" | "awaiting-origin" | "origin-applied" | "conflict";
   sourceSession: string;
   destinationSession: string;
   state: QueueState;
@@ -290,7 +292,7 @@ export interface HumanResponseInput {
   qitemId: string; actorSession: string; replyId: string; requestRevision: string; response: HumanResponse;
   identityProvenance?: import("../routes/require-sender-identity.js").IdentityProvenance;
 }
-export interface HumanResponseReceipt { replyQitemId: string; complete: boolean; replyHostId?: string }
+export interface HumanResponseReceipt { replyQitemId: string; complete: boolean; replyHostId?: string; forwardingStatus?: "pending" | "origin-applied" }
 export type HumanResponsePlan =
   | { status: "recorded"; receipt: HumanResponseReceipt }
   | { status: "prepared"; item: QueueItem; reply: QueueCreateInput; answers: HumanAnswers; fingerprint: string; receipt: HumanResponseReceipt };
@@ -789,7 +791,12 @@ export interface QueueDestinationAdvisory {
   message: string;
 }
 
+const elasticHumanMutationScopes = new WeakMap<Database.Database, { depth: number }>();
+
 export class QueueRepository {
+  private readonly elasticHumanScope: { depth: number };
+  private readonly hasElasticHumanProxyTable: boolean;
+  private readonly elasticHumanProxyAuthority?: ElasticHumanProxyAuthority;
   readonly db: Database.Database;
   readonly transitionLog: QueueTransitionLog;
   private readonly eventBus: EventBus;
@@ -842,6 +849,7 @@ export class QueueRepository {
     db: Database.Database,
     eventBus: EventBus,
     opts?: {
+      elasticHumanProxyAuthority?: ElasticHumanProxyAuthority;
       validateRig?: (sessionRef: string) => boolean;
       destinationAdvisory?: (sessionRef: string) => QueueDestinationAdvisory | null;
       /**
@@ -874,6 +882,10 @@ export class QueueRepository {
     }
   ) {
     this.db = db;
+    this.elasticHumanProxyAuthority = opts?.elasticHumanProxyAuthority;
+    this.hasElasticHumanProxyTable = detectTable(db, "elastic_human_proxies");
+    this.elasticHumanScope = elasticHumanMutationScopes.get(db) ?? { depth: 0 };
+    elasticHumanMutationScopes.set(db, this.elasticHumanScope);
     this.eventBus = eventBus;
     this.transitionLog = new QueueTransitionLog(db);
     this.wakeRepo = new QueueWakeRepository(db);
@@ -1027,6 +1039,7 @@ export class QueueRepository {
     identityProvenance: string | null,
     nudge: boolean | undefined,
   ): void {
+    this.assertNotElasticHumanTransport(successorQitemId);
     // No wake intended (nudge:false) ⇒ no durable intent to make durable. The
     // W1-c guard is nudge-aware for the same reason: absence of an intent is a
     // defect only when a wake WAS intended.
@@ -1401,6 +1414,7 @@ export class QueueRepository {
     bodyOverride?: string,
   ): Promise<void> {
     if (nudgeOpt === false) return;
+    this.assertNotElasticHumanTransport(qitemId);
     if (!this.transport) return;
     const outcome = await this.performWakeSend(qitemId, destinationSession, sourceSession, bodyOverride);
     this.recordNudgeAttempt(qitemId, outcome.nudgeResult);
@@ -1427,6 +1441,7 @@ export class QueueRepository {
     prebuiltText?: string,
     committedOutboxIds?: string[],
   ): Promise<{ classified: "verified" | "indeterminate" | "failed" | "retained"; nudgeResult: string }> {
+    this.assertNotElasticHumanTransport(qitemId);
     // DEFECT FIX qitem-20260827065907-b9ae334c (S1-class, 3 live specimens): a virtual
     // @external destination has NO pane — the queue row ITSELF is the gateway
     // subsystem's input (the Slack connector polls human-destined rows and its own
@@ -1657,6 +1672,10 @@ export class QueueRepository {
     qitemId: string;
     persistedEvent: PersistedEvent;
   } {
+    if (!this.elasticHumanScope.depth) {
+      if (input.inboundReplyTo) this.assertNotElasticHumanTransport(input.inboundReplyTo);
+      if (input.handedOffFrom) this.assertNotElasticHumanTransport(input.handedOffFrom);
+    }
     // OPR.0.4.4.19 FR-4/FR-5 — human-routed items require summary +
     // evidence_ref at the domain write path (the validateClosure pattern).
     // The validator is a no-op for non-human-routed items (BR-1).
@@ -1786,6 +1805,7 @@ export class QueueRepository {
    * with `handed_off_from` recording the chain. One atomic transaction.
    */
   async handoff(input: QueueHandoffInput): Promise<{ closed: QueueItem; created: QueueItem }> {
+    if (input.qitemId) this.assertNotElasticHumanTransport(input.qitemId);
     const source = this.getById(input.qitemId);
     if (!source) {
       throw new QueueRepositoryError(
@@ -1964,6 +1984,7 @@ export class QueueRepository {
    * tracking needed against the source qitem.
    */
   async handoffAndComplete(input: QueueHandoffAndCompleteInput): Promise<{ closed: QueueItem; created: QueueItem }> {
+    if (input.qitemId) this.assertNotElasticHumanTransport(input.qitemId);
     const source = this.getById(input.qitemId);
     if (!source) {
       throw new QueueRepositoryError(
@@ -2321,6 +2342,7 @@ export class QueueRepository {
    * Mark a qitem `in-progress` (claim). Computes closure_required_at from tier.
    */
   claim(input: QueueClaimInput): QueueItem {
+    if (input.qitemId) this.assertNotElasticHumanTransport(input.qitemId);
     const qitem = this.getById(input.qitemId);
     if (!qitem) {
       throw new QueueRepositoryError(
@@ -2534,6 +2556,8 @@ export class QueueRepository {
         `qitem ${input.qitemId} not found`
       );
     }
+    if (!this.elasticHumanScope.depth) this.assertNotElasticHumanTransport(input.qitemId);
+    if (input.blockedOn) this.assertNotElasticHumanTransport(input.blockedOn);
     const hasNote = typeof input.transitionNote === "string" && input.transitionNote.trim().length > 0;
     const hasValidSummary = typeof input.summary === "string" && input.summary.trim().length > 0;
     const isGuardedTerminal = (["done", "canceled", "handed-off"] as const).includes(
@@ -3323,8 +3347,298 @@ export class QueueRepository {
     this.outbox?.markDelivered(`${HUMAN_RESPONSE_ACTIVATION_PREFIX}${replyQitemId}`);
   }
 
+  private elasticHumanMapping(qitemId: string): ElasticHumanProxyMapping | null {
+    if (!this.hasElasticHumanProxyTable) return null;
+    const row = this.db.prepare('SELECT mapping FROM elastic_human_proxies WHERE proxy_qitem_id=? OR receipt_qitem_id=?').get(qitemId, qitemId) as { mapping: string } | undefined;
+    return row ? JSON.parse(row.mapping) as ElasticHumanProxyMapping : null;
+  }
+
+  private elasticHumanProxyState(mapping: ElasticHumanProxyMapping): string {
+    return (this.db.prepare('SELECT state FROM elastic_human_proxies WHERE mapping_id=?').get(mapping.mappingId) as { state: string }).state;
+  }
+
+  private elasticHumanForwardStatus(mapping: ElasticHumanProxyMapping): 'pending' | 'origin-applied' {
+    const row = this.db.prepare('SELECT origin_receipt FROM elastic_human_proxies WHERE mapping_id=?').get(mapping.mappingId) as { origin_receipt: string | null };
+    return row.origin_receipt ? 'origin-applied' : 'pending';
+  }
+
+  private elasticHumanProjection(qitemId: string): Pick<QueueItem, 'humanForwardingStatus'> {
+    const mapping = this.elasticHumanMapping(qitemId);
+    if (!mapping) return {};
+    const state = this.elasticHumanProxyState(mapping);
+    return state === 'open' ? {} : { humanForwardingStatus: state === 'forward-pending' ? 'pending' : state === 'awaiting-origin' ? 'awaiting-origin' : state === 'conflict' ? 'conflict' : 'origin-applied' };
+  }
+
+  private assertNotElasticHumanTransport(qitemId: string): void {
+    if (this.elasticHumanMapping(qitemId)) throw new QueueRepositoryError('elastic_human_transport_guard', 'Mapped human proxy and receipt rows require the typed response or verified origin reconciliation path.');
+  }
+
+  private withElasticHumanMutation<T>(body: () => T): T {
+    if (!this.hasElasticHumanProxyTable) throw new QueueRepositoryError('elastic_human_schema_unavailable', 'Current proxy schema required.');
+    if (!this.db.inTransaction) throw new QueueRepositoryError('elastic_human_transaction_required', 'Internal proxy writes require the owning SQLite transaction.');
+    if (this.elasticHumanScope.depth === 0) this.db.prepare('UPDATE elastic_human_write_scope SET enabled=1 WHERE id=1').run();
+    this.elasticHumanScope.depth++;
+    try { return body(); } finally {
+      this.elasticHumanScope.depth--;
+      if (this.elasticHumanScope.depth === 0) this.db.prepare('UPDATE elastic_human_write_scope SET enabled=0 WHERE id=1').run();
+    }
+  }
+
+  private validateElasticHumanMapping(mapping: ElasticHumanProxyMapping): void {
+    const authority = this.elasticHumanProxyAuthority;
+    const current = authority?.currentWorker(mapping.worker.workerId);
+    if (!authority || !current || !this.sameElasticHumanWorker(current, mapping.worker)
+      || !authority.isOriginManager(mapping.worker, mapping.originManager)
+      || !authority.isLocalManager(mapping.coordinatorManager)
+      || !authority.isHumanBinding(mapping.coordinatorHuman, mapping.originHuman)) {
+      throw new QueueRepositoryError('elastic_human_authority_unavailable', 'Exact current worker enrollment, actual local manager and explicit human binding are required; forwarding custody is retained.');
+    }
+  }
+
+  private sameElasticHumanWorker(a: ElasticHumanWorker, b: ElasticHumanWorker): boolean {
+    return a.workerId === b.workerId && a.vmId === b.vmId && a.nativeHostId === b.nativeHostId
+      && a.fleetEpoch === b.fleetEpoch && a.manifestDigest === b.manifestDigest;
+  }
+
+  private validateElasticHumanOrigin(mapping: ElasticHumanProxyMapping, origin: QueueItem): void {
+    if (origin.qitemId !== mapping.originQitemId || origin.sourceSession !== mapping.originManager
+      || origin.destinationSession !== mapping.originHuman || !origin.humanRequestRevision) {
+      throw new QueueRepositoryError('elastic_human_origin_conflict', 'Authoritative readback does not match the exact native origin question.');
+    }
+  }
+
+  /** Internal trusted coordinator entry point. No public route accepts this input. */
+  createElasticHumanProxy(input: ElasticHumanProxyCreate): QueueItem {
+    const events: PersistedEvent[] = [];
+    const item = this.db.transaction(() => this.withElasticHumanMutation(() => this.createElasticHumanProxyWithinTransaction(input, 0, events)))();
+    for (const event of events) this.eventBus.notifySubscribers(event);
+    return item;
+  }
+
+  private createElasticHumanProxyWithinTransaction(input: ElasticHumanProxyCreate, sequence: number, events: PersistedEvent[]): QueueItem {
+    if (!this.hasElasticHumanProxyTable) throw new QueueRepositoryError('elastic_human_schema_unavailable', 'Current proxy schema required.');
+    const { worker, origin } = input;
+    const parsedManager = parseSessionName(origin.sourceSession);
+    const parsedCoordinator = parseSessionName(input.coordinatorManager);
+    // The origin continuation must stay on its worker; a host-qualified source invokes reverse credentials.
+    if (parsedCoordinator.kind !== 'canonical' || parsedCoordinator.rig.includes('@') || parsedManager.kind !== 'canonical' || parsedManager.rig.includes('@') || isHumanSeatSessionRef(origin.sourceSession)
+      || origin.state !== 'pending' || origin.humanIntent === 'update' || !origin.humanRequestRevision
+      || !isHumanSeatSessionRef(origin.destinationSession) || !isHumanSeatSession(input.coordinatorHuman)
+      || isHumanSeatSessionRef(input.coordinatorManager) || !this.validateRig(input.coordinatorManager)
+      || !Object.values(worker).every(v => typeof v === 'string' && v.length > 0 && v.length <= 512)) {
+      throw new QueueRepositoryError('elastic_human_invalid_origin', 'A pending native human decision with a local origin manager and valid configured coordinator identities is required.');
+    }
+    const mappingId = createHash('sha256').update(JSON.stringify([worker.workerId, worker.vmId, worker.nativeHostId, worker.fleetEpoch, worker.manifestDigest, origin.qitemId, origin.humanRequestRevision, sequence])).digest('hex');
+    const mapping: ElasticHumanProxyMapping = { version: 1, mappingId, worker: { ...worker }, originQitemId: origin.qitemId,
+      originRevision: origin.humanRequestRevision, originManager: origin.sourceSession, originHuman: origin.destinationSession,
+      proxyQitemId: `qitem-elastic-human-${mappingId}`, coordinatorManager: input.coordinatorManager, coordinatorHuman: input.coordinatorHuman, sequence };
+    this.validateElasticHumanMapping(mapping);
+    const existing = this.elasticHumanMapping(mapping.proxyQitemId);
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(mapping)) throw new QueueRepositoryError('elastic_human_mapping_conflict', 'Mapping identity conflicts.');
+      return this.getByIdOrThrow(mapping.proxyQitemId);
+    }
+    const latest = this.db.prepare('SELECT max(sequence) sequence FROM elastic_human_proxies WHERE worker_id=? AND origin_qitem_id=?').get(worker.workerId, origin.qitemId) as { sequence: number | null };
+    if (sequence !== (latest.sequence === null ? 0 : latest.sequence + 1)) throw new QueueRepositoryError('elastic_human_sequence_conflict', 'Only explicit authoritative reconciliation can advance an origin sequence.');
+    this.db.prepare("INSERT INTO elastic_human_proxies(mapping_id,proxy_qitem_id,worker_id,origin_qitem_id,sequence,mapping,state) VALUES(?,?,?,?,?,?,'open')")
+      .run(mappingId, mapping.proxyQitemId, worker.workerId, origin.qitemId, sequence, JSON.stringify(mapping));
+    this.db.prepare('UPDATE elastic_human_proxies SET origin_readback=? WHERE mapping_id=?').run(JSON.stringify(origin), mappingId);
+    const created = this.createWithinTransaction({ qitemId: mapping.proxyQitemId, sourceSession: input.coordinatorManager,
+      destinationSession: input.coordinatorHuman, body: `Forwarded native question from ${worker.nativeHostId}/${origin.qitemId}. The coordinator manager is accountable for forwarding.\n\n${origin.body}`,
+      summary: origin.summary ?? undefined, evidenceRef: origin.evidenceRef ?? undefined, humanIntent: 'decision',
+      ...(origin.humanQuestions?.length ? { humanQuestions: unansweredQuestions(origin.humanQuestions, origin.humanAnswers ?? {}) } : {}),
+      chainOfRecord: [...(origin.chainOfRecord ?? []), origin.qitemId], nudge: false });
+    events.push(created.persistedEvent);
+    this.assertElasticHumanNoDependents(mapping);
+    return this.getByIdOrThrow(created.qitemId);
+  }
+
+  private assertElasticHumanNoDependents(mapping: ElasticHumanProxyMapping): void {
+    const row = this.db.prepare('SELECT qitem_id FROM queue_items WHERE blocked_on IN (?, (SELECT receipt_qitem_id FROM elastic_human_proxies WHERE mapping_id=?)) LIMIT 1').get(mapping.proxyQitemId, mapping.mappingId);
+    if (row) throw new QueueRepositoryError('elastic_human_transport_dependency', 'Transport rows cannot unblock executable coordinator work.');
+  }
+
+  private recordElasticHumanResponse(mapping: ElasticHumanProxyMapping, input: HumanResponseInput,
+    plan: Extract<HumanResponsePlan, { status: 'prepared' }>, events: PersistedEvent[]): HumanResponseReceipt {
+    return this.withElasticHumanMutation(() => {
+      this.validateElasticHumanMapping(mapping);
+      if (!this.outbox) throw new QueueRepositoryError('elastic_human_outbox_unavailable', 'A mapped answer requires the same-connection durable forwarding outbox.');
+      const { item, reply, answers, fingerprint } = plan;
+      const receipt: HumanResponseReceipt = { replyQitemId: plan.receipt.replyQitemId, complete: plan.receipt.complete, forwardingStatus: 'pending' };
+      const intent: ElasticHumanForward = { version: 1, intentId: `${ELASTIC_HUMAN_FORWARD_PREFIX}${receipt.replyQitemId}`, mapping,
+        proxyRevision: input.requestRevision, proxyReplyId: input.replyId, localReceiptQitemId: receipt.replyQitemId, fingerprint,
+        originInput: { qitemId: mapping.originQitemId, replyId: `elastic-${createHash('sha256').update(JSON.stringify([mapping.mappingId, input.replyId])).digest('hex')}`,
+          requestRevision: mapping.originRevision, actorSession: mapping.originHuman, identityProvenance: input.identityProvenance ?? 'claimed:v1', response: parseHumanResponse(input.response)! } };
+      this.db.prepare("UPDATE elastic_human_proxies SET state='forward-pending',intent_id=?,receipt_qitem_id=? WHERE mapping_id=? AND state='open'")
+        .run(intent.intentId, receipt.replyQitemId, mapping.mappingId);
+      authorizeElasticSuccessor(this.db, item.qitemId, receipt.replyQitemId, input.actorSession, mapping.coordinatorManager, 'human-response');
+      const created = this.createWithinTransaction({ ...reply, destinationSession: mapping.coordinatorManager,
+        body: `Human response recorded for forwarding. Origin application is unconfirmed.\n\n${reply.body}`, nudge: false });
+      events.push(created.persistedEvent);
+      events.push(...this.updateInTransactionalContext({ qitemId: created.qitemId, actorSession: input.actorSession,
+        state: 'blocked', blockedOn: `${ELASTIC_HUMAN_FORWARD_GATE}${mapping.mappingId}`, transitionNote: 'Passive forwarding receipt; no coordinator work or wake authorized.' }).persistedEvents);
+      const body = JSON.stringify(intent);
+      const prior = this.outbox.getById(intent.intentId);
+      if (prior && (prior.body !== body || prior.auditPointer !== created.qitemId || prior.senderSession !== input.actorSession || prior.destinationSession !== mapping.coordinatorManager)) {
+        throw new QueueRepositoryError('elastic_human_intent_conflict', 'The durable forwarding identity already contains a different immutable tuple.');
+      }
+      this.outbox.record({ outboxId: intent.intentId, senderSession: input.actorSession, destinationSession: mapping.coordinatorManager,
+        body, auditPointer: created.qitemId, tags: ['elastic-human-forward'], identityProvenance: input.identityProvenance });
+      if (input.response.kind !== 'clarification') this.db.prepare('UPDATE queue_items SET human_answers=? WHERE qitem_id=?').run(JSON.stringify(answers), item.qitemId);
+      events.push(...this.updateInTransactionalContext({ qitemId: item.qitemId, actorSession: input.actorSession,
+        ...(receipt.complete ? { state: 'done' as const, closureReason: 'no-follow-on' as const, ownerNotificationKind: 'human-decision-resolved' as const } : {}),
+        transitionNote: `${HUMAN_RESPONSE_RECEIPT_PREFIX}${JSON.stringify({ ...receipt, fingerprint })}`, identityProvenance: input.identityProvenance }).persistedEvents);
+      this.assertMappedProxyResponseHasForwardIntent(intent);
+      return receipt;
+    });
+  }
+
+  private assertMappedProxyResponseHasForwardIntent(intent: ElasticHumanForward): void {
+    const mapping = this.elasticHumanMapping(intent.mapping.proxyQitemId);
+    const row = this.getById(intent.localReceiptQitemId);
+    const stored = this.outbox?.getById(intent.intentId);
+    const response = parseHumanResponse(intent.originInput.response);
+    const localReceiptId = `human-reply-${createHash('sha256').update(JSON.stringify([intent.mapping.proxyQitemId, intent.proxyReplyId])).digest('hex')}`;
+    const originReplyId = `elastic-${createHash('sha256').update(JSON.stringify([intent.mapping.mappingId, intent.proxyReplyId])).digest('hex')}`;
+    const nativeReceipt = this.transitionLog.listForQitem(intent.mapping.proxyQitemId).some(t => {
+      if (!t.transitionNote?.startsWith(HUMAN_RESPONSE_RECEIPT_PREFIX) || t.actorSession !== intent.mapping.coordinatorHuman) return false;
+      const r = JSON.parse(t.transitionNote.slice(HUMAN_RESPONSE_RECEIPT_PREFIX.length)) as HumanResponseReceipt & { fingerprint: string };
+      return r.replyQitemId === intent.localReceiptQitemId && r.fingerprint === intent.fingerprint;
+    });
+    if (!response || !nativeReceipt || intent.version !== 1 || intent.localReceiptQitemId !== localReceiptId
+      || intent.intentId !== `${ELASTIC_HUMAN_FORWARD_PREFIX}${localReceiptId}` || intent.originInput.replyId !== originReplyId
+      || intent.originInput.qitemId !== intent.mapping.originQitemId || intent.originInput.requestRevision !== intent.mapping.originRevision
+      || intent.originInput.actorSession !== intent.mapping.originHuman
+      || createHash('sha256').update(JSON.stringify([intent.proxyRevision, response])).digest('hex') !== intent.fingerprint
+      || !mapping || JSON.stringify(mapping) !== JSON.stringify(intent.mapping) || !row || row.state !== 'blocked'
+      || row.blockedOn !== `${ELASTIC_HUMAN_FORWARD_GATE}${mapping.mappingId}` || row.destinationSession !== mapping.coordinatorManager
+      || row.sourceSession !== mapping.coordinatorHuman || row.replyTo !== mapping.proxyQitemId || !row.chainOfRecord?.includes(mapping.proxyQitemId)
+      || row.humanIntent != null || row.humanQuestions != null || row.humanAnswers != null || row.tier != null
+      || !stored || stored.body !== JSON.stringify(intent) || stored.auditPointer !== row.qitemId
+      || stored.senderSession !== mapping.coordinatorHuman || stored.destinationSession !== mapping.coordinatorManager) {
+      throw new QueueRepositoryError('elastic_human_forward_invariant', 'Mapped answer lacks its exact durable passive receipt and typed forwarding intent.');
+    }
+    this.assertElasticHumanNoDependents(mapping);
+  }
+
+  /** Bounded stable pending tuples, including uncertain/restart outcomes. Retry SAME originInput.
+   * Missing authority throws and retains custody. Task5b serializes its network consumer. */
+  pendingElasticHumanForwards(limit = 50): ElasticHumanForward[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new QueueRepositoryError('invalid_pagination', 'Use limit 1-100.');
+    if (!this.hasElasticHumanProxyTable) return [];
+    const rows = this.db.prepare("SELECT o.body FROM elastic_human_proxies m JOIN outbox_entries o ON o.outbox_id=m.intent_id WHERE m.state='forward-pending' ORDER BY m.rowid LIMIT ?").all(limit) as { body: string }[];
+    return rows.map(row => {
+      const intent = JSON.parse(row.body) as ElasticHumanForward;
+      this.validateElasticHumanMapping(intent.mapping);
+      this.assertMappedProxyResponseHasForwardIntent(intent);
+      return intent;
+    });
+  }
+
+  /** Atomic verified origin receipt + passive-row completion. Never stages a coordinator wake. */
+  settleElasticHumanForward(input: ElasticHumanForwardSettle): void {
+    const events: PersistedEvent[] = [];
+    this.db.transaction(() => this.withElasticHumanMutation(() => {
+      const row = this.db.prepare('SELECT mapping,origin_receipt,origin_readback FROM elastic_human_proxies WHERE intent_id=?').get(input.intentId) as { mapping: string; origin_receipt: string | null; origin_readback: string | null } | undefined;
+      if (!row) throw new QueueRepositoryError('elastic_human_intent_missing', 'Unknown forwarding intent.');
+      const mapping = JSON.parse(row.mapping) as ElasticHumanProxyMapping;
+      this.validateElasticHumanMapping(mapping);
+      if (!this.sameElasticHumanWorker(input.worker, mapping.worker)) throw new QueueRepositoryError('elastic_human_origin_conflict', 'Worker incarnation differs.');
+      this.validateElasticHumanOrigin(mapping, input.origin);
+      const stored = this.outbox?.getById(input.intentId);
+      if (!stored) throw new QueueRepositoryError('elastic_human_intent_missing', 'Missing forwarding outbox.');
+      const intent = JSON.parse(stored.body) as ElasticHumanForward;
+      const expectedFingerprint = createHash('sha256').update(JSON.stringify([intent.originInput.requestRevision, intent.originInput.response])).digest('hex');
+      if (input.commit.qitemId !== mapping.originQitemId || input.commit.actorSession !== mapping.originHuman
+        || input.commit.requestRevision !== mapping.originRevision || input.commit.fingerprint !== expectedFingerprint
+        || JSON.stringify(input.commit.response) !== JSON.stringify(intent.originInput.response)) {
+        throw new QueueRepositoryError('elastic_human_origin_conflict', 'Native committed tuple does not match the forwarded answer.');
+      }
+      const expectedReply = `human-reply-${createHash('sha256').update(JSON.stringify([mapping.originQitemId, intent.originInput.replyId])).digest('hex')}`;
+      const proxy = this.getByIdOrThrow(mapping.proxyQitemId);
+      const localComplete = proxy.state === 'done';
+      if (input.commit.receipt.replyQitemId !== expectedReply || input.commit.receipt.replyHostId || input.commit.receipt.complete !== localComplete
+        || (localComplete && input.origin.state !== 'done') || (!localComplete && input.origin.state !== 'pending')) {
+        throw new QueueRepositoryError('elastic_human_origin_conflict', 'Native origin receipt/readback does not match the committed forwarded tuple.');
+      }
+      // The authenticated native receipt lookup supplies the committed tuple; the question
+      // readback independently retains the typed answer. Neither proves agent execution.
+      const response = intent.originInput.response;
+      if (response.kind === 'choice' && input.origin.humanAnswers?.[response.questionId] !== response.optionId) throw new QueueRepositoryError('elastic_human_origin_conflict', 'Origin choice differs.');
+      if (response.kind === 'custom') {
+        const first = proxy.humanQuestions?.[0];
+        const answer = first ? input.origin.humanAnswers?.[first.id] : undefined;
+        const found = answer && typeof answer !== 'string' && answer.text === response.text;
+        if (first && !found) throw new QueueRepositoryError('elastic_human_origin_conflict', 'Origin custom answer differs.');
+      }
+      if (row.origin_receipt) {
+        if (row.origin_receipt !== JSON.stringify(input.commit.receipt) || (JSON.parse(row.origin_readback!) as QueueItem).humanRequestRevision !== input.origin.humanRequestRevision) throw new QueueRepositoryError('elastic_human_origin_conflict', 'Acknowledgment identity conflicts.');
+        return;
+      }
+      if (this.elasticHumanProxyState(mapping) !== 'forward-pending') throw new QueueRepositoryError('elastic_human_origin_conflict', 'Conflicting origin requires explicit reconciliation.');
+      this.assertMappedProxyResponseHasForwardIntent(intent);
+      this.db.prepare('UPDATE elastic_human_proxies SET state=?,origin_receipt=?,origin_readback=? WHERE mapping_id=?')
+        .run(input.commit.receipt.complete ? 'settled' : 'awaiting-origin', JSON.stringify(input.commit.receipt), JSON.stringify(input.origin), mapping.mappingId);
+      events.push(...this.updateInTransactionalContext({ qitemId: intent.localReceiptQitemId, actorSession: mapping.coordinatorManager,
+        state: 'done', closureReason: 'no-follow-on', transitionNote: `Verified native origin response ${expectedReply}; worker execution is not asserted.` }).persistedEvents);
+      this.outbox!.markDelivered(input.intentId);
+      this.assertElasticHumanNoDependents(mapping);
+    }))();
+    for (const event of events) this.eventBus.notifySubscribers(event);
+  }
+
+  /** Only authoritative readback can supersede/reopen. Clarification needs a real changed question;
+   * an unchanged question cannot loop back into relay. Direct-origin winners are retained as conflicts. */
+  reconcileElasticHumanProxy(input: ElasticHumanProxyReconcile): QueueItem | null {
+    const events: PersistedEvent[] = [];
+    const result = this.db.transaction(() => this.withElasticHumanMutation(() => {
+      const mapping = this.elasticHumanMapping(input.proxyQitemId);
+      if (!mapping) throw new QueueRepositoryError('elastic_human_mapping_missing', 'Unknown proxy.');
+      this.validateElasticHumanMapping(mapping);
+      if (!this.sameElasticHumanWorker(input.worker, mapping.worker)) throw new QueueRepositoryError('elastic_human_origin_conflict', 'Worker incarnation differs.');
+      this.validateElasticHumanOrigin(mapping, input.origin);
+      const row = this.db.prepare('SELECT state,origin_receipt,intent_id FROM elastic_human_proxies WHERE mapping_id=?').get(mapping.mappingId) as { state: string; origin_receipt: string | null; intent_id: string | null };
+      if (row.state === 'superseded' && input.disposition === 'remaining') {
+        const next = this.db.prepare('SELECT mapping FROM elastic_human_proxies WHERE worker_id=? AND origin_qitem_id=? AND sequence=?').get(mapping.worker.workerId, mapping.originQitemId, mapping.sequence + 1) as { mapping: string } | undefined;
+        const nextMapping = next ? JSON.parse(next.mapping) as ElasticHumanProxyMapping : null;
+        if (!nextMapping || nextMapping.originRevision !== input.origin.humanRequestRevision) throw new QueueRepositoryError('elastic_human_origin_conflict', 'Supersession readback conflicts.');
+        this.validateElasticHumanMapping(nextMapping);
+        return this.getByIdOrThrow(nextMapping.proxyQitemId);
+      }
+      if (input.disposition === 'origin-changed') {
+        if (input.origin.state === 'pending' && input.origin.humanRequestRevision === mapping.originRevision) throw new QueueRepositoryError('elastic_human_origin_conflict', 'Unchanged origin cannot reconcile a conflicting winner.');
+        this.db.prepare("UPDATE elastic_human_proxies SET state='conflict',origin_readback=? WHERE mapping_id=?").run(JSON.stringify(input.origin), mapping.mappingId);
+        return null;
+      }
+      if (row.state !== 'awaiting-origin' || !row.origin_receipt || !row.intent_id || input.origin.state !== 'pending'
+        || input.origin.humanRequestRevision === mapping.originRevision) {
+        throw new QueueRepositoryError('elastic_human_reconcile_required', 'A verified incomplete origin receipt and a changed pending native question are required before another proxy sequence.');
+      }
+      const stored = this.outbox?.getById(row.intent_id);
+      if (!stored) throw new QueueRepositoryError('elastic_human_intent_missing', 'Missing forwarding custody.');
+      const intent = JSON.parse(stored.body) as ElasticHumanForward;
+      if (intent.originInput.response.kind === 'clarification') {
+        const prior = JSON.parse((this.db.prepare('SELECT origin_readback FROM elastic_human_proxies WHERE mapping_id=?').get(mapping.mappingId) as { origin_readback: string }).origin_readback) as QueueItem;
+        const questionContent = (q: QueueItem) => JSON.stringify([q.body, q.summary, q.evidenceRef, q.humanQuestions, q.humanIntent]);
+        if (questionContent(prior) === questionContent(input.origin)) throw new QueueRepositoryError('elastic_human_origin_conflict', 'Clarification requires an actual manager question change, not another origin answer.');
+      } else {
+        const prior = JSON.parse((this.db.prepare('SELECT origin_readback FROM elastic_human_proxies WHERE mapping_id=?').get(mapping.mappingId) as { origin_readback: string }).origin_readback) as QueueItem;
+        if (prior.humanRequestRevision !== input.origin.humanRequestRevision) throw new QueueRepositoryError('elastic_human_origin_conflict', 'Partial advancement must use the exact verified answer readback.');
+      }
+      this.assertElasticHumanNoDependents(mapping);
+      this.db.prepare("UPDATE elastic_human_proxies SET state='superseded' WHERE mapping_id=?").run(mapping.mappingId);
+      events.push(...this.updateInTransactionalContext({ qitemId: mapping.proxyQitemId, actorSession: mapping.coordinatorManager, state: 'canceled',
+        transitionNote: 'Superseded by authoritative remaining origin question.' }).persistedEvents);
+      return this.createElasticHumanProxyWithinTransaction({ worker: input.worker, origin: input.origin,
+        coordinatorManager: mapping.coordinatorManager, coordinatorHuman: mapping.coordinatorHuman }, mapping.sequence + 1, events);
+    }))();
+    for (const event of events) this.eventBus.notifySubscribers(event);
+    return result;
+  }
+
   /** A remote human answer is inert until its source daemon commits the decision receipt. */
   stageHumanResponseReturn(input: QueueCreateInput): QueueItem {
+    if (input.qitemId) this.assertNotElasticHumanTransport(input.qitemId);
     const events: PersistedEvent[] = [];
     const result = this.db.transaction(() => {
       const existing = input.qitemId ? this.getById(input.qitemId) : null;
@@ -3348,6 +3662,7 @@ export class QueueRepository {
   }
 
   activateHumanResponseReturn(input: { qitemId: string; actorSession: string; fingerprint: string; identityProvenance?: import("../routes/require-sender-identity.js").IdentityProvenance }): QueueItem {
+    if (input.qitemId) this.assertNotElasticHumanTransport(input.qitemId);
     const events: PersistedEvent[] = [];
     let wake = false;
     const result = this.db.transaction(() => {
@@ -3373,6 +3688,16 @@ export class QueueRepository {
     return result;
   }
 
+  /** Read a committed native response by the exact replay tuple. Available through the authenticated
+   * human-response-receipt HTTP route, including after a lost response or changed request revision. */
+  humanResponseCommitEvidence(input: HumanResponseInput): NativeHumanResponseCommit {
+    const plan = this.prepareHumanResponse(input);
+    if (plan.status !== 'recorded') throw new QueueRepositoryError('human_response_not_committed', 'No native committed receipt exists for this exact tuple.');
+    const response = parseHumanResponse(input.response)!;
+    return { qitemId: input.qitemId, actorSession: input.actorSession, requestRevision: input.requestRevision, response,
+      fingerprint: createHash('sha256').update(JSON.stringify([input.requestRevision, response])).digest('hex'), receipt: plan.receipt };
+  }
+
   /** Pure preflight shared by local recording and the native target-first remote return. */
   prepareHumanResponse(input: HumanResponseInput): HumanResponsePlan {
     const response = parseHumanResponse(input.response);
@@ -3385,6 +3710,8 @@ export class QueueRepository {
     if (!item || item.destinationSession !== input.actorSession || !isHumanSeatSessionRef(item.destinationSession)) {
       throw new QueueRepositoryError("not_the_asked_human", "Only the asked human may respond to this request.");
     }
+    const mapping = this.elasticHumanMapping(item.qitemId);
+    if (mapping) this.validateElasticHumanMapping(mapping);
     // A receipt lives with the request even when the native reply row lives on another daemon.
     for (const transition of this.transitionLog.listForQitem(item.qitemId).reverse()) {
       if (!transition.transitionNote?.startsWith(HUMAN_RESPONSE_RECEIPT_PREFIX)) continue;
@@ -3393,8 +3720,14 @@ export class QueueRepository {
       if (receipt.fingerprint !== fingerprint || transition.actorSession !== input.actorSession) {
         throw new QueueRepositoryError("reply_id_conflict", "This replyId already records a different response.");
       }
-      return { status: "recorded", receipt: { replyQitemId, complete: receipt.complete, ...(receipt.replyHostId ? { replyHostId: receipt.replyHostId } : {}) } };
+      if (mapping && this.elasticHumanProxyState(mapping) === 'forward-pending') {
+        const stored = this.outbox?.getById(`${ELASTIC_HUMAN_FORWARD_PREFIX}${replyQitemId}`);
+        if (!stored) throw new QueueRepositoryError('elastic_human_intent_missing', 'Mapped response intent is unavailable; custody retained.');
+        this.assertMappedProxyResponseHasForwardIntent(JSON.parse(stored.body) as ElasticHumanForward);
+      }
+      return { status: "recorded", receipt: { replyQitemId, complete: receipt.complete, ...(receipt.replyHostId ? { replyHostId: receipt.replyHostId } : {}), ...(mapping ? { forwardingStatus: this.elasticHumanForwardStatus(mapping) } : {}) } };
     }
+    if (mapping && this.elasticHumanProxyState(mapping) !== "open") throw new QueueRepositoryError("elastic_human_forward_pending", "This proxy awaits origin reconciliation; another answer is not authorized.");
     if (item.state !== "pending" || item.humanIntent === "update") {
       throw new QueueRepositoryError("stale_human_request", "This decision is no longer pending. Refresh the request before responding.");
     }
@@ -3444,6 +3777,8 @@ export class QueueRepository {
       const plan = this.prepareHumanResponse(input);
       if (plan.status === "recorded") return plan.receipt;
       const { item, reply, answers, fingerprint, receipt } = plan;
+      const mapping = this.elasticHumanMapping(item.qitemId);
+      if (mapping) return this.recordElasticHumanResponse(mapping, input, plan, events);
       if (receipt.replyHostId) {
         const expectedSource = stampSelfHostSuffix(input.actorSession);
         if (!remoteReply || remoteReply.qitemId !== receipt.replyQitemId || remoteReply.destinationSession !== reply.destinationSession
@@ -3489,6 +3824,7 @@ export class QueueRepository {
    * button set is already final; its resolve continuation must not overwrite those answers.
    */
   resolveDirectHumanReply(input: { qitemId: string; actorSession: string; decision: string }): boolean {
+    if (input.qitemId) this.assertNotElasticHumanTransport(input.qitemId);
     const result = this.db.transaction(() => {
       const item = this.getById(input.qitemId);
       if (item?.state !== "pending" || item.humanIntent === "update"
@@ -3533,6 +3869,7 @@ export class QueueRepository {
    * id, a stranger, a decision already resolved), never an error the socket must retry.
    */
   recordHumanAnswer(input: { qitemId: string; actorSession: string; questionId: string; optionId: string }): RecordHumanAnswerResult {
+    if (input.qitemId) this.assertNotElasticHumanTransport(input.qitemId);
     if (!this.hasHumanQuestionsColumn) return { status: "not-applicable", reason: "schema" };
     return this.db.transaction(() => {
       const item = this.getById(input.qitemId);
@@ -4450,6 +4787,7 @@ export class QueueRepository {
       ...(handoffAdvisory ? { handoffAdvisory } : {}),
       pickup,
       ...(waiting ? { waiting } : {}),
+      ...this.elasticHumanProjection(row.qitem_id),
       qitemId: row.qitem_id,
       tsCreated: row.ts_created,
       tsUpdated: row.ts_updated,

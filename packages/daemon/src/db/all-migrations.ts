@@ -1,3 +1,4 @@
+import { elasticHumanProxySchema } from './migrations/118_elastic_human_proxy.js';
 import { elasticWorkerSchema } from "./migrations/117_elastic_worker.js";
 // The canonical ordered migration list. SINGLE SOURCE: the daemon boot path
 // (startup.ts) and any test/tool that needs a schema-faithful DB both migrate from THIS array,
@@ -237,4 +238,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   githubIntakeSchema,
   elasticFleetSchema,
   elasticWorkerSchema,
+  elasticHumanProxySchema,
 ];

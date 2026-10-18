@@ -11,7 +11,8 @@ export type HumanAnswers = Record<string, string | { kind: "typed-reply"; text: 
 type Response = { kind: "choice"; questionId: string; optionId: string } | { kind: "custom" | "clarification"; text: string };
 
 /** Explicit operator answers on the native human decision, using the existing local admin bearer. */
-export function HumanResponse({ qitemId, destinationSession, questions, answers, hostId, requestRevision, actorSession }: {
+export function HumanResponse({ qitemId, destinationSession, questions, answers, hostId, requestRevision, actorSession, forwardingStatus }: {
+  forwardingStatus?: "pending" | "awaiting-origin" | "origin-applied" | "conflict";
   qitemId: string; destinationSession: string; actorSession?: string; requestRevision: string; questions: HumanQuestion[]; answers: HumanAnswers; hostId?: string;
 }) {
   const client = useQueryClient();
@@ -34,19 +35,19 @@ export function HumanResponse({ qitemId, destinationSession, questions, answers,
       });
       const result = await res.json();
       if (!res.ok) throw new Error(result.message ?? `HTTP ${res.status}`);
-      return result as { replyQitemId: string; complete: boolean };
+      return result as { replyQitemId: string; complete: boolean; forwardingStatus?: "pending" | "origin-applied" };
     },
     onSuccess: (result, response) => {
-      setReceipt(response.kind === "clarification"
+      setReceipt(result.forwardingStatus === "pending" ? "Your response was recorded for forwarding. Origin delivery is pending." : response.kind === "clarification"
         ? "Question sent to the manager. The decision remains pending."
         : result.complete ? "Your answer was recorded and sent to the manager." : "Your answer was recorded. Other questions remain unanswered.");
-      setClosed(result.complete);
+      setClosed(result.complete || result.forwardingStatus === "pending");
       setMode(null); setText("");
       client.invalidateQueries({ queryKey: ["queue", "item", qitemId] });
       client.invalidateQueries({ queryKey: ["mission-control", "view"] });
     },
   });
-  const disabled = mutation.isPending || !actor.trim() || closed;
+  const disabled = mutation.isPending || !actor.trim() || closed || Boolean(forwardingStatus);
   const buttonClass = "min-h-[44px] border border-outline px-3 py-2 text-sm disabled:opacity-50";
   return <section aria-label="Human decision response" className="space-y-3">
     {actorSession ? <p className="text-sm">Responding as {actorSession}.</p> : <label className="block text-sm">Operator identity
@@ -83,6 +84,7 @@ export function HumanResponse({ qitemId, destinationSession, questions, answers,
         {mode === "clarification" ? "Send question" : "Send custom response"}
       </button>
     </div> : null}
+    {forwardingStatus ? <p role="status">{forwardingStatus === "pending" ? "Your response was recorded for forwarding. Origin delivery is pending." : forwardingStatus === "conflict" ? "The origin question changed. This response awaits reconciliation." : "The origin recorded your response. Awaiting the next verified question."}</p> : null}
     {mutation.error ? <p role="alert">{mutation.error.message}</p> : null}
     {receipt ? <p role="status">{receipt}</p> : null}
   </section>;

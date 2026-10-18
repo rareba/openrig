@@ -61,4 +61,19 @@ describe("human response choices", () => {
     expect(JSON.parse(fetcher.mock.calls[0][1].body).actorSession).toBe("human@kernel");
   });
 
+  it("records forwarding without claiming manager delivery and locks partial responses until reconciliation", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ replyQitemId: "passive-receipt", complete: false, forwardingStatus: "pending" }) }));
+    show();
+    fireEvent.change(screen.getByLabelText("Operator identity"), { target: { value: "operator@external" } });
+    fireEvent.click(screen.getByRole("button", { name: /Release \(Recommended\)/ }));
+    expect(await screen.findByRole("status")).toHaveTextContent("recorded for forwarding. Origin delivery is pending.");
+    expect(screen.getByRole("button", { name: "Ask a question" })).toBeDisabled();
+    expect(screen.queryByText(/sent to the manager/)).toBeNull();
+  });
+  it("keeps a reloaded pending-forward proxy disabled and truthful", () => {
+    render(<QueryClientProvider client={new QueryClient()}><HumanResponse qitemId="proxy" destinationSession="human@kernel" actorSession="human@kernel" questions={questions} answers={{}} requestRevision="revision" forwardingStatus="pending" /></QueryClientProvider>);
+    expect(screen.getByRole("status")).toHaveTextContent("Origin delivery is pending.");
+    expect(screen.getByRole("button", { name: "Ask a question" })).toBeDisabled();
+  });
+
 });

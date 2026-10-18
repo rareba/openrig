@@ -134,7 +134,7 @@ export class HumanRelayService {
                     if (deliveries.length >= maxDeliveries)
                         break;
                     const q = this.queue.getById(c.qitem_id);
-                    if (!q || q.state !== "pending" || q.humanIntent === "update" || !q.humanRequestRevision)
+                    if (!q || q.state !== "pending" || q.humanIntent === "update" || !q.humanRequestRevision || q.humanForwardingStatus)
                         continue;
                     const id = HUMAN_RELAY_PREFIX + digest([host, q.qitemId, q.humanRequestRevision, b.channel === "whatsapp" ? { connectorId: b.connectorId, humanSession: b.humanSession, profile: b.profile, chatId: b.chatId, senderId: b.senderId } : b, b.channel ?? "whatsapp"]);
                     const prior = this.outbox.getById(id);

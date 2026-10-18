@@ -386,6 +386,7 @@ export function proofAssetUrl(sliceName: string, relPath: string): string {
 
 export interface QueueItemDetail {
   humanRequestRevision?: string;
+  humanForwardingStatus?: "pending" | "awaiting-origin" | "origin-applied" | "conflict";
   humanIntent?: "decision" | "update" | null;
   humanQuestions?: import("../components/for-you/HumanResponse.js").HumanQuestion[] | null;
   humanAnswers?: import("../components/for-you/HumanResponse.js").HumanAnswers | null;

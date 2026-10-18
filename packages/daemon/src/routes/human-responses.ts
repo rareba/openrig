@@ -43,6 +43,19 @@ export function humanResponsesRoutes(opts: { queueRepo?: QueueRepository; bearer
       return c.json({ error: err.code, message: err.message }, 409);
     }
   });
+  app.post("/human-response-receipt", authBearerTokenMiddleware({ expectedToken: opts.bearerToken ?? null }), async (c) => {
+    if (!opts.queueRepo) return c.json({ error: "queue_unavailable" }, 503);
+    let body: Record<string, unknown>;
+    try { const raw: unknown = await c.req.json(); if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw Error(); body = raw as Record<string, unknown>; }
+    catch { return c.json({ error: "invalid_body" }, 400); }
+    const actor = resolveActorWithDeferral(c, { verb: "human response receipt", bodyClaim: typeof body.actorSession === "string" ? body.actorSession : null });
+    if (!actor.ok) return actor.response;
+    const response = parseHumanResponse(body.response);
+    if (typeof body.qitemId !== "string" || typeof body.replyId !== "string" || typeof body.requestRevision !== "string" || !response) return c.json({ error: "invalid_human_response" }, 400);
+    try { return c.json(opts.queueRepo.humanResponseCommitEvidence({ qitemId: body.qitemId, replyId: body.replyId,
+      requestRevision: body.requestRevision, actorSession: actor.session, response })); }
+    catch (error) { if (!(error instanceof QueueRepositoryError)) throw error; return c.json({ error: error.code, message: error.message }, 409); }
+  });
   app.post("/human-response", authBearerTokenMiddleware({ expectedToken: opts.bearerToken ?? null }), async (c) => {
     let body: Record<string, unknown>;
     try {
