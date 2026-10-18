@@ -99,7 +99,7 @@ describe("durable elastic fleet lifecycle", () => {
     await service.reconcile(); expect(b.calls.map((c) => c.type)).toEqual(["beginDrain"]);
     b.inspect("succeeded"); await service.reconcile();
     expect((await service.plan())?.freeSlots).toBe(0);
-    await service.reconcile();
+    time += 1; b.set(snapshot([worker()], false)); await service.reconcile();
     expect(b.calls.map((c) => c.type)).toEqual(["beginDrain", "remove"]);
     expect(b.calls[1]).toMatchObject({ workerId: "vm1", targetCapacity: 0 });
     expect(service.drainingWorkerIds()).toEqual([]);
@@ -114,7 +114,8 @@ describe("durable elastic fleet lifecycle", () => {
   ])("never removes a drained worker with %s native evidence", async (_label, workers) => {
     const db = database(); const b = boundary(); const service = new ElasticFleetService(db, b.io, () => time); service.configure(config);
     b.set(snapshot([worker()], false)); service.requestDrain("vm1"); await service.reconcile();
-    b.set(snapshot(workers as FleetWorkerObservation[], false)); await service.reconcile();
+    time += 1;
+    b.set(snapshot((workers as FleetWorkerObservation[]).map((native) => ({ ...native, observedAt: native.observedAt + 1 })), false)); await service.reconcile();
     expect(b.calls.map((c) => c.type)).toEqual(["beginDrain"]);
     expect(service.drainingWorkerIds()).toEqual(["vm1"]);
   });
@@ -177,6 +178,54 @@ describe("durable elastic fleet lifecycle", () => {
     expect(() => second.releaseReconcile({ owner, operatorConfirmedStopped: true })).toThrow("owner_not_stopped");
     second.requestDrain("vm1"); finish(snapshot([worker()], false)); await running;
     expect(b.calls).toEqual([]); expect(first.drainingWorkerIds()).toEqual(["vm1"]);
+  });
+
+  it.each([
+    { identity: "pool", uncertain: false }, { identity: "provider", uncertain: false },
+    { identity: "pool", uncertain: true }, { identity: "provider", uncertain: true },
+  ])("pins $identity after provision intent (uncertain: $uncertain) while allowing policy updates", async ({ identity, uncertain }) => {
+    const db = database(); const b = boundary(); const service = new ElasticFleetService(db, b.io, () => time);
+    if (uncertain) b.io.provision = async (operation) => { b.calls.push(operation); throw Error("lost provision reply"); };
+    const limited = { ...config, policy: { ...config.policy, maxWorkers: 1 } };
+    service.configure(limited); await service.reconcile(); time += 10_000; b.set(snapshot()); await service.reconcile();
+    expect(b.calls).toHaveLength(1);
+    const changed = identity === "pool" ? { ...limited, policy: { ...limited.policy, poolId: "other" } }
+      : { ...limited, provider: { resourceGroup: "other" } };
+    const reopened = new ElasticFleetService(db, b.io, () => time);
+    expect(() => reopened.configure(changed)).toThrow("pool_busy");
+    expect(reopened.status().config).toEqual(limited);
+    const pausedPolicy = { ...limited, policy: { ...limited.policy, enabled: false, mode: "dry-run" as const } };
+    expect(reopened.configure(pausedPolicy).config).toEqual(pausedPolicy);
+    expect(b.calls).toHaveLength(1);
+  });
+
+  it("rejects cached pre-drain proof until both native and snapshot samples follow drain completion", async () => {
+    const db = database(); const b = boundary(); const service = new ElasticFleetService(db, b.io, () => time);
+    service.configure(config); b.set(snapshot([worker()], false));
+    b.io.beginDrain = async (operation) => { b.calls.push(operation); time += 5_000; };
+    service.requestDrain("vm1"); await service.reconcile();
+    await service.reconcile();
+    expect(b.calls.map((c) => c.type)).toEqual(["beginDrain"]);
+    b.set(snapshot([worker()], false)); await service.reconcile();
+    expect(b.calls.map((c) => c.type)).toEqual(["beginDrain"]);
+    time += 1; b.set(snapshot([worker({ observedAt: 1_000_000 })], false)); await service.reconcile();
+    expect(b.calls.map((c) => c.type)).toEqual(["beginDrain"]);
+    b.set(snapshot([worker()], false)); await service.reconcile();
+    expect(b.calls.map((c) => c.type)).toEqual(["beginDrain", "remove"]);
+  });
+
+  it.each(["busy", "human returns", "dirty", "absent"] as const)("allows bounded scale-out while retaining a %s drain", async (condition) => {
+    const db = database(); const b = boundary(); const service = new ElasticFleetService(db, b.io, () => time);
+    service.configure(config); b.set(snapshot([worker()], false)); service.requestDrain("vm1"); await service.reconcile();
+    const currentWorkers = () => condition === "absent" ? [] : [worker(condition === "busy" ? { active: 1 }
+      : condition === "dirty" ? { clean: false } : { pendingHumanReturns: true })];
+    time += 1; b.set(snapshot(currentWorkers())); await service.reconcile();
+    time += 10_000; b.set(snapshot(currentWorkers()));
+    expect((await service.plan())?.add).toBe(1);
+    await service.reconcile();
+    expect(b.calls.map((c) => c.type)).toEqual(["beginDrain", "provision"]);
+    expect(b.calls[1]).toMatchObject({ count: 1, targetCapacity: condition === "absent" ? 1 : 2 });
+    expect(service.drainingWorkerIds()).toEqual(["vm1"]);
   });
 
 });

@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { planFleet, validateFleetPolicy, type FleetPolicy, type FleetSnapshot, type FleetHistory, type FleetPlan } from "./elastic-fleet-policy.js";
 
 export interface ElasticFleetConfiguration { policy: FleetPolicy; provider?: Record<string, unknown> }
@@ -94,8 +95,10 @@ export class ElasticFleetService {
     catch { throw Error("invalid_configuration"); }
     this.db.transaction(() => {
       const previous = this.row();
-      if (previous.config && JSON.parse(previous.config).policy.poolId !== config.policy.poolId
-        && (this.drains().length > 0 || this.latestOperation(true))) throw Error("pool_busy");
+      const provision = this.db.prepare("SELECT configuration FROM elastic_fleet_operations WHERE type = 'provision' ORDER BY rowid LIMIT 1").get() as { configuration: string } | undefined;
+      const identity: ElasticFleetConfiguration | null = provision ? JSON.parse(provision.configuration) : previous.config ? JSON.parse(previous.config) : null;
+      if (identity && (identity.policy.poolId !== config.policy.poolId || !isDeepStrictEqual(identity.provider, config.provider))
+        && (provision || this.drains().length > 0 || this.latestOperation(true))) throw Error("pool_busy");
       this.db.prepare("UPDATE elastic_fleet_config SET config = ?, revision = revision + 1, paused = 0, history = ?, last_plan = NULL, error = NULL, updated_at = ? WHERE id = 1")
         .run(JSON.stringify(config), JSON.stringify(emptyHistory), this.now());
     }).immediate();
@@ -203,16 +206,18 @@ export class ElasticFleetService {
     const drain = this.drains()[0];
     if (drain) {
       const native = observed.workers.find((worker) => worker.id === drain.worker_id);
-      if (drain.pool_id !== config.policy.poolId || !native || !native.managed || native.permanent
-        || !["ready", "draining"].includes(native.state)) return this.status();
-      workerId = native.id;
-      if (drain.state === "requested") type = "beginDrain";
-      else if (native.active === 0 && native.clean === true && native.pendingHumanReturns === false && drain.begin_operation_id) {
-        const begin = this.db.prepare("SELECT state FROM elastic_fleet_operations WHERE operation_id = ? AND type = 'beginDrain' AND worker_id = ?").get(drain.begin_operation_id, native.id) as { state: string } | undefined;
-        if (begin?.state === "succeeded") type = "remove";
+      if (drain.pool_id === config.policy.poolId && native?.managed && !native.permanent
+        && ["ready", "draining"].includes(native.state)) {
+        workerId = native.id;
+        if (drain.state === "requested") type = "beginDrain";
+        else if (native.active === 0 && native.clean === true && native.pendingHumanReturns === false && drain.begin_operation_id) {
+          const begin = this.db.prepare("SELECT state, updated_at FROM elastic_fleet_operations WHERE operation_id = ? AND type = 'beginDrain' AND worker_id = ?").get(drain.begin_operation_id, native.id) as { state: string; updated_at: number } | undefined;
+          if (begin?.state === "succeeded" && snapshot.observedAt > begin.updated_at && native.observedAt > begin.updated_at) type = "remove";
+        }
       }
-    } else if (plan.add > 0) { type = "provision"; count = plan.add; }
-    else if (plan.drainIds[0]) { type = "beginDrain"; workerId = plan.drainIds[0]; }
+    }
+    if (!type && plan.add > 0) { type = "provision"; workerId = null; count = plan.add; }
+    else if (!drain && !type && plan.drainIds[0]) { type = "beginDrain"; workerId = plan.drainIds[0]; }
     if (!type) return this.status();
     const reserved = this.reserve(owner, state.revision, config, snapshot, type, workerId, count);
     if (!reserved) return this.status();
