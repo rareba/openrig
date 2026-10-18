@@ -13,6 +13,42 @@ import urllib.error
 import urllib.request
 
 
+def _same_bound_identity(observed, bound, channel):
+    if observed == bound:
+        return True
+    if channel != 'whatsapp':
+        return False
+    try:
+        from gateway.whatsapp_identity import (canonical_whatsapp_identifier, expand_whatsapp_aliases,
+                                               normalize_whatsapp_mention_jid)
+        observed_jid = normalize_whatsapp_mention_jid(observed)
+        bound_jid = normalize_whatsapp_mention_jid(bound)
+        if not observed_jid or not bound_jid:
+            return False
+        observed_number, _, observed_domain = observed_jid.partition('@')
+        bound_number, _, bound_domain = bound_jid.partition('@')
+        if observed_jid == bound_jid:
+            return True
+        # Only a single native PN↔LID pair can extend an existing binding.
+        # Domain stripping alone or a conflicting transitive map cannot authorize it.
+        if observed_domain == bound_domain or observed_number == bound_number:
+            return False
+        pair = {observed_number, bound_number}
+        if expand_whatsapp_aliases(observed_jid) | expand_whatsapp_aliases(bound_jid) != pair:
+            return False
+        canonical = canonical_whatsapp_identifier(observed_jid)
+        return bool(canonical) and canonical == canonical_whatsapp_identifier(bound_jid)
+    except Exception:
+        return False  # Missing/unreadable native identity support never broadens a binding.
+
+
+def _binding_matches(delivery, binding, channel):
+    profile, chat, sender = binding
+    return {'profile_matches': profile == delivery['profile'],
+            'chat_matches': _same_bound_identity(chat, delivery['chatId'], channel),
+            'sender_matches': _same_bound_identity(sender, delivery['senderId'], channel)}
+
+
 class RelayFailure(Exception):
     def __init__(self, status, reason):
         super().__init__(reason)
@@ -482,11 +518,12 @@ class RelayPlugin:
         await self.flush_platform_receipt(item)
 
     def known_question(self, quoted_id, channel='whatsapp', binding=None):
-        return next((item for item in self.ctx.state.get('outbound', {}).values()
-                     if quoted_id and quoted_id in item.get('messageIds', [])
-                     and item['delivery'].get('channel', 'whatsapp') == channel
-                     and (binding is None or (item['delivery']['profile'], item['delivery']['chatId'],
-                                              item['delivery']['senderId']) == binding)), None)
+        matches = [item for item in self.ctx.state.get('outbound', {}).values()
+                   if quoted_id and quoted_id in item.get('messageIds', [])
+                   and item['delivery'].get('channel', 'whatsapp') == channel]
+        if binding is not None:
+            matches = [item for item in matches if all(_binding_matches(item['delivery'], binding, channel).values())]
+        return matches[0] if len(matches) == 1 else None
 
     def quoted_id(self, event):
         quoted = getattr(event, 'reply_to_message_id', None)
@@ -538,17 +575,23 @@ class RelayPlugin:
             return None
         quoted_id = self.quoted_id(event)
         profile = getattr(source, 'profile', None) or self.profile
-        item = self.known_question(quoted_id, channel, (profile, source.chat_id, source.user_id))
+        binding = (profile, source.chat_id, source.user_id)
+        item = self.known_question(quoted_id, channel, binding)
         if not item:
-            if self.known_question(quoted_id, channel):
-                return {'action': 'skip', 'reason': 'OpenRig question belongs to a different bound sender/profile/chat.'}
+            candidate = self.known_question(quoted_id, channel)
+            if candidate:
+                matches = _binding_matches(candidate['delivery'], binding, channel)
+                diagnostic = ', '.join(f'{key}={value}' for key, value in matches.items())
+                return {'action': 'skip', 'reason': 'OpenRig question belongs to a different bound sender/profile/chat. ' + diagnostic}
+            if any(quoted_id and quoted_id in value.get('messageIds', [])
+                   and value['delivery'].get('channel', 'whatsapp') == channel
+                   for value in self.ctx.state.get('outbound', {}).values()):
+                return {'action': 'skip', 'reason': 'OpenRig quoted question is ambiguous; no answer was queued.'}
             return None
         d = item['delivery']
-        if (profile != d['profile'] or source.chat_id != d['chatId'] or source.user_id != d['senderId']):
-            return {'action': 'skip', 'reason': 'OpenRig question belongs to a different bound sender/profile/chat.'}
         text = self.command_text(event)
         base = {'hostId': item['hostId'], 'deliveryId': d['deliveryId'], 'connectorId': d['connectorId'],
-                'profile': profile, 'chatId': source.chat_id, 'senderId': source.user_id,
+                'profile': d['profile'], 'chatId': d['chatId'], 'senderId': d['senderId'],
                 'replyToMessageId': quoted_id}
         if channel != 'whatsapp':
             base['channel'] = channel
@@ -583,12 +626,14 @@ class RelayPlugin:
             return {'action': 'skip', 'reason': 'Malformed OpenRig reply; no answer was queued.'}
         payload = {**base, 'messageId': event.message_id, 'qitemId': d['qitemId'],
                    'requestRevision': d['requestRevision'], 'response': response}
-        identity = hashlib.sha256(json.dumps([channel, profile, source.chat_id, source.user_id, event.message_id], separators=(',', ':')).encode()).hexdigest()
+        identity = hashlib.sha256(json.dumps([channel, d['profile'], d['chatId'], d['senderId'], event.message_id], separators=(',', ':')).encode()).hexdigest()
         async with self.inbound_lock:
             existing = self.ctx.state.get('inbound', {}).get(identity)
             if existing:
                 return {'action': 'skip', 'reason': 'This native message already has a durable OpenRig reply record.'}
             record = {'payload': payload, 'state': 'pending', 'at': self.now()}
+            if (profile, source.chat_id, source.user_id) != (d['profile'], d['chatId'], d['senderId']):
+                record['observedSource'] = {'profile': profile, 'chatId': source.chat_id, 'senderId': source.user_id}
             try:
                 self.save_inbound(identity, record)  # Durable BEFORE the native HTTP call.
             except Exception:
