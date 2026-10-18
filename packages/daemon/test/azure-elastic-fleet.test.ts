@@ -204,4 +204,39 @@ describe('Azure dedicated VMSS boundary',()=>{
   expect(f.commands.filter(args=>args[0]==='rest')).toHaveLength(11);
  });
 
+ it.each([
+  ['other-rg','Scale rule','other-rg'],['other-rg','Scale # rule','other-rg'],['other-rg','r'.repeat(91),'other-rg'],
+  ['other(rg)','rule','other-rg'],['部署é１２','伸縮 规则','other-rg'],
+  ['other-rg','rule','other(rg)'],['other-rg','rule','部署é１２'],
+  ['組'.repeat(90),'規'.repeat(260),'標'.repeat(90)],
+ ])('accepts legal unrelated inventory names: group %s, rule %s, target group %s',async(group,setting,targetGroup)=>{
+  const rule={id:`/subscriptions/${subscription}/resourceGroups/${group}/providers/Microsoft.Insights/autoscalesettings/${setting}`,
+   properties:{enabled:false,targetResourceUri:`/subscriptions/${subscription}/resourceGroups/${targetGroup}/providers/Microsoft.Web/serverfarms/Other app (é１２)`}};
+  const f=restFixture([{value:[rule]}]);expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(true);
+  expect(f.commands.some(args=>args[1]==='list-instances')).toBe(true);
+ });
+ it.each(['Scale rule','規'.repeat(260)])('still rejects enabled same-pool rules with legal broad names %s',async setting=>{
+  const rule={id:`/subscriptions/${subscription}/resourceGroups/別(rg)/providers/Microsoft.Insights/autoscalesettings/${setting}`,properties:{enabled:true,targetResourceUri:resourceId.toUpperCase()}};
+  const f=restFixture([{value:[rule]}]);expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);
+ });
+ it.each([
+  ['bad/rg','rule'],['bad rg','rule'],['r'.repeat(91),'rule'],['rg.','rule'],['rg','r'.repeat(261)],['rg','bad:rule'],['rg','rule.'],['rg','rule '],
+ ])('rejects malformed setting name components %s/%s',async(group,setting)=>{
+  const f=restFixture([{value:[{...autoscaleRule(),id:`/subscriptions/${subscription}/resourceGroups/${group}/providers/Microsoft.Insights/autoscalesettings/${setting}`}]}]);
+  expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);
+ });
+ it.each([resourceId+'/',resourceId+'//child',resourceId+'/child',resourceId.replace('/fleet','/..'),resourceId+'?query=x',resourceId+'#fragment'])('rejects malformed target structure %s',async target=>{
+  const f=restFixture([{value:[autoscaleRule('other-rg',false,target)]}]);expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(false);
+ });
+
+ it('accepts long nested unrelated target names without the old total-ID text bound',async()=>{
+  const target=`/subscriptions/${subscription}/resourceGroups/${'組'.repeat(90)}/providers/Microsoft.Example/parents/${'親'.repeat(260)}/children/${'子'.repeat(260)}`;
+  expect(target.length).toBeGreaterThan(512);
+  const f=restFixture([{value:[autoscaleRule('other-rg',false,target)]}]);
+  expect((await f.io.observe(policy,configuration)).providerAvailable).toBe(true);
+ });
+ it.each(['other(rg)','部署','r'.repeat(91)])('keeps configured pool names restricted: %s',group=>{
+  expect(()=>validateAzurePoolConfiguration({...provider,resourceGroup:group,resourceId:resourceId.replace('/rg/','/'+group+'/')},'pool')).toThrow('invalid_azure_configuration');
+ });
+
 });

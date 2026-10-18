@@ -156,6 +156,21 @@ export function createAzureElasticFleetIO(options: AzureFleetOptions): FleetIO {
       if (!token || /[\u0000-\u001f\u007f]/.test(token)) reject();
       return `${base}&${new URLSearchParams({'$skiptoken':token})}`;
     }
+    // Inventory names follow Azure's rules, independently of our intentionally narrow pool configuration.
+    const resourceGroupName = (value: string) => value.length >= 1 && value.length <= 90
+      && /^[\p{L}\p{Nd}_.()-]+$/u.test(value) && !value.endsWith('.');
+    const settingName = (value: string) => value.length >= 1 && value.length <= 260
+      && !/[:<>+/&%\\?|\p{Cc}]/u.test(value) && !/[ .]$/.test(value);
+    function armParts(value: unknown, target = false): string[] {
+      if (typeof value !== 'string' || value.length > 8192 || /[\p{Cc}\\]/u.test(value) || (target && /[?#]/.test(value))) reject();
+      const parts = value.split('/');
+      if (parts.length < 9 || parts.length % 2 !== 1 || parts[0] !== '' || parts[1]?.toLowerCase() !== 'subscriptions'
+        || !uuid.test(parts[2] ?? '') || parts[3]?.toLowerCase() !== 'resourcegroups' || !resourceGroupName(parts[4] ?? '')
+        || parts[5]?.toLowerCase() !== 'providers' || !/^[A-Za-z0-9_.-]+$/.test(parts[6] ?? '')
+        || parts.slice(7).some((part,index) => part.length === 0 || part === '.' || part === '..'
+          || (index % 2 === 0 && !/^[A-Za-z0-9_.-]+$/.test(part)))) reject();
+      return parts;
+    }
     let url = base; let bytes = 0; let count = 0;
     const seenPages = new Set<string>(); const seenRules = new Set<string>();
     const deadline = performance.now() + limits.timeout;
@@ -169,14 +184,13 @@ export function createAzureElasticFleetIO(options: AzureFleetOptions): FleetIO {
       const body: unknown = JSON.parse(stdout);
       if (!object(body) || !Array.isArray(body.value) || 'error' in body) reject();
       for (const rule of body.value) {
-        if (++count > 10_000 || !object(rule) || !text(rule.id) || !object(rule.properties)
-          || typeof rule.properties.enabled !== 'boolean' || !text(rule.properties.targetResourceUri)
-          || !/^\/subscriptions\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/resourceGroups\/[A-Za-z0-9_.-]+\/providers\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)+$/i.test(rule.properties.targetResourceUri)) reject();
-        const parts = rule.id.split('/');
-        if (parts.length !== 9 || parts[0] !== '' || parts[1]?.toLowerCase() !== 'subscriptions' || !sameId(parts[2],configuration.subscription)
-          || parts[3]?.toLowerCase() !== 'resourcegroups' || !name.test(parts[4] ?? '') || parts[5]?.toLowerCase() !== 'providers'
+        if (++count > 10_000 || !object(rule) || !object(rule.properties)
+          || typeof rule.properties.enabled !== 'boolean') reject();
+        armParts(rule.properties.targetResourceUri,true);
+        const parts = armParts(rule.id);
+        if (parts.length !== 9 || !sameId(parts[2],configuration.subscription)
           || parts[6]?.toLowerCase() !== 'microsoft.insights' || parts[7]?.toLowerCase() !== 'autoscalesettings'
-          || !name.test(parts[8] ?? '') || seenRules.has(rule.id.toLowerCase())) reject();
+          || !settingName(parts[8] ?? '') || typeof rule.id !== 'string' || seenRules.has(rule.id.toLowerCase())) reject();
         seenRules.add(rule.id.toLowerCase());
         if (rule.properties.enabled && sameId(rule.properties.targetResourceUri,configuration.resourceId)) reject();
       }
