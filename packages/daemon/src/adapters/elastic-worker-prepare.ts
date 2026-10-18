@@ -74,7 +74,7 @@ export function readinessProofArtifact(task: z.infer<typeof ownerSchema>, sessio
 /** Fixed command is both the task scope and the exact tool-call evidence expected in Pi history. */
 export function readinessTaskBody(task: z.infer<typeof ownerSchema>, session: string, cwd: string, manifestDigest: string): string {
     const artifact = readinessProofArtifact(task, session, cwd, manifestDigest);
-    return `cd '${cwd}' && rig whoami --json && rig queue show '${task.qitemId}' --full --json && (umask 077; set -C; printf '%s\\n' '${artifact.bytes}' > '${artifact.path}') && /usr/bin/sha256sum '${artifact.path}' && printf '%s\\n' 'OPENRIG_ELASTIC_PROOF ${task.nonce} ${session} ${manifestDigest}'`;
+    return `cd '${cwd}' && rig whoami --json && rig queue show '${task.qitemId}' --full --json && (umask 077; set -C; printf '%s' '${artifact.bytes}' > '${artifact.path}') && /usr/bin/sha256sum '${artifact.path}' && printf '%s\\n' 'OPENRIG_ELASTIC_PROOF ${task.nonce} ${session} ${manifestDigest}'`;
 }
 /** Model-authored booleans never qualify; require a paired successful Bash result in native history. */
 export function inspectPiToolProof(entries: unknown[], expected: {

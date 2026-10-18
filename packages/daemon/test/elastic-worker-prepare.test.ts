@@ -10,13 +10,29 @@ describe('finite native preparation', () => {
     });
     it('requires actual current Pi Bash/result/nonce evidence, never a boolean or health receipt', () => {
         const task = { qitemId: 'fixture-task', nonce: 'a'.repeat(32), sourceSession: 'manager@fixture', originHostId: 'fixture-origin' };
-        const command = readinessTaskBody(task, 'worker-a@elastic', '/work/repo', digest);
+        const root = realpathSync(mkdtempSync(join(tmpdir(), 'prepare-proof-')));
+        cleanup.push(() => rmSync(root, { recursive: true, force: true }));
+        const cwd = join(root, 'repo');
+        mkdirSync(cwd);
+        const command = readinessTaskBody(task, 'worker-a@elastic', cwd, digest);
         expect(command).toContain('rig whoami');
-        const artifact = readinessProofArtifact(task, 'worker-a@elastic', '/work/repo', digest);
-        const messages = [{ type: 'message', message: { role: 'assistant', model: 'fixture/model', content: [{ type: 'toolCall', id: 'call', name: 'bash', arguments: { command } }] } }, { type: 'message', message: { role: 'toolResult', toolCallId: 'call', toolName: 'bash', isError: false, content: [{ type: 'text', text: artifact.sha256 + '  ' + artifact.path + '\nOPENRIG_ELASTIC_PROOF aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa worker-a@elastic ' + digest }] } }];
-        expect(inspectPiToolProof(messages, { model: 'fixture/model', task, seat: 'worker-a@elastic', cwd: '/work/repo', manifestDigest: digest })).toBe(true);
-        expect(inspectPiToolProof([{ ready: true }], { model: 'fixture/model', task, seat: 'worker-a@elastic', cwd: '/work/repo', manifestDigest: digest })).toBe(false);
-        expect(inspectPiToolProof(messages, { model: 'wrong/model', task, seat: 'worker-a@elastic', cwd: '/work/repo', manifestDigest: digest })).toBe(false);
+        const artifact = readinessProofArtifact(task, 'worker-a@elastic', cwd, digest);
+        const checksum = join(root, 'checksum.mjs');
+        writeFileSync(checksum, `import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+const path = process.argv[2];
+process.stdout.write(createHash('sha256').update(readFileSync(path)).digest('hex') + '  ' + path + '\\n');
+`);
+        // Execute the complete generated command. Only native CLI and Linux checksum transport
+        // are local fixtures; the proof writer and marker run unchanged in Bash.
+        const output = execFileSync('/bin/bash', ['-c', `rig() { printf '%s\\n' '{}'; }
+function /usr/bin/sha256sum() { "$FIXTURE_NODE" "$FIXTURE_CHECKSUM" "$@"; }
+${command}`], { encoding: 'utf8', env: { ...process.env, FIXTURE_NODE: process.execPath, FIXTURE_CHECKSUM: checksum } });
+        const messages = [{ type: 'message', message: { role: 'assistant', model: 'fixture/model', content: [{ type: 'toolCall', id: 'call', name: 'bash', arguments: { command } }] } }, { type: 'message', message: { role: 'toolResult', toolCallId: 'call', toolName: 'bash', isError: false, content: [{ type: 'text', text: output }] } }];
+        expect(readFileSync(artifact.path)).toEqual(Buffer.from(artifact.bytes));
+        expect(inspectPiToolProof(messages, { model: 'fixture/model', task, seat: 'worker-a@elastic', cwd, manifestDigest: digest })).toBe(true);
+        expect(inspectPiToolProof([{ ready: true }], { model: 'fixture/model', task, seat: 'worker-a@elastic', cwd, manifestDigest: digest })).toBe(false);
+        expect(inspectPiToolProof(messages, { model: 'wrong/model', task, seat: 'worker-a@elastic', cwd, manifestDigest: digest })).toBe(false);
     });
 });
 import Database from 'better-sqlite3';

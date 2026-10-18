@@ -20,6 +20,7 @@ import { createHash, createPublicKey, generateKeyPairSync } from 'node:crypto';
 import { ElasticWorkerAttemptStore } from '../src/adapters/elastic-worker-attempts.js';
 import { AzureWorkerCommandClient } from '../src/adapters/azure-worker-command.js';
 import { ElasticWorkerEnrollment } from '../src/adapters/elastic-worker-enrollment.js';
+import type { FleetOperation } from '../src/domain/elastic-fleet.js';
 import { sealEnrollment } from '../src/domain/elastic-enrollment.js';
 import { loadHostRegistry } from '../src/domain/hosts/hosts-registry-reader.js';
 const roots: string[] = [];
@@ -109,6 +110,8 @@ it('concretely stages, wraps enrollment, registers without touching permanent ho
     const f = fixture();
     const service = new ElasticWorkerEnrollment(f.options);
     expect((await service.advanceEnrollment(f.context)).state).toBe('pending');
+    expect(await service.inspectNative({ configuration: f.context.configuration, instances: [f.context.instance], operation: f.context.operation })).toBe('pending');
+    expect(f.puts()).toBe(1);
     expect((await service.advanceEnrollment(f.context)).state).toBe('pending');
     expect((await service.advanceEnrollment(f.context)).state).toBe('pending');
     expect((await service.advanceEnrollment(f.context)).state).toBe('pending');
@@ -132,4 +135,39 @@ it('retains original key/request after unknown PUT and missing GET across restar
     expect(f.puts()).toBe(1);
     expect(f.store.privateKey(a.id)).toEqual(key);
     expect(JSON.stringify(first)).not.toContain('bearer');
+});
+
+it('requires exactly one ready attempt per added incarnation after restart without submitting commands', async () => {
+    const f = fixture();
+    const service = new ElasticWorkerEnrollment(f.options);
+    for (let step = 0; step < 5; step++)
+        await service.advanceEnrollment(f.context);
+    const saved = f.store.list()[0]!;
+    const restarted = new ElasticWorkerEnrollment(f.options);
+    const inspect = (instances: typeof f.context.instance[], operation: FleetOperation = f.context.operation) =>
+        restarted.inspectNative({ configuration: f.context.configuration, instances, operation });
+    expect(await inspect([f.context.instance])).toBe('succeeded');
+    const second = { ...f.context.instance, instanceId: '1', vmId: '22222222-2222-4222-8222-222222222222', resourceId: `${f.context.configuration.resourceId}/virtualMachines/1`, workerId: `azure:${f.context.configuration.resourceId.toLowerCase()}:22222222-2222-4222-8222-222222222222` };
+    const observation = await restarted.observeManagedWorker(saved, f.context.configuration);
+    const withBaseline = { ...f.context.operation, targetCapacity: 2,
+        snapshot: { ...f.context.operation.snapshot, workers: [{ ...observation.worker, id: second.workerId }] } };
+    expect(await inspect([f.context.instance, second], withBaseline)).toBe('succeeded');
+    expect(await inspect([f.context.instance, { ...second, workerId: 'changed-incarnation' }], withBaseline)).toBe('unknown');
+    const expanded = { ...f.context.operation, count: 2, targetCapacity: 2 };
+    expect(await inspect([f.context.instance, second], expanded)).toBe('unknown');
+    expect(await inspect([f.context.instance, f.context.instance], expanded)).toBe('unknown');
+    for (const changed of [
+        { ...f.context.instance, instanceId: '1' },
+        { ...f.context.instance, resourceId: second.resourceId },
+        { ...f.context.instance, vmId: second.vmId },
+        second,
+    ])
+        expect(await inspect([changed])).toBe('unknown');
+    const extra = f.store.createOrRead({ ...saved.identity, instanceId: second.instanceId, childResourceId: second.resourceId, vmId: second.vmId });
+    expect(extra.phase).toBe('reserved');
+    const before = f.store.list();
+    expect(await inspect([f.context.instance])).toBe('unknown');
+    expect(await inspect([f.context.instance, second], withBaseline)).toBe('unknown');
+    expect(f.store.list()).toEqual(before);
+    expect(f.puts()).toBe(3);
 });

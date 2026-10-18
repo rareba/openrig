@@ -424,13 +424,25 @@ export class ElasticWorkerEnrollment {
     }): Promise<'succeeded' | 'pending' | 'unknown'> {
         if (context.operation.type !== 'provision')
             return 'unknown';
-        const attempts = this.options.store.list().filter(a => a.identity.operationId === context.operation.operationId);
-        if (!attempts.length || context.instances.length !== context.operation.targetCapacity)
+        const { operation, instances } = context;
+        const previous = new Set(operation.snapshot.workers.filter(w => w.managed && !w.permanent).map(w => w.id));
+        const added = instances.filter(i => !previous.has(i.workerId));
+        const attempts = this.options.store.list().filter(a => a.identity.operationId === operation.operationId);
+        if (instances.length !== operation.targetCapacity || operation.count < 1 || added.length !== operation.count
+            || [...previous].some(id => !instances.some(i => i.workerId === id))
+            || attempts.length !== added.length)
             return 'unknown';
-        const states = await Promise.all(attempts.map(a => {
-            const instance = context.instances.find(i => i.workerId === a.workerId && i.vmId === a.binding.vmId && i.resourceId === a.identity.childResourceId);
-            return instance ? this.inspectEnrollment({ configuration: context.configuration, instance, operation: context.operation }) : Promise.resolve({ state: 'unknown' as const, publicReason: 'owned_incarnation_absent' });
-        }));
+        for (const key of ['workerId', 'vmId', 'resourceId', 'instanceId'] as const) {
+            if (new Set(instances.map(i => i[key])).size !== instances.length)
+                return 'unknown';
+        }
+        const matched = added.map(instance => ({ instance, attempts: attempts.filter(a => a.workerId === instance.workerId
+                && a.binding.vmId === instance.vmId && a.identity.childResourceId === instance.resourceId
+                && a.identity.instanceId === instance.instanceId) }));
+        if (matched.some(item => item.attempts.length !== 1))
+            return 'unknown';
+        const states = await Promise.all(matched.map(({ instance }) =>
+            this.inspectEnrollment({ configuration: context.configuration, instance, operation })));
         return states.length && states.every(s => s.state === 'ready') ? 'succeeded' : states.some(s => s.state === 'unknown') ? 'unknown' : 'pending';
     }
 }
