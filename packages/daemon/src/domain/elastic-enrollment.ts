@@ -84,3 +84,14 @@ export function openCheckpointCapability(envelope: string, binding: EnrollmentBi
   if (result.length > 8192) { result.fill(0); fail(); }
   return result;
 }
+
+/** Repository credentials have a separate domain from immutable Pi runtime material. */
+export function sealGithubMaterial(plaintext: Buffer, binding: EnrollmentBinding, publicKey: KeyObject): string {
+  if (plaintext.length > 16384) fail();
+  return seal(plaintext, binding, publicKey, true, 'openrig-worker-github-material-v1\0');
+}
+export function openGithubMaterial(envelope: string, binding: EnrollmentBinding, privateKey: KeyObject): Buffer {
+  const bytes = open(envelope, binding, privateKey, true, 'openrig-worker-github-material-v1\0');
+  if (bytes.length > 16384) { bytes.fill(0); fail(); }
+  return bytes;
+}

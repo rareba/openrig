@@ -1,0 +1,23 @@
+name: elastic-worker
+version: "1.0"
+description: Bounded managed Pi worker for explicit native queue tasks.
+defaults:
+  runtime: pi
+profiles:
+  default:
+    uses:
+      guidance: [role]
+      skills: []
+      subagents: []
+      plugins: []
+      runtime_resources: []
+resources:
+  guidance:
+    - id: role
+      path: profiles/default/AGENTS.md
+startup:
+  files:
+    - path: profiles/default/AGENTS.md
+      delivery_hint: send_text
+      required: true
+  actions: []

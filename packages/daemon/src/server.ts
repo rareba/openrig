@@ -1,3 +1,8 @@
+import { ElasticWorkerPreparation, preparationPlanSchema } from './adapters/elastic-worker-prepare.js';
+import { loadForegroundManifest } from './adapters/elastic-worker-foreground.js';
+import { assertRootPath } from './adapters/linux-privileged-worker-boundary.js';
+import { noFollowRead } from './adapters/elastic-worker-checkpoint.js';
+import { elasticWorkerAuth } from './middleware/elastic-worker-auth.js';
 import { elasticWorkerRoutes, type ElasticWorkerProbeReader } from "./routes/elastic-worker.js";
 import { healthDiagnosisRoutes } from "./routes/health-diagnosis.js";
 import type { HealthDiagnosisService } from "./domain/health-diagnosis.js";
@@ -348,6 +353,7 @@ export interface AppDeps {
   healthCheckpoints?: HealthCheckpointSource;
   contextMonitor?: { pollOnce(): Promise<void> };
   elasticWorkerProbe?: ElasticWorkerProbeReader;
+  elasticWorkerPreparation?: ElasticWorkerPreparation;
   /**
    * OPR.0.4.3.14 — Claude compaction enforcer, exposed to routes for the manual
    * compaction trigger (POST /api/compaction/trigger). Constructed once in
@@ -655,6 +661,10 @@ export function createApp(deps: AppDeps): Hono {
 
   // Browser boundary: target name and browser Origin, checked once per /api request
   // (WebSocket upgrades included), before the remote read-through and every route.
+  app.use("/api/*", elasticWorkerAuth({
+    enabled: process.env.OPENRIG_ELASTIC_GUARD !== undefined || deps.elasticWorkerProbe !== undefined || fs.existsSync('/etc/openrig-elastic/manifest.json'),
+    bearerToken: process.env.OPENRIG_ELASTIC_GUARD === undefined && deps.elasticWorkerProbe === undefined && fs.existsSync('/etc/openrig-elastic/manifest.json') ? null : deps.missionControlBearerToken ?? null,
+  }));
   app.use("/api/*", browserBoundary({
     webUiEnabled: deps.webUiEnabled === true,
     bearerTokens: [deps.terminalBearerToken, deps.missionControlBearerToken],
@@ -794,7 +804,17 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/rigs/:rigId/chat", chatRoutes());
   app.route("/api/stream", streamRoutes());
   app.route("/api/queue", queueRoutes());
-  app.route("/api/elastic-worker", elasticWorkerRoutes({ probe: deps.elasticWorkerProbe, bearerToken: deps.missionControlBearerToken ?? null }));
+  let elasticPreparation = deps.elasticWorkerPreparation;
+  if (!elasticPreparation && process.env.OPENRIG_ELASTIC_GUARD !== undefined) {
+    const manifest = loadForegroundManifest();
+    assertRootPath('/etc/openrig-elastic/preparation.json');
+    const approvedPlan = preparationPlanSchema.parse(JSON.parse(noFollowRead('/etc/openrig-elastic/preparation.json', 65536).toString()));
+    if (!deps.queueRepo || !process.env.OPENRIG_ELASTIC_MANIFEST_DIGEST) throw Error('elastic_worker_unavailable');
+    elasticPreparation = new ElasticWorkerPreparation({ manifest, manifestDigest: process.env.OPENRIG_ELASTIC_MANIFEST_DIGEST, approvedPlan,
+      services: { bootstrap: deps.bootstrapOrchestrator, rigs: deps.rigRepo, sessions: deps.sessionRegistry, queue: deps.queueRepo } });
+  }
+  app.route("/api/elastic-worker", elasticWorkerRoutes({ probe: deps.elasticWorkerProbe, bearerToken: deps.missionControlBearerToken ?? null,
+    preparation: elasticPreparation, ...(elasticPreparation ? { runtime: () => ({ selfHostId: getSelfHostId(), build: stampFields() }) } : {}) }));
   app.route("/api/github-intake", githubIntakeRoutes({ service: deps.githubIntakeService, bearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/mission-control", humanResponsesRoutes({ queueRepo: deps.queueRepo, bearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/mission-control", humanRelayRoutes({ service: deps.humanRelayService, queueRepo: deps.queueRepo, bearerToken: deps.missionControlBearerToken ?? null }));

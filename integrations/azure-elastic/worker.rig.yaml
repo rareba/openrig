@@ -1,0 +1,21 @@
+version: "0.2"
+name: elastic
+summary: Finite enrolled Pi seats. Checkout, model and proof scope are installed by the approved preparation plan.
+pods:
+  - id: worker
+    label: Elastic workers
+    members:
+      - id: a
+        agent_ref: "path:/opt/openrig/integrations/azure-elastic/worker-agent"
+        runtime: pi
+        profile: default
+        model: __OPENRIG_MODEL__
+        cwd: __OPENRIG_CWD_A__
+      - id: b
+        agent_ref: "path:/opt/openrig/integrations/azure-elastic/worker-agent"
+        runtime: pi
+        profile: default
+        model: __OPENRIG_MODEL__
+        cwd: __OPENRIG_CWD_B__
+    edges: []
+edges: []

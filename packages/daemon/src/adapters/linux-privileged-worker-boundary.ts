@@ -560,6 +560,20 @@ export class LinuxPrivilegedWorkerBoundary implements PrivilegedWorkerBoundary {
       manifestDigest: this.manifestDigest,
     };
     durableWrite(m.linux.guard, JSON.stringify(identity), 0o644);
+    // Fixed root-owned record; the dedicated group can read it, the worker cannot replace it.
+    const gitConfig = join(m.linux.home, '.gitconfig');
+    const gitConfigBytes = '[credential "https://github.com"]\n\thelper = !/opt/node/bin/gh auth git-credential\n[credential]\n\tinteractive = false\n[core]\n\thooksPath = /dev/null\n';
+    if (existsSync(gitConfig)) { if (noFollowRead(gitConfig, 16384).toString() !== gitConfigBytes) reject(); }
+    else { durableWrite(gitConfig, gitConfigBytes); chownSync(gitConfig, m.uid, m.gid); }
+    const ghConfigDirectory = '/etc/openrig-elastic/gh-empty';
+    if (!existsSync(ghConfigDirectory)) mkdirSync(ghConfigDirectory, { mode: 0o755 });
+    assertRootPath(ghConfigDirectory);
+    if (!lstatSync(ghConfigDirectory).isDirectory() || readdirSync(ghConfigDirectory).length !== 0) reject();
+    const localApiPath = "/etc/openrig-elastic/local-api.json";
+    durableWrite(localApiPath, JSON.stringify({ version: 1, workerId: identity.workerId, vmId: x.vmId,
+      manifestDigest: this.manifestDigest, baseUrl: `http://${x.privateIPv4}:${m.port}`, bearer }), 0o640);
+    chownSync(localApiPath, 0, m.gid);
+
     const env = {
       HOME: m.linux.home,
       SHELL: m.linux.shell,

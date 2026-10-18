@@ -1,5 +1,6 @@
+import { GithubCredentialStore, githubMaterialSchema } from './elastic-worker-github.js';
 import { createPrivateKey } from "node:crypto";
-import { openCheckpointCapability, type EnrollmentBinding } from "../domain/elastic-enrollment.js";
+import { openCheckpointCapability, openGithubMaterial, type EnrollmentBinding } from "../domain/elastic-enrollment.js";
 import Database from "better-sqlite3";
 import { closeSync, openSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -80,6 +81,7 @@ const payloads = {
       materialEnvelope: z.string().max(96 * 1024),
     })
     .strict(),
+  "github-credential-install": z.object({ binding: enrollment, materialEnvelope: z.string().max(32 * 1024) }).strict(),
   "begin-drain": z.object({ identity, operationId: text }).strict(),
   quiesce: z.object({ binding: finalBinding }).strict(),
   "final-checkpoint-export": z
@@ -154,6 +156,15 @@ export async function runWorkerHelper(argv: string[]): Promise<unknown> {
     const fd = openSync(candidate, "wx", 0o600);
     closeSync(fd);
     lock = candidate;
+    if (operation === "github-credential-install") {
+      const p = payloads["github-credential-install"].parse(input);
+      const prepared = JSON.parse(noFollowRead(join(manifest.controlDirectory, 'enrollment.json'), 16384).toString()) as { binding: EnrollmentBinding; privateKeyPem: string };
+      const instance = os.instance(); const state = control.read();
+      if (JSON.stringify(p.binding) !== JSON.stringify(prepared.binding) || instance.vmId !== p.binding.vmId || instance.fleetEpoch !== p.binding.fleetEpoch || instance.operationId !== p.binding.operationId || !state || state.phase !== 'ready' || state.vmId !== p.binding.vmId) throw Error();
+      const plaintext = openGithubMaterial(p.materialEnvelope, prepared.binding, createPrivateKey(prepared.privateKeyPem));
+      try { return new GithubCredentialStore('/etc/openrig-elastic', 0, manifest.gid).install(githubMaterialSchema.parse(JSON.parse(plaintext.toString()))); }
+      finally { plaintext.fill(0); }
+    }
     switch (operation) {
       case "quiesce":
         return lifecycle.quiesce(payloads.quiesce.parse(input).binding);

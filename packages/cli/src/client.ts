@@ -1,3 +1,4 @@
+import { resolveLocalElasticApiCredential } from './local-elastic-auth.js';
 import fs from "node:fs";
 import path from "node:path";
 import { ConfigStore } from "./config-store.js";
@@ -153,6 +154,7 @@ function localDaemonUrl(): string | undefined {
 
 export class DaemonClient {
   readonly baseUrl: string;
+  private explicitUrl = false;
   private fetchImpl: typeof fetch = fetch;
   private timeoutMs = 5_000;
   /** Set by remoteDaemonClient; absent origin is labelled explicitly on remote requests. */
@@ -194,6 +196,7 @@ export class DaemonClient {
 
   constructor(baseUrl?: string, options?: DaemonClientOptions) {
     if (baseUrl) {
+      this.explicitUrl = true;
       this.baseUrl = baseUrl;
     } else {
       const envUrl = readOpenRigEnv("OPENRIG_URL", "RIGGED_URL");
@@ -271,6 +274,14 @@ export class DaemonClient {
     if (options?.headers) {
       init = { ...init, headers: { ...(init.headers as Record<string, string> ?? {}), ...options.headers } };
     }
+    const headers = new Headers(init.headers);
+    let localAuth: Record<string, string> = {};
+    if (!headers.has("Authorization")) {
+      const token = resolveLocalElasticApiCredential({ enabled: process.env.OPENRIG_ELASTIC_GUARD !== undefined || fs.existsSync('/etc/openrig-elastic/manifest.json'),
+        baseUrl: this.baseUrl, remoteTarget: this.remoteTarget, explicitUrl: this.explicitUrl });
+      if (token) localAuth = { Authorization: `Bearer ${token}` };
+    }
+    init = { ...init, headers: { ...(init.headers as Record<string, string> ?? {}), ...localAuth }, ...(localAuth.Authorization ? { redirect: "error" as const } : {}) };
     // P18 sender-provenance: stamp the seat-derived identity header LAST, so the transport — never a
     // caller-supplied header or a request body — decides the caller identity the channel of record records.
     // Known remote or unproved direct endpoints carry origin; proven local requests remain bare.

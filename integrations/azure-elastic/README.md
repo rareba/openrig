@@ -7,7 +7,7 @@ build or these tests do not establish real Linux/provider readiness.
 
 ## Build and stage
 
-Build with the pinned lockfile and Node 22/24: `npm ci`, then `npm run build -w packages/daemon`.
+Build with the pinned lockfile and Node 22/24: `npm ci`, then `npm run build:package`.
 Stage the built checkout and its complete runtime dependency tree at `/opt/openrig`, Pi
 **@earendil-works/pi-coding-agent 1.0.4** with all dependencies at `/opt/pi`, and the exact
 Node executable at `/opt/node/bin/node`. Paths in the example are configurable in the
@@ -164,3 +164,83 @@ authenticated continuation envelope through the final runtime ingress, or a revi
 pre-seal drain withdrawal/reconciliation that restores productive custody. A sealed worker
 must never be unsealed. Local queue/human-return transactions already retain their actual custody.
 This is an explicit fail-closed integration limitation, not completed continuation delivery.
+
+## Build the complete worker bundle
+
+Use an isolated Linux amd64 checkout at the reviewed commit. Run `npm ci` and
+`npm run build:package` before invoking `node integrations/azure-elastic/build-worker-bundle.mjs <config.json>`.
+The builder config contains `checkout`, `commit`, `lockSha256`, `piRoot`, `node`,
+`nodeSha256`, `packageDirectory`, `packageRecipe`, and an absolute `output` tar path.
+`piRoot` is the package root of Pi 1.0.4 with its complete installed dependency closure.
+Its actual `bin.pi` is resolved from `package.json`. A nested npm package without its
+hoisted dependencies is not a complete input. The builder preserves the built checkout,
+the assembled CLI daemon/resources, native SQLite, and the compiled custody SQLite helper.
+It emits SHA256, size, build provenance, and tree pins for `/opt/openrig`, `/opt/pi`, and
+`/opt/node`. Required canonical `rig` and credential-loading `gh` launchers are regular files.
+The worker uses `/opt/pi/dist/bundle/cli.js` for Pi 1.0.4.
+
+The Ubuntu recipe type is exported as `UbuntuPackageRecipe` in
+`packages/daemon/src/adapters/elastic-worker-enrollment.ts`. It binds Ubuntu 24.04/amd64,
+explicit supported `basePackages` versions, every ordered `.deb` filename/package/version/
+architecture/hash/size, and exact final git/gh/tmux/bash/prlimit/python3 hashes.
+`signedMetadata` binds the pinned archive keyring and a finite set of signed InRelease files,
+each with its own exact Packages index hash and release path. The builder verifies signatures,
+index membership, and every package. The stager uses these already approved package bytes.
+
+The fixed `stage-worker.py` receives a typed protected managed RunCommand request. It downloads
+only `/api/elastic-artifacts/<sha256>` from the configured private IPv4 HTTPS origin, using the
+separately supplied CA and optional certificate pin. TLS 1.3, IP SAN, digest, exact length,
+finite deadlines, and redirect refusal are mandatory. It validates archive entries before copying.
+It uses APT only with explicit verified local package filenames and isolated empty source/list
+paths, after a simulation whose install/configure actions must be within the approved recipe.
+There is no online package lookup. The pinned manifest is supplied separately; pins are never
+regenerated on the VM. A partial package/copy/install state is retained for explicit reconciliation.
+Python 3 with TLS 1.3 must already be available to run this trusted stager on the target image.
+
+## Consume enrollment and native preparation
+
+`ElasticWorkerEnrollment` exports `advanceEnrollment`, read-only `inspectEnrollment`,
+`ensureElasticRegistration`, `observeManagedWorker`, and read-only `inspectNative`.
+`bootstrap` resolves only for a currently ready native worker. The caller schedules bounded
+`advanceEnrollment` calls for an existing operation; inspection does not submit commands.
+`ElasticWorkerAttemptStore.custodyMaterial` returns the original private key and binding for
+`CheckpointCustody.registerAttempt`. Clear the returned private Buffer after use.
+
+`AzureWorkerCommandClient` requires an absolute Azure CLI executable, isolated Azure config
+directory, and private command directory. It independently resolves the owned VMSS model,
+child incarnation, protection, image, and unique attached private IPv4 before mutations.
+Managed commands use a deterministic exact ARM CreateOrUpdate request with API `2024-11-01`,
+`asyncExecution`, and named protected parameters. The CLI invocation is `az rest ... --body @<private-file>`.
+The legacy CLI `vmss run-command create` wrapper parses protected parameters as name=value
+and cannot safely consume a private JSON filename. Readback uses the same managed command
+resource and its terminal instanceView result. A timeout or missing readback never authorizes
+another PUT or shared-request overwrite.
+
+The approved finite preparation plan is installed at `/etc/openrig-elastic/preparation.json`.
+The authenticated `/api/elastic-worker/prepare` route accepts only its operation ID and digest.
+The service clones full deterministic checkouts as the dedicated worker UID, then calls native
+bootstrap plan/apply with the exact reviewed action keys. It verifies actual rig/node/session,
+Pi runtime/model/cwd, current process identity, and separate tool-proof evidence. No project
+scripts execute as root. The current template has the two canonical seats in the manifest example.
+
+Readiness tasks belong to an existing registered coordinator owner. `owner.tasks` gives each
+seat its immutable native qitem ID and nonce. The coordinator creates those tasks after worker
+registration; `readinessTaskBody` returns the exact bounded shell command to put in each row.
+The worker requires the completed claimed native row, matching origin/source/destination,
+a paired successful Pi Bash call/result, and the exact nonce-bound proof artifact. An absent
+owner or model/tool result keeps the worker nonschedulable. Task5b3 composes owner/task creation,
+capacity scheduling, durable idle windows, and final custody/removal. The existing root process
+probe is an idle/drain proof; busy capacity needs a separate trusted observation before activation.
+
+All `/api/*` requests on an enrolled elastic worker require its worker bearer. Only the three
+exact POST activity hook/usage paths defer to their existing activity-token checks. Ordinary hosts
+retain their existing API behavior. Local CLI lookup reads the root-owned group-readable
+`local-api.json` only for its exact bound endpoint; explicit or registered remote URLs receive
+no implicit local token. Requests with this local credential refuse redirects.
+
+Public repository mode remains read-only. Optional approved narrow material uses the separate
+`github-credential-install` encrypted operation, expected previous revision, expiry, and exact
+repository permissions. `advanceGithubCredential` accepts an explicit replacement source.
+The gh launcher rereads the fixed private record on every invocation and scopes GH_TOKEN to
+its gh child. Dedicated HOME Git configuration uses native `gh auth git-credential`.
+No issuer, GitHub App signing key, OAuth home, or controller bearer is distributed.

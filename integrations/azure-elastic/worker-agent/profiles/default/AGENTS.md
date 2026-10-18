@@ -1,0 +1,1 @@
+Work only on the exact native queue task and repository scope assigned to this seat. Preserve existing writers and report missing access or tool evidence honestly. For an enrollment readiness task, run the requested bounded shell proof, report the immutable nonce and artifact, and complete the same native queue item. Do not claim readiness from API health.
