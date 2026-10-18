@@ -1,8 +1,8 @@
-# OpenRig questions in Hermes WhatsApp
+# OpenRig questions through Hermes native channels
 
-This optional Hermes plugin lets the bound person discuss a native OpenRig question on WhatsApp, then send an explicit choice, custom answer, or clarification back to its original request. OpenRig's existing queue and human-response writer remain authoritative. A conversation or an LLM statement never records an approval.
+This optional Hermes plugin lets the bound person discuss a native OpenRig question on WhatsApp, Slack or Teams, then send an explicit choice, custom answer, or clarification back to its original request. OpenRig's existing queue and human-response writer remain authoritative. A conversation or an LLM statement never records an approval.
 
-The plugin uses Hermes' existing WhatsApp adapter and supervised plugin task lifecycle. It creates no process, port, account, or credentials. Keep the plugin disabled until the actual WhatsApp profile, chat and sender have been verified. Telegram and OpenClaw are outside this first slice.
+The plugin uses Hermes' existing native platform adapters and supervised plugin task lifecycle. It creates no process, port, account, or credentials. Keep the plugin disabled until the actual WhatsApp profile, chat and sender have been verified. Telegram and OpenClaw are outside this integration. Each provider needs its own existing authorized configuration; this plugin never provisions a provider.
 
 ## Supported Hermes extension points
 
@@ -14,7 +14,7 @@ Verified against the deployed Hermes source `71d34bad1045610252eda02ee7954943689
 - SDK71's owner-message prefix is recognized only with matching native owner metadata and message/chat/sender identities. Ordinary discussion retains the SDK marker; quoted commands still require the original question and bound sender.
 - `ctx.get_config`, `ctx.profile_name` and durable `ctx.state` provide the existing plugin settings, authoritative profile and atomic profile-scoped state.
 
-Use a compatible Hermes installation with its existing WhatsApp platform enabled. Install this directory as a trusted user plugin using Hermes' supported plugin installation procedure, then run `hermes plugins enable openrig-human-relay` in that gateway's existing profile and restart the gateway. This preserves other enabled plugins; the settings entry alone does not add this plugin to Hermes' `plugins.enabled` allow-list. No API server is required, enabled or exposed, and this plugin does not change Hermes access lists.
+Use a compatible Hermes installation with its existing WhatsApp platform enabled. Install this directory as a trusted user plugin using Hermes' supported plugin installation procedure, then run `hermes plugins enable openrig-human-relay` in that gateway's existing profile and restart the gateway. This preserves other enabled plugins; the settings entry alone does not add this plugin to Hermes' `plugins.enabled` allow-list. Legacy pull needs no listener. Optional push uses the existing Hermes webhook adapter and a separately configured authenticated route; the plugin creates no listener and does not change Hermes access lists.
 
 The WhatsApp connection factory starts one supervised poll task; the existing webhook platform, when enabled, also starts the same task so previously saved inbound replies can retry before WhatsApp connects. Neither factory creates a listener or changes routes. Reconnecting updates the adapter without starting another poller. While WhatsApp is disconnected, native questions and saved replies remain retained. If neither an existing webhook nor WhatsApp has connected since gateway startup, no factory has fired yet, so saved inbound retries wait for platform startup. On successful connection, the existing durable retry lanes resume.
 
@@ -52,6 +52,36 @@ plugins:
 ```
 
 The URL must be the existing protected OpenRig endpoint reachable from that gateway (an existing private tunnel is suitable). The file must contain the already-authorized OpenRig bearer; alternatively `bearer_env` names an existing environment variable, defaulting to `OPENRIG_AUTH_BEARER_TOKEN`. Tokens are read internally and never stored in plugin receipts or placed on command lines. Remote host credentials remain in OpenRig's existing host registry and are resolved by the daemon, not exposed to WhatsApp or the LLM.
+
+## Optional durable webhook delivery
+
+Push requires Hermes native `plugin_hook` webhook support. SDK71 without that extension continues to support legacy pull. Configure an existing generic HMAC webhook route with `plugin_hook: openrig-human-relay` and the operator-managed secret in Hermes' normal route configuration. Pin that route with plugin setting `webhook_route: openrig-human-relay` (the default), and set `delivery_mode: webhook`. The native route dispatches exactly one async registered hook with `route_name`, canonical `profile` (`default` for the default profile), parsed `payload` and authenticated header `delivery_id`. Missing or duplicate hook registration fails closed in Hermes. Its existing HMAC authentication runs before this plugin.
+
+Configure the matching OpenRig origin's `human-relay.json` with a `webhooks` entry containing `connectorId`, `profile`, optional `channel` (default `whatsapp`), `endpointUrl` for this existing route and `secretFile` naming the existing authorized shared HMAC secret. Hermes owns its route secret configuration; OpenRig reads its operator-managed secret file. OpenRig uses Standard Webhooks headers accepted by Hermes' generic route: `webhook-id` carries `deliveryId`, `webhook-timestamp` carries the Unix timestamp, and `webhook-signature` is `v1,` followed by the base64 HMAC-SHA256 of `<deliveryId>.<timestamp>.<exact UTF-8 JSON body>`. Use the same plain secret on both sides (not a `whsec_`-encoded secret). Hermes also supports its native generic V2 signature for other authorized senders. Do not put credentials in bindings, messages or LLM prompts. Webhook payloads cannot choose an endpoint or route.
+
+The sole accepted event shape is:
+
+```json
+{
+  "schema": "openrig.human-relay.v1",
+  "type": "question.created",
+  "deliveryId": "ORIGINAL_DELIVERY_ID",
+  "fingerprint": "SHA256_HEX_OF_CANONICAL_DELIVERY",
+  "delivery": {"...": "existing native HumanRelayDelivery"}
+}
+```
+
+Canonical delivery JSON recursively sorts object keys, uses compact separators, preserves Unicode and is encoded as UTF-8. Admission verifies that fingerprint, the original delivery identity, connector and profile. The header ID must equal the envelope and delivery IDs. An atomic `ctx.state` write precedes HTTP 200. The exact acceptance body is `{"schema":"openrig.human-relay.v1","status":"accepted","deliveryId":"...","fingerprint":"..."}`. This confirms durable admission only. Existing platform receipt HTTP remains the separate proof that a provider submitted a message.
+
+Duplicate `(originHostId, deliveryId)` callbacks return that same stored acknowledgment, including after a gateway restart or lost HTTP response. A changed payload with the same identity returns 409; malformed events return 400; wrong route/profile returns 403; unavailable durable storage returns 503. Keep the original attempt and payload unchanged across HTTP retries. Stored webhook acknowledgment records remain retained for stable retry results.
+
+Disconnected native adapters leave admissions queued. The existing supervised poller drains queued work, saved platform receipts and incoming answers. `delivery_mode: webhook` disables only legacy pull. Immediately before each platform send, the plugin asks the original OpenRig origin to validate the exact delivery, attempt, question revision and current binding. Unavailable or malformed validation holds it for retry; a changed or answered request suppresses the platform send. The plugin persists `sending` before provider I/O. Restarted or timed-out sends with no saved platform receipt remain indeterminate and never automatically repost.
+
+## Channel binding and provider limits
+
+Set optional `channel` on the native binding to `slack` or `teams`; omitted `channel` preserves the existing WhatsApp binding and reply identity. The plugin attaches each through `register_platform_handler` and chooses an adapter by that native channel. A quoted reply must match the saved channel, profile, chat, sender and actual provider receipt. Non-WhatsApp response payloads carry `channel`; their inbound deduplication keys include that channel. Text cannot supply the actor or quoted identity. SDK71 WhatsApp stanza-only quotes and identity-matched owner prefixes retain their original behavior.
+
+Slack's native `reply_to_message_id` is its thread root. Teams requires a native adapter that preserves activity `reply_to_id` as `MessageEvent.reply_to_message_id`; an older adapter that drops it can submit questions but cannot authorize quoted responses. The plugin does not infer a quote from conversation text. Unconfigured or disconnected providers remain queued. These adapters do not expose a caller-chosen send idempotency key or reliable query-by-key reconciliation through this integration, so an uncertain provider attempt requires reconciliation. Provider IDs prove submission, not human reading.
 
 ## On the phone
 

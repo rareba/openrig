@@ -30,6 +30,7 @@ class Transport:
    if self.claimed:return {'deliveries':[]}
    self.claimed=True;return {'deliveries':[copy.deepcopy(DELIVERY)]}
   if operation=='respond' and self.lost_response:self.lost_response=False;raise OSError('HTTP acknowledgment lost after native commit')
+  if operation=='validate':return {'current':True}
   if operation=='context':return {'current':True,'body':'Current native context','questions':DELIVERY['questions']}
   return {'state':'delivered' if payload.get('outcome')=='platform-sent' else ('pending' if payload.get('outcome')=='not-attempted' else 'indeterminate')} if operation=='receipt' else {'replyQitemId':'native-reply','complete':payload.get('response',{}).get('kind')!='clarification'}
 class Adapter:

@@ -1,4 +1,4 @@
-"""Native OpenRig questions through an existing Hermes WhatsApp adapter.
+"""Native OpenRig questions through existing Hermes native platform adapters.
 No LLM turn can manufacture a native answer. Quoted explicit commands own submission.
 """
 import asyncio
@@ -73,8 +73,12 @@ class RelayPlugin:
         self.now = now or time.time
         self.transport = transport or NativeTransport(ctx)
         self.adapter = None
+        self.adapters = {}
         self.connector = ctx.get_config('connector_id', 'hermes')
-        self.profile = ctx.profile_name
+        self.profile = ctx.profile_name or 'default'
+        self.delivery_mode = ctx.get_config('delivery_mode', 'pull')
+        self.webhook_route = ctx.get_config('webhook_route', 'openrig-human-relay')
+        self.webhook_lock = asyncio.Lock()
         self.hosts = ctx.get_config('origin_hosts', ['local'])[:10]
         self.poll_lock = asyncio.Lock()
         self.inbound_lock = asyncio.Lock()
@@ -85,9 +89,69 @@ class RelayPlugin:
         self.stopped = False
         ctx.on_unload(self.stop)
 
-    def attach_whatsapp(self, native, adapter):
-        self.adapter = adapter
+    def attach_channel(self, channel, native, adapter):
+        self.adapters[channel] = adapter
+        if channel == 'whatsapp':
+            self.adapter = adapter  # Preserve the original public WhatsApp attachment.
         self.start()
+
+    def attach_whatsapp(self, native, adapter):
+        self.attach_channel('whatsapp', native, adapter)
+
+    def platform_adapter(self, channel):
+        return self.adapter if channel == 'whatsapp' else self.adapters.get(channel)
+
+    def outbound_key(self, item):
+        return item.get('storageKey', item['delivery']['deliveryId'])
+
+    def outgoing_reply(self, payload):
+        return next((item for item in self.ctx.state.get('outbound', {}).values()
+                     if item['delivery']['deliveryId'] == payload['deliveryId']
+                     and item['hostId'] == payload['hostId']
+                     and item['delivery'].get('channel', 'whatsapp') == payload.get('channel', 'whatsapp')), None)
+
+    async def handle_webhook(self, *, route_name, profile, payload, delivery_id, **kwargs):
+        # Hermes has already authenticated the configured native HMAC route. Payload
+        # content cannot nominate routes, profiles, transports, or callback handlers.
+        if route_name != self.webhook_route or (profile or 'default') != self.profile:
+            return {'status': 403, 'body': {'error': 'relay_route_or_profile_mismatch'}}
+        try:
+            if (not isinstance(payload, dict) or set(payload) != {'schema', 'type', 'deliveryId', 'fingerprint', 'delivery'}
+                    or payload['schema'] != 'openrig.human-relay.v1' or payload['type'] != 'question.created'):
+                raise ValueError('invalid_envelope')
+            d = payload['delivery']
+            required = ('deliveryId', 'attemptId', 'originHostId', 'qitemId', 'requestRevision', 'connectorId',
+                        'humanSession', 'profile', 'chatId', 'senderId', 'body')
+            if (not isinstance(d, dict) or any(not isinstance(d.get(k), str) or not d[k] for k in required)
+                    or d.get('channel', 'whatsapp') not in ('whatsapp', 'slack', 'teams')
+                    or not isinstance(d.get('questions'), list) or not d['questions']
+                    or d['connectorId'] != self.connector or d['profile'] != self.profile
+                    or d['deliveryId'] != payload['deliveryId'] or delivery_id != payload['deliveryId']):
+                raise ValueError('invalid_delivery')
+            render_question(d)  # Reject malformed native question shapes before acknowledging storage.
+            canonical = json.dumps(d, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+            fingerprint = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+            if payload['fingerprint'] != fingerprint:
+                raise ValueError('invalid_fingerprint')
+            identity = 'webhook:' + hashlib.sha256(json.dumps([d['originHostId'], d['deliveryId']],
+                                               ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+            ack = {'schema': 'openrig.human-relay.v1', 'status': 'accepted',
+                   'deliveryId': d['deliveryId'], 'fingerprint': fingerprint}
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return {'status': 400, 'body': {'error': 'invalid_relay_event'}}
+        try:
+            async with self.webhook_lock:
+                existing = self.ctx.state.get('outbound', {}).get(identity)
+                if existing:
+                    if existing.get('fingerprint') != fingerprint:
+                        return {'status': 409, 'body': {'error': 'delivery_id_payload_conflict'}}
+                    return {'status': 200, 'body': existing['ack']}
+                item = {'storageKey': identity, 'delivery': json.loads(canonical), 'hostId': d['originHostId'],
+                        'state': 'queued', 'at': self.now(), 'fingerprint': fingerprint, 'ack': ack}
+                self.save_outbound(identity, item)  # Atomic durable admission before HTTP acceptance.
+            return {'status': 200, 'body': ack}
+        except Exception:
+            return {'status': 503, 'body': {'error': 'relay_storage_unavailable'}}
 
     def attach_webhook(self, native, adapter):
         # Existing webhook calls its factory with None after binding; only start
@@ -150,11 +214,14 @@ class RelayPlugin:
         async def deliver():
             async with self.notice_limit:
                 try:
-                    if not self.adapter or not self.adapter.is_connected:
+                    item = self.ctx.state.get('inbound', {}).get(identity)
+                    channel = item['payload'].get('channel', 'whatsapp') if item else (failure[2] if failure else 'whatsapp')
+                    adapter = self.platform_adapter(channel)
+                    if not adapter or not adapter.is_connected:
                         return
                     if failure:
-                        chat, message_id = failure
-                        await self.adapter.send(chat, 'Hermes could not save your reply, so it was not queued. Please retry after the storage issue is resolved.', reply_to=message_id)
+                        chat, message_id = failure[:2]
+                        await adapter.send(chat, 'Hermes could not save your reply, so it was not queued. Please retry after the storage issue is resolved.', reply_to=message_id)
                         return
                     item = self.ctx.state.get('inbound', {}).get(identity)
                     if not item or item.get('noticeAttemptedState') == item['state']:
@@ -162,7 +229,7 @@ class RelayPlugin:
                     phase = item['state']
                     item['noticeAttemptedState'] = phase
                     self.save_inbound(identity, item)  # Persist before sending a status notice.
-                    result = await self.adapter.send(item['payload']['chatId'], self.notice_text(item), reply_to=item['payload']['messageId'])
+                    result = await adapter.send(item['payload']['chatId'], self.notice_text(item), reply_to=item['payload']['messageId'])
                     # Reload after network I/O: a native answer may have committed while
                     # this best-effort status notice was in flight.
                     current = self.ctx.state.get('inbound', {}).get(identity)
@@ -195,7 +262,7 @@ class RelayPlugin:
             item['state'] = 'not-attempted'
         else:
             item['state'] = 'acknowledged' if item.get('messageIds') else 'indeterminate'
-        self.save_outbound(d['deliveryId'], item)
+        self.save_outbound(self.outbound_key(item), item)
 
     async def flush_platform_receipt(self, item):
         try:
@@ -208,23 +275,24 @@ class RelayPlugin:
                 item['state'] = 'receipt-refused'
             else:
                 self.defer(item)
-            self.save_outbound(item['delivery']['deliveryId'], item)
+            self.save_outbound(self.outbound_key(item), item)
         except Exception as error:
             item['error'] = type(error).__name__
             self.defer(item)
-            self.save_outbound(item['delivery']['deliveryId'], item)
+            self.save_outbound(self.outbound_key(item), item)
 
     def defer(self, item):
         item['attempts'] = item.get('attempts', 0) + 1
         item['nextAttemptAt'] = self.now() + min(5 * 2 ** min(item['attempts'] - 1, 6), 300)
 
-    def due(self, key, states):
+    def due(self, key, states, connected_only=False):
         items = [(identity, item) for identity, item in self.ctx.state.get(key, {}).items()
-                 if item['state'] in states and item.get('nextAttemptAt', 0) <= self.now()]
+                 if item['state'] in states and item.get('nextAttemptAt', 0) <= self.now()
+                 and (not connected_only or self.connected_delivery(item))]
         return sorted(items, key=lambda pair: (pair[1].get('nextAttemptAt', 0), pair[1].get('at', 0), pair[0]))[:2]
 
     async def flush_inbound(self, identity, item):
-        outgoing = self.ctx.state.get('outbound', {}).get(item['payload']['deliveryId'])
+        outgoing = self.outgoing_reply(item['payload'])
         if not outgoing or outgoing['state'] != 'acknowledged':
             # A phone reply can arrive while its saved platform receipt is not yet
             # acknowledged. Never turn that temporary ordering into a stale refusal.
@@ -240,7 +308,7 @@ class RelayPlugin:
             item['receipt'] = receipt
             if receipt['complete']:
                 outgoing['resolvedAt'] = self.now()
-                self.save_outbound(item['payload']['deliveryId'], outgoing)
+                self.save_outbound(self.outbound_key(outgoing), outgoing)
             self.save_inbound(identity, item)
         except asyncio.CancelledError:
             raise
@@ -268,7 +336,7 @@ class RelayPlugin:
         pending = {v['payload']['qitemId'] for v in incoming.values() if v['state'] == 'pending'}
         outgoing = self.ctx.state.get('outbound', {})
         outgoing = {k: v for k, v in outgoing.items()
-                    if not (v.get('resolvedAt', float('inf')) < cutoff
+                    if not (not v.get('ack') and v.get('resolvedAt', float('inf')) < cutoff
                             and v['state'] == 'acknowledged' and v['delivery']['qitemId'] not in pending)}
         incoming = {k: v for k, v in incoming.items()
                     if not (v['state'] in ('recorded', 'refused') and v['at'] < cutoff)}
@@ -288,9 +356,12 @@ class RelayPlugin:
                        if item.get('noticeAttemptedState') != item['state']]
             for identity, item in sorted(notices, key=lambda pair: (pair[1]['at'], pair[0]))[:2]:
                 self.schedule_notice(identity)
-            if not self.adapter or not self.adapter.is_connected:
-                return  # Definite offline: leave the authoritative native request untouched.
-            # Each origin gets a bounded request; one unavailable host cannot starve the others.
+            for identity, item in self.due('outbound', ('queued',), connected_only=True):
+                await self.send_delivery(item)
+            if self.delivery_mode == 'webhook':
+                return  # Durable admission replaces pull, but all retry lanes remain active.
+            if not any(a and a.is_connected for a in [self.adapter, *self.adapters.values()]):
+                return
             selected = self.hosts[self.host_cursor:self.host_cursor + 1]
             self.host_cursor = (self.host_cursor + 1) % max(1, len(self.hosts))
             for host in selected:
@@ -299,44 +370,77 @@ class RelayPlugin:
                 except (OSError, TimeoutError, RelayFailure):
                     continue
                 for delivery in batch['deliveries']:
-                    item = {'delivery': delivery, 'hostId': host, 'state': 'sending', 'at': self.now()}
-                    # Native sending claim already exists. Persist the Hermes claim BEFORE
-                    # calling the platform; if storage refuses, no external send occurs.
+                    previous = self.ctx.state.get('outbound', {}).get(delivery['deliveryId'])
+                    if previous and previous['state'] not in ('not-attempted',):
+                        continue
+                    item = {'delivery': delivery, 'hostId': host, 'state': 'queued', 'at': self.now()}
                     self.save_outbound(delivery['deliveryId'], item)
-                    if not self.adapter.is_connected:
-                        item['state'] = 'not-attempted-pending'
-                        self.save_outbound(delivery['deliveryId'], item)
-                        await self.flush_platform_receipt(item)
-                        continue
-                    try:
-                        result = await self.adapter.send(delivery['chatId'], render_question(delivery))
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        # Preserve sending/no receipt. Never reinterpret a timeout as definitely absent.
-                        await self.flush_platform_receipt(item)
-                        continue
-                    # Verified Hermes WhatsApp `_needs_bridge` returns this exact result
-                    # before entering send(), so no chunk could have been posted.
-                    if not result.success and getattr(result, 'error', None) == 'Not connected':
-                        item['state'] = 'not-attempted-pending'
-                        self.save_outbound(delivery['deliveryId'], item)
-                        await self.flush_platform_receipt(item)
-                        continue
-                    ids = list(getattr(result, 'continuation_message_ids', ()) or ())
-                    if getattr(result, 'message_id', None):
-                        ids.append(result.message_id)
-                    if result.success and ids:
-                        item['messageIds'] = ids
-                        item['state'] = 'platform-sent'
-                        # Storage refusal here stops before HTTP acknowledgment. A later
-                        # restart sees sending/no saved receipt and conservatively holds it.
-                        self.save_outbound(delivery['deliveryId'], item)
-                    await self.flush_platform_receipt(item)
+                    await self.send_delivery(item)
 
-    def known_question(self, quoted_id):
+    def connected_delivery(self, item):
+        adapter = self.platform_adapter(item['delivery'].get('channel', 'whatsapp'))
+        return adapter is not None and adapter.is_connected
+
+    async def send_delivery(self, item):
+        delivery = item['delivery']
+        channel = delivery.get('channel', 'whatsapp')
+        adapter = self.platform_adapter(channel)
+        if not adapter or not adapter.is_connected:
+            return
+        try:
+            result = await self.transport.post('validate', {**delivery, 'hostId': item['hostId']})
+            if not isinstance(result, dict) or type(result.get('current')) is not bool:
+                raise ValueError('Native validation is malformed.')
+        except asyncio.CancelledError:
+            raise
+        except RelayFailure as error:
+            item['error'] = str(error)
+            if error.status == 409:
+                item['state'] = 'suppressed'  # Native attempt, revision or binding is no longer valid.
+            else:
+                self.defer(item)
+            self.save_outbound(self.outbound_key(item), item)
+            return
+        except Exception:
+            self.defer(item)
+            self.save_outbound(self.outbound_key(item), item)
+            return  # Origin unavailable: retain the exact immutable attempt.
+        if not result['current']:
+            item['state'] = 'suppressed'
+            self.save_outbound(self.outbound_key(item), item)
+            return
+        if not adapter.is_connected:
+            return
+        item['state'] = 'sending'
+        self.save_outbound(self.outbound_key(item), item)  # Persist BEFORE any platform I/O.
+        try:
+            result = await adapter.send(delivery['chatId'], render_question(delivery))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self.flush_platform_receipt(item)
+            return
+        # Only the verified WhatsApp bridge's exact refusal proves no platform I/O.
+        if channel == 'whatsapp' and not result.success and getattr(result, 'error', None) == 'Not connected':
+            item['state'] = 'queued' if item.get('ack') else 'not-attempted-pending'
+            self.defer(item)
+            self.save_outbound(self.outbound_key(item), item)
+            if not item.get('ack'):
+                await self.flush_platform_receipt(item)
+            return
+        ids = list(getattr(result, 'continuation_message_ids', ()) or ())
+        if getattr(result, 'message_id', None):
+            ids.append(result.message_id)
+        if result.success and ids:
+            item['messageIds'] = ids
+            item['state'] = 'platform-sent'
+            self.save_outbound(self.outbound_key(item), item)
+        await self.flush_platform_receipt(item)
+
+    def known_question(self, quoted_id, channel='whatsapp'):
         return next((item for item in self.ctx.state.get('outbound', {}).values()
-                     if quoted_id and quoted_id in item.get('messageIds', [])), None)
+                     if quoted_id and quoted_id in item.get('messageIds', [])
+                     and item['delivery'].get('channel', 'whatsapp') == channel), None)
 
     def quoted_id(self, event):
         quoted = getattr(event, 'reply_to_message_id', None)
@@ -344,7 +448,8 @@ class RelayPlugin:
             return quoted
         # SDK71 omits the structured id for native stanza-only WhatsApp quotes.
         raw = getattr(event, 'raw_message', None)
-        if (isinstance(raw, dict) and isinstance(raw.get('quotedMessageId'), str)
+        if (getattr(getattr(event.source, 'platform', None), 'value', None) == 'whatsapp'
+                and isinstance(raw, dict) and isinstance(raw.get('quotedMessageId'), str)
                 and raw.get('messageId') == event.message_id
                 and raw.get('chatId') == event.source.chat_id
                 and raw.get('senderId') == event.source.user_id):
@@ -356,7 +461,8 @@ class RelayPlugin:
         raw = getattr(event, 'raw_message', None)
         metadata = getattr(event, 'metadata', None)
         # SDK71 prefixes owner messages; strip only its identity-matched native marker.
-        if (isinstance(metadata, dict) and metadata.get('whatsapp_from_owner') is True
+        if (getattr(getattr(event.source, 'platform', None), 'value', None) == 'whatsapp'
+                and isinstance(metadata, dict) and metadata.get('whatsapp_from_owner') is True
                 and isinstance(raw, dict) and raw.get('fromOwner') is True
                 and raw.get('messageId') == event.message_id
                 and raw.get('chatId') == event.source.chat_id
@@ -374,17 +480,18 @@ class RelayPlugin:
             source = getattr(event, 'source', None)
             platform = getattr(getattr(source, 'platform', None), 'value', None)
             command = self.command_text(event).split(maxsplit=1)
-            if (platform == 'whatsapp' and self.quoted_id(event)
+            if (platform in ('whatsapp', 'slack', 'teams') and self.quoted_id(event)
                     and command and command[0] in ('/choose', '/answer', '/ask')):
                 return {'action': 'skip', 'reason': 'OpenRig storage or transport failed; no success is claimed. The original reply remains retained if it was persisted.'}
             return None
 
     async def _handle_event(self, event, **kwargs):
         source = event.source
-        if getattr(getattr(source, 'platform', None), 'value', None) != 'whatsapp':
+        channel = getattr(getattr(source, 'platform', None), 'value', None)
+        if channel not in ('whatsapp', 'slack', 'teams'):
             return None
         quoted_id = self.quoted_id(event)
-        item = self.known_question(quoted_id)
+        item = self.known_question(quoted_id, channel)
         if not item:
             return None
         d = item['delivery']
@@ -395,6 +502,8 @@ class RelayPlugin:
         base = {'hostId': item['hostId'], 'deliveryId': d['deliveryId'], 'connectorId': d['connectorId'],
                 'profile': profile, 'chatId': source.chat_id, 'senderId': source.user_id,
                 'replyToMessageId': quoted_id}
+        if channel != 'whatsapp':
+            base['channel'] = channel
         command = text.split(maxsplit=1)[0] if text else ''
         if command not in ('/choose', '/answer', '/ask'):
             try:
@@ -426,7 +535,7 @@ class RelayPlugin:
             return {'action': 'skip', 'reason': 'Malformed OpenRig reply; no answer was queued.'}
         payload = {**base, 'messageId': event.message_id, 'qitemId': d['qitemId'],
                    'requestRevision': d['requestRevision'], 'response': response}
-        identity = hashlib.sha256(json.dumps(['whatsapp', profile, source.chat_id, source.user_id, event.message_id], separators=(',', ':')).encode()).hexdigest()
+        identity = hashlib.sha256(json.dumps([channel, profile, source.chat_id, source.user_id, event.message_id], separators=(',', ':')).encode()).hexdigest()
         async with self.inbound_lock:
             existing = self.ctx.state.get('inbound', {}).get(identity)
             if existing:
@@ -435,7 +544,7 @@ class RelayPlugin:
             try:
                 self.save_inbound(identity, record)  # Durable BEFORE the native HTTP call.
             except Exception:
-                self.schedule_notice(identity, failure=(source.chat_id, event.message_id))
+                self.schedule_notice(identity, failure=(source.chat_id, event.message_id, channel))
                 return {'action': 'skip', 'reason': 'Durable storage refused the reply; it was not queued.'}
         self.schedule_notice(identity)
         return {'action': 'skip', 'reason': 'OpenRig reply ' + record['state'] + '; original request identity preserved.'}
@@ -445,4 +554,7 @@ def register(ctx):
     plugin = RelayPlugin(ctx)
     ctx.register_platform_handler('whatsapp', plugin.attach_whatsapp)
     ctx.register_platform_handler('webhook', plugin.attach_webhook)
+    for channel in ('slack', 'teams'):
+        ctx.register_platform_handler(channel, lambda native, adapter, channel=channel: plugin.attach_channel(channel, native, adapter))
+    ctx.register_hook('openrig-human-relay', plugin.handle_webhook)
     ctx.register_hook('pre_gateway_dispatch', plugin.handle_event)
