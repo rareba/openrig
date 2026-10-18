@@ -6,10 +6,11 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import Database from "better-sqlite3";
 /** Reading/starting the daemon is distinct from permission to write to a seat. */
-export function assertElasticUnitStartAllowed(db?: Database.Database): void {
-  readAdmission(db);
+/** dbPath must be the database the daemon will actually open; OPENRIG_DB is only the fallback. */
+export function assertElasticUnitStartAllowed(db?: Database.Database, dbPath?: string): void {
+  readAdmission(db, dbPath);
 }
-function readAdmission(db?: Database.Database) {
+function readAdmission(db?: Database.Database, dbPath?: string) {
   const path = process.env.OPENRIG_ELASTIC_GUARD;
   if (path === undefined) {
     if (existsSync('/etc/openrig-elastic/manifest.json')) throw Error('elastic_worker_effect_denied');
@@ -17,7 +18,7 @@ function readAdmission(db?: Database.Database) {
   }
   let own:Database.Database|null=null;
   try {
-    if(!db)own=new Database(process.env.OPENRIG_DB ?? '', {readonly:true,fileMustExist:true});
+    if(!db)own=new Database(dbPath ?? process.env.OPENRIG_DB ?? '', {readonly:true,fileMustExist:true});
     const st=lstatSync(path);
     if(realpathSync(path)!==path || !st.isFile() || st.uid!==0 || (st.mode&0o022)!==0 || st.size>4096) throw Error();
     const v=JSON.parse(readFileSync(path,'utf8'));

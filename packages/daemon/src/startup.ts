@@ -310,7 +310,7 @@ export function collectAllowlistedProviderAuthEnv(
 /** Assemble the daemon services and runtime adapters using the selected installation assets. */
 export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> {
   const elasticWorkerMode = process.env.OPENRIG_ELASTIC_GUARD !== undefined;
-  if (elasticWorkerMode) { loadForegroundManifest(); assertElasticUnitStartAllowed(); }
+  if (elasticWorkerMode) { loadForegroundManifest(); assertElasticUnitStartAllowed(undefined, opts?.dbPath ?? ":memory:"); }
   const daemonHome = os.homedir();
   const configuredCodexHome = process.env.CODEX_HOME || undefined;
   if (configuredCodexHome && !nodePath.isAbsolute(configuredCodexHome)) {

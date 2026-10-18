@@ -246,11 +246,11 @@ async function isTrustedLocalOrTailnetBind(host: string): Promise<boolean> {
 }
 
 export async function startServer(port?: number) {
-  assertElasticUnitStartAllowed();
-  const p = port ?? parseInt(readOpenRigEnv("OPENRIG_PORT", "RIGGED_PORT") ?? "7433", 10);
   // D15 — anchor the default db under OPENRIG_HOME, never a bare CWD-relative
   // filename (which could open the shared fleet db). Explicit OPENRIG_DB wins.
   const dbPath = resolveDaemonDbPath(readOpenRigEnv("OPENRIG_DB", "RIGGED_DB"), OPENRIG_HOME);
+  assertElasticUnitStartAllowed(undefined, dbPath);
+  const p = port ?? parseInt(readOpenRigEnv("OPENRIG_PORT", "RIGGED_PORT") ?? "7433", 10);
   const instanceConfig = new SettingsStore().resolveConfig();
   const initialization = ensureOpenRigInstance({
     home: OPENRIG_HOME,
